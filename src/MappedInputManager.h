@@ -2,6 +2,12 @@
 
 #include <HalGPIO.h>
 
+#include "util/HomeButtonInput.h"
+
+#if FREEINK_DEVICE_X4PRO
+#include "../lib/hal/Scribble.h"
+#endif
+
 class GfxRenderer;
 namespace freeink {
 namespace ui {
@@ -39,7 +45,24 @@ class MappedInputManager {
 
   MappedInputManager(HalGPIO& gpio, const GfxRenderer& renderer) : gpio(gpio), renderer(renderer) {}
 
-  void update() const;
+  // Blocking transfer loops pump physical input themselves. Defer configured
+  // Home-key actions so the next main-loop pass can dispatch them, while the
+  // current action remains available for immediate Home cancellation.
+  void update(bool deferHomeButtonAction = false) const;
+#if FREEINK_DEVICE_X4PRO
+  // A scribbled gesture decided this frame (a row struck out, a ring round one, a tap, a swipe),
+  // in logical px. Fed in update() from the same contact the SDK reads off the GT911 on this
+  // task, so it adds no bus traffic. A stroke a second finger joined decides nothing.
+  bool wasScribble(scribble::Result& out) const;
+  // A strike decided this frame (out along a line and back), aimed at (x, y): a form puts that question back.
+  bool wasStrike(int16_t& x, int16_t& y) const;
+  // The stroke that ended this frame (its samples), or nullptr: for a screen that draws it back.
+  const scribble::Stroke* endedStroke() const { return scribbler.endedStroke(); }
+#ifdef TENOR_PRESS_PROBE
+  // CMD:STROKE_LOG: each stroke and each decision printed, labelled for test/scribble.
+  void setStrokeLog(bool on, const char* label) const;
+#endif
+#endif
 #if FREEINK_CAP_TOUCH
   // X4 Pro delays a single power click until its frontlight double-click window
   // expires. The main loop supplies that one-frame event here.
@@ -61,6 +84,7 @@ class MappedInputManager {
   // the long-press opened. The SDK owns that latch and self-clears it once the
   // contact ends.
   bool wasScreenLongPress(int& x, int& y) const;
+  bool wasScreenHold(int& x, int& y, unsigned long thresholdMs) const;
   bool isScreenTouchHeld(int& x, int& y) const;
   // Raw release edge, also true when the contact ended in a swipe or drag-off
   // (which wasScreenTapped never reports). InputSnapshot builders forward it
@@ -81,6 +105,16 @@ class MappedInputManager {
   RowTouch colTouch(int& col, int left, int colStep, int colCount, int yStart, int yEnd, int colWidth = 0) const;
 
   SwipeDir wasSwipe() const;
+  // Consumed once on the input task; deltas follow the rendered orientation.
+  bool popMultiTouchSwipe(uint8_t& contacts, int& dx, int& dy, unsigned long* durationMs = nullptr) const;
+  // Live: the contacts down now and their centre in screen pixels (rendered orientation).
+  bool touchContactsAt(uint8_t& count, int& x, int& y) const;
+  uint32_t touchContactGeneration() const { return touchContactGeneration_; }
+  bool wasBottomHomeGesture() const;
+  // An up or down swipe in this pass: its vertical travel (negative: the finger went up) and how long
+  // the finger was down.
+  bool wasVerticalSwipe(int& dy, unsigned long& heldMs) const;
+  bool wasVerticalSwipe(int& dy, unsigned long& heldMs, int& startX, int& startY) const;
   // Back = left-to-right swipe anchored at the left edge. Public so swipe-mode
   // page turns (reader) can exclude it from a plain SwipeDir::Right.
   bool wasBackGesture() const;
@@ -88,8 +122,12 @@ class MappedInputManager {
   // is intentionally unused. Other boards retain the bottom-edge Home gesture.
   // The reader menu remains on its existing top-edge gesture and middle tap.
   bool wasHomeGesture() const;
-  // A Home-key hold runs the configured long-press action in the reader.
-  bool wasHomeKeyHold() const;
+  // Configured one-frame action, independent of the gesture that triggered it.
+  HomeButtonAction homeButtonAction() const { return homeAction; }
+  void resetHomeButtonInput() const {
+    homeButtonInput.reset();
+    deferredHomeAction = HomeButtonAction::Ignore;
+  }
   bool wasMenuGesture() const;
   // Bottom-edge up-swipe as the reader-menu gesture (SHOW_READER_MENU's Swipe
   // Up option). Only meaningful on home-key boards, where Home lives on the
@@ -145,12 +183,23 @@ class MappedInputManager {
 #endif
   void rememberTouchHeldTime() const;
 
+  mutable HomeButtonInput homeButtonInput;
+  mutable uint32_t touchContactGeneration_ = 0;
+  mutable HomeButtonAction homeAction = HomeButtonAction::Ignore;
+  mutable HomeButtonAction deferredHomeAction = HomeButtonAction::Ignore;
   mutable bool touchHeldOverrideValid = false;
   mutable unsigned long touchHeldOverrideMs = 0;
   mutable unsigned long touchHeldOverrideAt = 0;
   mutable uint16_t longPressFiredButtons = 0;
   mutable uint16_t suppressedReleaseButtons = 0;
+  mutable bool footBackTap = false;           // update(): this frame's tap on "<" is Back
+  mutable unsigned long lastFootBackMs = 0;   // when the last one was
 #if FREEINK_CAP_TOUCH
   bool powerConfirmClickFrame = false;
+#endif
+#if FREEINK_DEVICE_X4PRO
+  void stepScribble() const;
+  mutable scribble::Scribbler scribbler;
+  mutable scribble::Result scribbleFrame;
 #endif
 };

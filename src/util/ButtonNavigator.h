@@ -1,13 +1,14 @@
 #pragma once
 
 #include <functional>
-#include <vector>
+#include <initializer_list>
 
 #include "MappedInputManager.h"
 
 class ButtonNavigator final {
   using Callback = std::function<void()>;
-  using Buttons = std::vector<MappedInputManager::Button>;
+  // Borrowed lists are consumed synchronously and never retained.
+  using Buttons = std::initializer_list<MappedInputManager::Button>;
 
   const uint16_t continuousStartMs;
   const uint16_t continuousIntervalMs;
@@ -41,11 +42,24 @@ class ButtonNavigator final {
   [[nodiscard]] static int nextIndex(int currentIndex, int totalItems);
   [[nodiscard]] static int previousIndex(int currentIndex, int totalItems);
 
+  // Top row of the viewport after a one-row step landed on `selected`. The single rule for how a
+  // list scrolls under the front buttons, every list of the button boards asks it (founder 07/10/2026):
+  // a row still in view keeps the page; stepping past the last row flips to the next page with the
+  // selection on its first row; stepping before the first row flips back with the selection on its
+  // last row; the last row (a wrap from the first) lands on a full last page.
+  [[nodiscard]] static int pageTopAfterStep(int selected, int top, int rowsPerPage, int totalItems);
+
   [[nodiscard]] static int nextPageIndex(int currentIndex, int totalItems, int itemsPerPage);
   [[nodiscard]] static int previousPageIndex(int currentIndex, int totalItems, int itemsPerPage);
 
   // Navigation uses the logical NavNext / NavPrevious buttons; MappedInputManager::mapButton resolves
   // them to physical buttons and applies any orientation-based direction swap, so this stays settings-free.
-  [[nodiscard]] static Buttons getNextButtons() { return {MappedInputManager::Button::NavNext}; }
-  [[nodiscard]] static Buttons getPreviousButtons() { return {MappedInputManager::Button::NavPrevious}; }
+  [[nodiscard]] static Buttons getNextButtons() {
+    static constexpr Buttons buttons = {MappedInputManager::Button::NavNext};
+    return buttons;
+  }
+  [[nodiscard]] static Buttons getPreviousButtons() {
+    static constexpr Buttons buttons = {MappedInputManager::Button::NavPrevious};
+    return buttons;
+  }
 };

@@ -9,56 +9,139 @@
 
 #include "MappedInputManager.h"
 #include "MenuCustomization.h"
+#include "MenuTiltInput.h"
+#include "activities/util/ListOrderActivity.h"
 #include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
+#include "components/UIThemeTokens.h"
 #include "components/themes/TenorRadius.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyChrome.h"
 
 namespace fui = freeink::ui;
 
 namespace {
 constexpr int16_t TOUCH_TAB_BAR_HEIGHT = 50;
+
+int touchTabBarHeight(const bool touchShell, const int regularHeight) {
+  return touchShell ? tenorchrome::FOOT_BACK_SIZE : regularHeight;
 }
 
-UiTabListActivity::UiTabListActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput)
-    : UiListActivity(name, renderer, mappedInput) {}
 
-void UiTabListActivity::loop() {
+}  // namespace
+
+void UiTabListActivity::veThanhTheTenor(UiScreen& screen, const fui::Rect& thanh, const fui::TabItem* tabs,
+                                        const int count, const fui::TextStyle& chu) {
+  // Bar margin from the band's side: the touch band is already 8 px in from the screen edge, the button board's is not.
+  constexpr int LE = tenorchrome::kTouchShell ? 8 : tenorchrome::X3_BAR_MARGIN;
+  constexpr int KHE = tenorchrome::BAR_TAB_INSET;  // band top to the selected pill
+  constexpr int PILL_ICON_W = tenorchrome::BAR_TAB_W;
+  constexpr int INDICATOR = 6;  // sort arrow beside a label
+  const int x0 = thanh.x + LE, w = thanh.width - 2 * LE, h = thanh.height, y0 = thanh.y;
+  if (uiTarget.paintingEnabled()) tenorchrome::drawBarFrame(renderer, x0, y0, w, h);
+  if (count <= 0) return;
+  const bool icons = static_cast<bool>(tabs[0].icon);
+  const int slotW = (w - 2 * KHE) / count;
+  // Icon pills leave BAR_END_INSET inside the bar's ends; the centres spread evenly between them.
+  const int endInset = tenorchrome::BAR_END_INSET;
+  fui::TextStyle label = chu;
+  label.align = fui::TextAlign::Center;
+  label.color = fui::Color::Black;
+  label.inverted = false;
+  // Text tabs: each pill is its label plus 14 px a side, and the pills are spread with equal air between
+  // them inside the bar, so a long label does not touch the bar's ring. Equal slots when
+  // the labels do not fit that way.
+  int textCentre[5] = {};
+  bool spread = false;
+  if (tenorchrome::kTouchShell && !icons && count <= 5) {
+    int widths[5] = {}, total = 0;
+    for (int i = 0; i < count; ++i) {
+      widths[i] = (tabs[i].label ? screen.target().measureText(label.font, tabs[i].label, label).width : 0) + 28;
+      total += widths[i];
+    }
+    const int inner = w - 2 * KHE;
+    const int air = total <= inner ? (inner - total) / count : -1;
+    spread = air >= 0;
+    int x = x0 + KHE + (air >= 0 ? air / 2 : 0);
+    for (int i = 0; i < count; ++i) {
+      textCentre[i] = air >= 0 ? x + widths[i] / 2 : x0 + KHE + slotW * i + slotW / 2;
+      x += widths[i] + (air >= 0 ? air : 0);
+    }
+  }
+  for (int i = 0; i < count; ++i) {
+    const fui::TabItem& tab = tabs[i];
+    int cx, pillW;
+    int16_t labelW = 0;
+    if (icons) {
+      cx = tenorchrome::barTabCentre(x0, w, count, i, endInset);
+      pillW = PILL_ICON_W;
+    } else {
+      cx = spread ? textCentre[i] : x0 + KHE + slotW * i + slotW / 2;
+      labelW = tab.label ? screen.target().measureText(label.font, tab.label, label).width : 0;
+      pillW = spread ? labelW + 28 : std::min(slotW - 4, labelW + 28);
+    }
+    if (tenorchrome::kTouchShell) {
+      // The whole bar height, split halfway between neighbouring tabs: every point of the bar picks a tab.
+      const auto centre = [&](const int j) {
+        if (!icons) return spread ? textCentre[j] : x0 + KHE + slotW * j + slotW / 2;
+        return tenorchrome::barTabCentre(x0, w, count, j, endInset);
+      };
+      const int left = i == 0 ? thanh.x : (centre(i - 1) + cx) / 2;
+      const int right = i == count - 1 ? thanh.right() : (cx + centre(i + 1)) / 2;
+      screen.frame().hit(fui::Rect{static_cast<int16_t>(left), static_cast<int16_t>(y0),
+                                   static_cast<int16_t>(right - left), static_cast<int16_t>(h)},
+                         ACTION_TAB, tab.value, fui::InputTouch | fui::InputLongPress);
+    }
+    if (!uiTarget.paintingEnabled()) {
+      // tenor/ugly on the button readers lays the list out with its ink off: the tab names are written by hand
+      // here, a slot each, and the circle of the cursor goes round the tab in use.
+      if (shell::uglyParts() && tab.label) {
+        const int slot = icons ? PILL_ICON_W + 16 : std::max<int>(pillW, slotW - 4);
+        const auto ink = uglychrome::words(renderer, fui::Rect{static_cast<int16_t>(cx - slot / 2), static_cast<int16_t>(y0),
+                                                               static_cast<int16_t>(slot), static_cast<int16_t>(h)},
+                                           tab.label, fui::TextAlign::Center);
+        if (tab.selected) uglychrome::ring(renderer, ink, tabMark_.get(activeTab()));
+      }
+      continue;
+    }
+    if (icons) {
+      tenorchrome::drawBarTab(renderer, cx, y0, h, tab.icon.data, tab.icon.width, tab.icon.height, tab.selected);
+      continue;
+    }
+    if (tab.selected) tenorchrome::drawPillRing(renderer, cx - pillW / 2, y0 + KHE, pillW, h - 2 * KHE, 3, false);
+    if (!tab.label) continue;
+    const int row = labelW + (tab.indicator != fui::TabIndicator::None ? 4 + INDICATOR : 0);
+    const int lx = cx - row / 2;
+    screen.target().text(fui::Rect{static_cast<int16_t>(lx), static_cast<int16_t>(y0), labelW, static_cast<int16_t>(h)},
+                         tab.label, label);
+    if (tab.indicator == fui::TabIndicator::None) continue;
+    const int tx = lx + labelW + 4, mid = y0 + h / 2, half = INDICATOR / 2;
+    const bool up = tab.indicator == fui::TabIndicator::Up;
+    screen.target().triangle(
+        fui::Point{static_cast<int16_t>(up ? tx + half : tx), static_cast<int16_t>(up ? mid - half : mid - half)},
+        fui::Point{static_cast<int16_t>(up ? tx : tx + INDICATOR), static_cast<int16_t>(up ? mid + half : mid - half)},
+        fui::Point{static_cast<int16_t>(up ? tx + INDICATOR : tx + half), static_cast<int16_t>(mid + half)},
+        fui::Paint::solid(fui::Color::Black));
+  }
+}
+
+UiTabListActivity::UiTabListActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
+                                     const bool wantsTouchLongPress)
+    : UiListActivity(name, renderer, mappedInput, wantsTouchLongPress) {}
+
+void UiTabListActivity::pollTilt() {
   const bool acceptsTilt = acceptsTiltTabNavigation();
-  const auto orientation = static_cast<CrossPointOrientation::Value>(renderer.getOrientation());
-  halTiltSensor.update(SETTINGS.tiltTabNavigation, static_cast<uint8_t>(orientation), acceptsTilt);
+  const auto tilt = menutilt::pollTabs(static_cast<uint8_t>(renderer.getOrientation()), acceptsTilt);
   if (acceptsTilt) {
-    // Measured on the X3 22/09: the sensor's own Normal is the direction
-    // readers find natural for tabs, so the readings pass straight through.
-    const bool forward = halTiltSensor.wasTiltedForward();
-    const bool backward = halTiltSensor.wasTiltedBack();
-    queueTiltTabNavigation(forward, backward);
+    queueTiltTabNavigation(tilt.next, tilt.previous);
   }
-  // Row tilt is the other gyro axis. It is armed after the poll above because
-  // that call carries the tab setting alone; the arming is read by the next
-  // poll, and this runs on every pass, so the sensor is never more than one
-  // pass behind the live setting and gate.
-  const bool acceptsRowTilt = acceptsTiltMenuNavigation();
-  halTiltSensor.configureVerticalGesture(SETTINGS.tiltMenuNavigation, acceptsRowTilt);
-  if (acceptsRowTilt) {
-    // Measured on the X3 22/09: the gesture the sensor labels Up is the one
-    // readers use to go down a row, so the two readings trade places here.
-    queueTiltMenuNavigation(halTiltSensor.wasTiltedDown(), halTiltSensor.wasTiltedUp());
-  }
-  UiListActivity::loop();
+  // Row tilt is the other gyro axis, armed after the poll above because that call carries the
+  // tab setting alone.
+  pollRowTilt();
 }
 
 bool UiTabListActivity::acceptsTiltTabNavigation() const {
   return tabCount() > 1 && allowsTiltTabNavigation();
-}
-
-bool UiTabListActivity::acceptsTiltMenuNavigation() const {
-  return listCount() > 0 && allowsTiltMenuNavigation();
-}
-
-bool UiTabListActivity::queueTiltMenuNavigation(const bool up, const bool down) {
-  if (!acceptsTiltMenuNavigation() || (!up && !down)) return false;
-  queueNavIntent(up ? NavIntent::StepPrev : NavIntent::StepNext);
-  return true;
 }
 
 bool UiTabListActivity::queueTiltTabNavigation(const bool forward, const bool backward) {
@@ -83,7 +166,7 @@ void UiTabListActivity::onEnter() {
 bool UiTabListActivity::clampAfterNav() {
   auto& cursor = activeNav();
   const int count = listCount();
-  const int selected = count <= 0 ? 0 : std::clamp(cursor.selected, mappedInput.hasTouch() ? 0 : 1, count);
+  const int selected = count <= 0 ? 0 : std::clamp(cursor.selected.load(), mappedInput.hasTouch() ? 0 : 1, count);
   if (selected == cursor.selected) return false;
   cursor.selected = selected;
   cursor.followOnBuild = true;
@@ -107,14 +190,50 @@ int UiTabListActivity::ringPos() const {
 void UiTabListActivity::tabActionTrampoline(const fui::ActionEvent& event, void* user) {
   auto* self = static_cast<UiTabListActivity*>(user);
   if (event.value < 0 || event.value >= self->tabCount()) return;
+  if (tenorchrome::kTouchShell && event.longPress) {
+    if (!shell::isUgly()) self->showTabOrderMenu(event.value);
+    return;
+  }
   self->onTabAction(event.value);
   if (self->clampAfterNav()) self->requestUpdate();
 }
 
+// Touch: a held card offers Reorder, which opens the order screen with that card moving (the X3 moves a card a
+// step at a time by holding an edge key).
+void UiTabListActivity::showTabOrderMenu(const int id) {
+  const int group = menucustom::groupFor(name.c_str());
+  const int count = tabCount();
+  if (group < 0 || count < 2) return;
+  const StrId label = StrId::STR_REORDER;
+  showRowMenu(&label, 1, [this, group, count, id](int) {
+    std::vector<std::string> labels;
+    std::vector<int> ids;
+    for (int i = 0; i < count; ++i) {
+      ids.push_back(menucustom::idAt(group, i, count));
+      labels.emplace_back(tabLabel(ids.back()));
+    }
+    startActivityForResult(
+        std::make_unique<ListOrderActivity>(renderer, mappedInput, std::move(labels),
+                                            menucustom::position(group, id, count),
+                                            [group, ids](const std::vector<int>& order) {
+                                              std::vector<int> next;
+                                              for (const int i : order) next.push_back(ids[i]);
+                                              menucustom::arrangeTabs(group, next.data(), static_cast<int>(next.size()));
+                                            }),
+        nullptr);
+  }, ACTION_TAB, id);
+}
+
 void UiTabListActivity::onRowAction(const fui::ActionEvent& event) {
-  {
+  if (tenorchrome::kTouchShell && !touchRowMovesRing()) {
+    touchedRow = event.value;
+  } else {
     RenderLock lock(*this);
     moveRingTo(event.value + 1);
+  }
+  if (event.longPress) {
+    onRowLongPress(event.value);
+    return;
   }
   activateIndex(event.value);
 }
@@ -127,12 +246,15 @@ void UiTabListActivity::forgetOtherTabs() {
   }
 }
 
-void UiTabListActivity::moveRingTo(const int ringIndex) {
+void UiTabListActivity::moveRingTo(const int ringIndex, const int direction) {
   auto& n = activeNav();
   n.selected = ringIndex;
+  mark_.get(selectionMarkKey());
   n.followPending = ringIndex > 0;
   if (ringIndex == 0) {
     n.top = 0;
+  } else if (direction != 0) {
+    n.top = ButtonNavigator::pageTopAfterStep(ringIndex - 1, n.top, n.pageRowsFor(listCount()), listCount());
   } else {
     // Pull the viewport to the row (ring - 1); ListNav::follow reads
     // n.selected as a row index, so compute directly here.
@@ -207,15 +329,16 @@ void UiTabListActivity::stepSelection(const int direction) {
   }
   const int ring = ringPos();
   if (direction > 0) {
-    moveRingTo(ring <= 0 || ring >= count ? 1 : ring + 1);
+    moveRingTo(ring <= 0 || ring >= count ? 1 : ring + 1, 1);
   } else {
-    moveRingTo(ring <= 1 || ring > count ? count : ring - 1);
+    moveRingTo(ring <= 1 || ring > count ? count : ring - 1, -1);
   }
 }
 
 void UiTabListActivity::applyFirstRow() { moveRingTo(listCount() > 0 ? 1 : 0); }
 
 void UiTabListActivity::syncTabListViewport(UiScreen& screen, fui::ListProps& props, const bool hasSubtitle) {
+  frameRows(props);
   reserveFixedMenuContent(screen);
   reserveFavoriteHint(screen);
   decoratePinnedRows(props);
@@ -232,25 +355,19 @@ void UiTabListActivity::syncTabListViewport(UiScreen& screen, fui::ListProps& pr
     // Wrapped (maxLines > 1) labels grow only their own row: list() sizes
     // wrapped items per-row, so the dense height stays for the rest.
     props.rowHeight = rowHeight;
+    // A row with a subtitle grows to its text plus this padding, so the selected pill's ring clears a descender.
+    props.rowPaddingY = TENOR_PILL_ROW_PADDING_Y;
   }
   const int rowGap = props.rowGap >= 0 ? props.rowGap : screen.theme().listRowGap;
-  reserveMoreBelowChevron(screen, rowHeight, rowGap);
-  const uint16_t rows = fui::listVisibleRows(screen.body(), rowHeight, rowGap);
-  n.visibleRows = rows > 0 ? rows : 1;
-  if (n.followOnBuild) {
-    // Screen entry / tab switch: show the tab's remembered selection, or the
-    // top when the tab bar holds the focus.
-    n.followOnBuild = false;
-    n.followPending = n.selected > 0;
-    n.top = n.selected > 0 ? static_cast<int>(fui::listTopIndexFor(
-                                 static_cast<int16_t>(n.selected - 1), static_cast<uint16_t>(n.top < 0 ? 0 : n.top),
-                                 static_cast<uint16_t>(n.visibleRows), static_cast<uint16_t>(count)))
-                           : 0;
-  }
-  n.scrollBy(0, count);  // clamp to range
-  props.topIndex = static_cast<uint16_t>(n.top);
-  props.selectedIndex = static_cast<int16_t>(n.selected - 1);  // -1 = tab band focused
-  props.nav = &n;  // actual wrapped-row layout corrects the estimated viewport
+  reserveRowFrame(screen, rowGap);
+  // Touch: count a page with the rows list() lays out (see UiListActivity::syncListViewport).
+  const auto laid = rowsFramed ? screen.resolveListProps(props) : props;
+  n.syncToProps(screen.body(), rowsFramed ? laid.rowHeight : rowHeight, rowsFramed ? laid.rowGap : rowGap, count,
+                props, 1);
+  keepUglyRows(props);
+  measurePageScrollbar(screen, laid);
+  // The touch shell shows no cursor row; SDK navigation still owns the viewport.
+  if (tenorchrome::kTouchShell) props.selectedIndex = -1;
 }
 
 UiTabListActivity::CuaSoThe UiTabListActivity::tinhCuaSo(const int tong, const int dangChon, const int dauCu,
@@ -318,8 +435,11 @@ void UiTabListActivity::veMuiTenThe(const fui::Rect& thanh, const int16_t le) {
 }
 
 int UiTabListActivity::preferredTabBarHeight() const {
-  if (tenorchrome::enabled()) return tenorchrome::tabHeight();
-  return mappedInput.hasTouch() ? TOUCH_TAB_BAR_HEIGHT : UITheme::getInstance().getMetrics().tabBarHeight;
+  const int regularHeight = tenorchrome::enabled()
+                                ? tenorchrome::tabHeight()
+                                : (mappedInput.hasTouch() ? TOUCH_TAB_BAR_HEIGHT
+                                                          : UITheme::getInstance().getMetrics().tabBarHeight);
+  return touchTabBarHeight(tenorchrome::kTouchShell, regularHeight);
 }
 
 void UiTabListActivity::buildTabBar(UiScreen& screen) {
@@ -333,7 +453,7 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
   constexpr int MAX_TABS = 5;
   fui::TabBarProps tabProps;
   tabProps.action = ACTION_TAB;
-  tabProps.iconSize = SETTINGS.uiTheme == CrossPointSettings::TENOR_UI ? 32 : 0;
+  tabProps.iconSize = 40;
   tabProps.inputMask = fui::InputTouch;
   // Pill shape and label size are theme-driven. Lyra uses equal-width slots
   // with small labels so wide text (e.g. "Controls") still fits at large UI scales.
@@ -356,11 +476,16 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
     tabProps.tabInset = tabsFocused ? fui::Insets{2, 4, 4, 4} : fui::Insets{2, 4, 0, 4};
     tabProps.contentInset = fui::Insets{2, 0, 2, 0};
   }
-  if (tenorHome) tabProps.tabInset = fui::Insets{2, 4, 4, 4};
+  if (tenorHome) {
+    // veThanhTheTenor draws the bar itself; these two only size a slot for theVuaMan (a label plus 14 px
+    // each side, the pill's own padding).
+    tabProps.tabInset = fui::Insets{0, 0, 0, 0};
+    tabProps.contentInset = fui::Insets{0, 14, 0, 14};
+  }
   int16_t nhanRongNhat = 0;
   for (int i = 0; i < tabCount(); i++) {
     // The ve bang bieu tuong thi be rong la be rong anh, khong phai be rong chu.
-    const fui::BitmapRef anh = tabIcon(i);
+    const fui::BitmapRef anh = tabIcon(i, false);
     if (anh) {
       if (static_cast<int16_t>(anh.width) > nhanRongNhat) nhanRongNhat = static_cast<int16_t>(anh.width);
       continue;
@@ -384,7 +509,7 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
     // Chi so THAT trong danh sach the. Phai giu dung, vi `value` la thu cham tay gui
     // nguoc ve onTabAction(): gui chi so trong cua so la cham nham the.
     const int that = menucustom::idAt(menucustom::groupFor(name.c_str()), cuaSoDau + i, tabCount());
-    const fui::BitmapRef anh = tabIcon(that);
+    const fui::BitmapRef anh = tabIcon(that, activeTab() == that);
     if (anh) {
       // Bieu tuong THAY cho chu, khong phai dung canh chu: de ca hai thi o phai chua
       // duoc ca anh lan chu, va so the vua man tut xuong.
@@ -394,13 +519,26 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
     }
     tabs[i].value = static_cast<int16_t>(that);
     tabs[i].selected = activeTab() == that;
+    tabs[i].indicator = tabIndicator(that);
   }
   tabProps.tabs = tabs;
   tabProps.count = static_cast<uint16_t>(count);
 
   const int16_t tabLineHeight = screen.target().lineHeight(tabProps.text.font);
   const int16_t preferredTabHeight = static_cast<int16_t>(preferredTabBarHeight());
-  const int16_t tabBand = preferredTabHeight > tabLineHeight + 10 ? preferredTabHeight : tabLineHeight + 10;
+  const int16_t tabBand = tenorchrome::kTouchShell ? tenorchrome::FOOT_BACK_SIZE
+      : (preferredTabHeight > tabLineHeight + 10 ? preferredTabHeight : tabLineHeight + 10);
+
+  if (tabPillMaxPad > 0) {
+    // Cap each pill at its label plus this padding: the equal-width slots (and
+    // so the tab positions) stay exactly where they were, only the pill stops
+    // stretching across the whole slot. The SDK shrinks the pill to content
+    // width and centers it in its slot when the horizontal contentInset is
+    // nonzero.
+    tabProps.contentInset.left = tabPillMaxPad;
+    tabProps.contentInset.right = tabPillMaxPad;
+  }
+
   // Legacy Lyra two-state treatment: with the selection on the tab band, the
   // band fills gray and the active tab is a solid pill; with the selection
   // down in the list, the band is plain and the active tab keeps a gray box
@@ -410,15 +548,7 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
   tabStyles.explicitlySet = true;
   tabStyles.normal.foreground = fui::Paint::solid(fui::Color::Black);
   if (tenorHome) {
-    // Gray inside a 2 px black ring. The ring's solid ink draws the corner: a gray dither alone
-    // samples it on even pixels only, in a phase that moves with each tab's position, so every
-    // tab showed a different corner. A leaf of the cursor's own height.
-    tabStyles.selected.background = fui::Paint::dither(fui::Color::LightGray);
-    tabStyles.selected.foreground = fui::Paint::solid(fui::Color::Black);
-    tabStyles.selected.border = fui::Paint::solid(fui::Color::Black);
-    tabStyles.selected.borderWidth = 2;
-    tabStyles.selected.radius =
-        static_cast<uint8_t>(tenorradius::leaf(tabBand - tabProps.tabInset.top - tabProps.tabInset.bottom));
+    // Drawn by veThanhTheTenor: no pill styles.
   } else if (tabsFocused) {
     tabStyles.selected.background = fui::Paint::solid(fui::Color::Black);
     tabStyles.selected.foreground = fui::Paint::solid(fui::Color::White);
@@ -439,11 +569,31 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
   tabStyles.focused = tabStyles.selected;
   tabStyles.active = tabStyles.selected;
   tabProps.tabStyles = tabStyles;
-  const fui::Rect contentTabRect = screen.takeTop(tabBand);
   const fui::Rect frameRect = screen.frame().screen();
-  // Tab chrome is a full-width screen band like the legacy GUI tab bar. The
-  // remaining list content still stays inside the device safe area.
-  const fui::Rect tabRect{frameRect.x, contentTabRect.y, frameRect.width, contentTabRect.height};
+  fui::Rect tabRect;
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto layout = tenorchrome::x3ScreenLayout(renderer);
+    const int bottom = std::min<int>(screen.body().bottom(), layout.bodyRect.bottom());
+    screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(layout.bodyRect.y), 0,
+                                                  static_cast<int16_t>(renderer.getScreenHeight() - bottom), 0});
+    const auto& bar = layout.barRect;
+    tabRect = fui::Rect{static_cast<int16_t>(bar.x), static_cast<int16_t>(bar.y),
+                        static_cast<int16_t>(bar.width), static_cast<int16_t>(bar.height)};
+  } else if (tenorchrome::kTouchShell) {
+    // Touch: the bar shares the Back cell's 60 px band at every text size.
+    const auto bar = tenorchrome::touchTabBarRect(frameRect.width, frameRect.height);
+    const int left = tenorchrome::wantsFootBack(name.c_str())
+                         ? bar.x + bar.height + tenorchrome::FOOT_PILL_GAP - 8 : bar.x - 8;
+    tabRect = fui::Rect{static_cast<int16_t>(frameRect.x + left), static_cast<int16_t>(frameRect.y + bar.y),
+                        static_cast<int16_t>(bar.x + bar.width + 8 - left), static_cast<int16_t>(bar.height)};
+    const int bodyBottom = screen.body().y + screen.body().height;
+    if (bodyBottom > tabRect.y - 8) screen.takeBottom(static_cast<int16_t>(bodyBottom - (tabRect.y - 8)));
+  } else {
+    const fui::Rect contentTabRect = screen.takeTop(tabBand);
+    // Tab chrome is a full-width screen band like the legacy GUI tab bar. The
+    // remaining list content still stays inside the device safe area.
+    tabRect = fui::Rect{frameRect.x, contentTabRect.y, frameRect.width, contentTabRect.height};
+  }
   // O the nam trong phan giua; hai mang le hai ben danh cho mui ten.
   const fui::Rect theRect{static_cast<int16_t>(tabRect.x + leMuiTen), tabRect.y,
                           static_cast<int16_t>(tabRect.width - 2 * leMuiTen), tabRect.height};
@@ -452,12 +602,34 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
   if (tabsFocused && !metrics.tabPillFullSlot && !tenorHome) {
     screen.target().fill(tabRect, fui::Paint::dither(fui::Color::LightGray));
   }
-  fui::tabBar(screen.frame(), theRect, tabProps);
+  const bool readerTextPath = tenorchrome::x3ScreenLayoutEnabled() && !shell::uglyParts() &&
+      name == "TextSettings" && activityManager.x3NavigationPath("").front().icon == tenorchrome::X3PathIcon::Book;
+  if (shell::uglyParts() && tenorchrome::x3ScreenLayoutEnabled()) {
+    if (!uiTarget.paintingEnabled()) {
+      if (tabCount() > 1) {
+        const int group = menucustom::groupFor(name.c_str());
+        ugly::pageHints(renderer, tabLabel(menucustom::adjacent(group, activeTab(), tabCount(), -1)),
+                        tabLabel(menucustom::adjacent(group, activeTab(), tabCount(), 1)), renderer.getScreenHeight() - 52);
+      } else {
+        ugly::pathHints(renderer, headerTitle());
+      }
+    }
+  } else if (readerTextPath)
+    tenorchrome::drawX3ActivityPath(renderer, navigationLabel().c_str());
+  else if (tenorHome)
+    veThanhTheTenor(screen, theRect, tabs, count, tabProps.text);
+  else
+    fui::tabBar(screen.frame(), theRect, tabProps);
 
-  if (thanhTheChay) {
+  if (thanhTheChay && uiTarget.paintingEnabled() && !readerTextPath) {
     veMuiTenThe(tabRect, leMuiTen);
   }
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  if (!tenorchrome::x3ScreenLayoutEnabled()) screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+}
+
+void UiTabListActivity::drawChrome() {
+  if (tenorchrome::x3ScreenLayoutEnabled()) return;
+  UiListActivity::drawChrome();
 }
 
 void UiTabListActivity::commitTabNavigation() {

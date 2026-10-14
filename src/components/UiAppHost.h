@@ -57,21 +57,34 @@ class UiAppHost {
   // Gated snapshot-build + route: the common loop head. withLongPress forwards
   // the SDK long-press (rows must carry InputLongPress); routeHeld forwards
   // held frames for InputDrag elements (sliders, drag-select fields).
-  TouchRoute routeTouch(const MappedInputManager& input, bool withLongPress = false, bool routeHeld = false);
+  TouchRoute routeTouch(const MappedInputManager& input, bool withLongPress = false, bool routeHeld = false,
+                       unsigned long holdMs = 0);
+  // Touch (dynamic bar rule 11): how many rows a vertical swipe in this pass moves the list, by the one
+  // rule (TouchScroll.h) and the row pitch the last layout drew; 0 when the pass holds no vertical swipe.
+  int swipeRows(const MappedInputManager& input, const freeink::ui::ListNav& nav, int count,
+                freeink::ui::ActionId rowAction, int keepRows = 0) const;
+  // A button step moved nav.selected: the page the list shows by the one rule of the buttons
+  // (ButtonNavigator::pageTopAfterStep); touch keeps the minimal pull (ListNav::follow).
+  static void followStep(freeink::ui::ListNav& nav, int count);
 
   // Gated route of a caller-built snapshot, for flows that need the snapshot
   // before dispatch (e.g. a handler that reads "was this a release" state).
-  freeink::ui::ActionEvent route(const freeink::ui::InputSnapshot& snap);
+  freeink::ui::ActionEvent route(const freeink::ui::InputSnapshot& snap, const MappedInputManager& input);
 
   // Close the routing gate outside a render, e.g. when the data the
   // interaction table indexes is released mid-state. Reopens on renderUi().
   void closeRouting() { uiReady = false; }
+  // Touch: the hit rect of the tap routed just now (the row a value list opens from), else empty.
+  static freeink::ui::Rect dispatchingRect();
   bool routingReady() const { return uiReady.load(); }
 
   freeink::ui::GfxRendererTarget uiTarget;  // must precede `app`: the app holds a reference to it
   UiApp app;
 
  private:
+  void cancelStaleTouch(const MappedInputManager& input);
+  freeink::ui::ActionEvent routeApp(const freeink::ui::InputSnapshot& snap);
+  uint32_t touchContactGeneration = 0;
   // Opened by the render task after publication and closed on lifecycle/state
   // resets; read by the loop task (route*).
   std::atomic<bool> uiReady{false};

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Compile the production row builder/screen with the actual SDK list renderer.
+"""Compile the production row provider/screen with the actual SDK list renderer.
 
 Only display/font I/O and activity wiring are stubbed. The source functions are
-extracted verbatim so the baseline can run the same end-to-end row assertions.
+extracted verbatim. Since #3600 the SDK list pulls each drawn row through
+FileBrowserActivity::provideRow(), so nothing per file is materialized.
 """
 import argparse
 from pathlib import Path
@@ -33,25 +34,55 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     source = args.source.read_text()
     signatures = [
-        "void FileBrowserActivity::rebuildRowItems(",
-        "std::string getFileName(std::string filename) {",
+        "void formatFileName(const std::string& filename, char* buffer, const size_t bufferSize) {",
+        "void formatFileExtension(const std::string& filename, char* buffer, const size_t bufferSize) {",
         "std::string getFileExtension(const std::string& filename) {",
+        "const std::string& FileBrowserActivity::entryForVisibleRow(",
+        "void FileBrowserActivity::provideRow(",
+        "void FileBrowserActivity::prewarmRowGlyphs(",
         "void FileBrowserActivity::buildScreen(UiScreen& screen) {",
     ]
     functions = "\n\n".join(function(source, sig) for sig in signatures)
-    windowed = "const int first" in functions.split("\n", 1)[0]
     base = (REPO / "src/activities/UiListActivity.cpp").read_text()
     pin_state = base[base.index("struct PinDecoration {"):base.index("}  // namespace")]
     base_methods = "\n\n".join(function(base, sig) for sig in [
+        "void UiListActivity::frameRows(",
+        "UiListActivity::RowFrameLines UiListActivity::rowFrameLines(",
+        "void UiListActivity::reserveRowFrame(",
         "void UiListActivity::syncListViewport(",
+        "void UiListActivity::keepUglyRows(",
         "void UiListActivity::decoratePinnedRows(",
     ]).replace("UiListActivity::", "FileBrowserActivity::")
+    chrome = (REPO / "src/components/TenorMenuChrome.h").read_text()
+    start = chrome.index("#if defined(FREEINK_DEVICE_X4PRO)")
+    shell = chrome[start:chrome.index("#endif", start) + len("#endif")]
+    foot_x = next(line for line in chrome.splitlines() if line.startswith("constexpr int FOOT_BACK_X"))
+    foot_x += "\n" + next(line for line in chrome.splitlines() if line.startswith("constexpr bool roundFrames"))
+    browser_header = (REPO / "src/activities/home/FileBrowserActivity.h").read_text()
+    search_rows = next(line.strip().replace('static constexpr', 'constexpr')
+                       for line in browser_header.splitlines() if 'kSearchRows =' in line)
+    (args.output / 'production_shell.inc').write_text('namespace tenorchrome {\n' + shell + '\n}\n' + search_rows)
+    list_count = function(browser_header, 'int listCount() const override').replace(' override', '')
+    (args.output / 'production_row_count.inc').write_text(list_count)
+    row_opens = function(browser_header, "bool rowOpens(int row) const override").replace(
+        "bool rowOpens(int row) const override", "bool FileBrowserActivity::rowOpens(int row) const")
+    base_header = (REPO / "src/activities/UiListActivity.h").read_text()
+    framed = function(base_header, "virtual bool listFramed() const").replace(
+        "virtual bool listFramed() const", "bool FileBrowserActivity::listFramed() const")
     generated = args.output / "production_rows.inc"
-    generated.write_text(pin_state + "\n" + base_methods + "\n" + functions)
+    generated.write_text("namespace tenorchrome {\n" + foot_x +
+                         "\nstruct FrameSpan { int x, width; };\ntemplate <class R> inline FrameSpan frameSpan(const R&) { return {FOOT_BACK_X, 448}; }" +
+                         "\ninline bool enabled() { return true; }  // a board with buttons\n}\n" +
+                         framed + "\n" + row_opens + "\n" + pin_state + "\n" + base_methods + "\n" + functions)
     binary = args.output / "folder_rows"
     cmd = [args.compiler, "-std=c++20", "-O1", "-g", "-Wall", "-Wextra",
-           "-Wno-unused-parameter", f"-DWINDOWED={int(windowed)}",
+           "-Wno-unused-parameter",
            "-I" + str(args.output), "-I" + str(REPO / "freeink-sdk/libs/ui/FreeInkUI/include"),
+           "-I" + str(REPO / "src"),
+           "-I" + str(REPO / "lib/Memory"), "-I" + str(REPO / "lib/LibraryIndex"),
+           str(REPO / "src/components/FileSearch.cpp"), str(REPO / "src/components/FileSearchScan.cpp"),
+           str(REPO / "lib/LibraryIndex/LibraryText.cpp"),
+           "-I" + str(REPO / "freeink-sdk/libs/assets/Icons/include"),
            "-I" + str(REPO / "lib/Utf8"), "-I" + str(REPO / "lib/FsHelpers"),
            "-I" + str(REPO / "test/host_stubs"),
            str(HERE / "FolderRowsRegression.cpp"), str(REPO / "lib/Utf8/Utf8.cpp"),

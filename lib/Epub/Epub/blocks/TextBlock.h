@@ -2,8 +2,10 @@
 #include <EpdFontFamily.h>
 #include <HalStorage.h>
 
+#include <array>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -50,6 +52,9 @@ class TextBlock final : public Block {
   };
 
  private:
+  mutable std::array<int16_t, 4> stripBounds{};
+  mutable const GfxRenderer* boundsRenderer = nullptr;
+  mutable int boundsFont = 0;
   BlockStyle blockStyle;
   uint16_t numWords = 0;
   uint16_t textBytes = 0;  // total size of the text region, including NULs
@@ -68,7 +73,20 @@ class TextBlock final : public Block {
   const uint8_t* stylesArr = nullptr;
   const uint8_t* focusBoundaryArr = nullptr;  // null when !focusPresent
   const char* textArr = nullptr;
-  std::vector<std::string> rubyTexts;
+  struct RubyText {
+    uint16_t word = 0;
+    uint16_t length = 0;
+    std::unique_ptr<char[]> text;
+  };
+  static constexpr size_t MAX_RUBIES = 128;
+  static constexpr size_t MAX_RUBY_BYTES = 8192;
+  std::unique_ptr<RubyText[]> rubyTexts;
+  uint16_t rubyCount = 0;
+  uint16_t rubyCapacity = 0;
+  uint16_t rubyBytes = 0;
+  bool rubyPresent = false;
+  bool rubyRefused = false;
+  char* appendRuby(uint16_t word, size_t length);
   // Layout-only metadata. ChapterHtmlSlimParser moves it into Page::links
   // immediately; cached TextBlocks therefore keep the same compact format.
   std::vector<LinkSpan> linkSpans;
@@ -89,7 +107,7 @@ class TextBlock final : public Block {
   TextBlock(const TextBlock&) = delete;
   TextBlock& operator=(const TextBlock&) = delete;
 
-  void setBlockStyle(const BlockStyle& blockStyle) { this->blockStyle = blockStyle; }
+  void setBlockStyle(const BlockStyle& blockStyle) { this->blockStyle = blockStyle; boundsRenderer = nullptr; }
   const BlockStyle& getBlockStyle() const { return blockStyle; }
   bool isEmpty() override { return numWords == 0; }
   bool valid() const { return isValid; }
@@ -104,15 +122,17 @@ class TextBlock final : public Block {
   EpdFontFamily::Style wordStyle(const uint16_t i) const { return static_cast<EpdFontFamily::Style>(stylesArr[i]); }
   uint8_t focusBoundary(const uint16_t i) const { return focusPresent ? focusBoundaryArr[i] : 0; }
   uint16_t focusSuffixX(const uint16_t i) const { return focusPresent ? focusSuffixXArr[i] : 0; }
-  void setLetterSpacing(int8_t value) { letterSpacing = value; }
+  void setLetterSpacing(int8_t value) { letterSpacing = value; boundsRenderer = nullptr; }
   int8_t getLetterSpacing() const { return letterSpacing; }
-  void setDropCapHeight(uint16_t height) { dropCapHeight = height; }
+  void setDropCapHeight(uint16_t height) { dropCapHeight = height; boundsRenderer = nullptr; }
   uint16_t getDropCapHeight() const { return dropCapHeight; }
   bool hasRuby() const;
   int getRubyShift(int ascender) const { return hasRuby() ? (ascender / 2) : 0; }
-  const std::vector<std::string>& getRubyTexts() const { return rubyTexts; }
+  size_t getRubyCount() const { return rubyCount; }
+  std::string_view getRubyText(uint16_t word) const;
   std::vector<LinkSpan> takeLinkSpans() { return std::move(linkSpans); }
 
+  bool intersectsStrip(const GfxRenderer& renderer, int fontId, int x, int y) const;
   void render(const GfxRenderer& renderer, int fontId, int x, int y) const;
   BlockType getType() override { return TEXT_BLOCK; }
   bool serialize(HalFile& file) const;

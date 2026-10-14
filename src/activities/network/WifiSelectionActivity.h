@@ -1,4 +1,6 @@
 #pragma once
+#include "activities/X3ActivityLayout.h"
+#include "shells/ugly/UglyMarkSeed.h"
 
 #include <cstdint>
 #include <functional>
@@ -53,6 +55,8 @@ enum class WifiSelectionState {
  * The onComplete callback receives true if connected successfully, false if cancelled.
  */
 class WifiSelectionActivity final : public Activity, private UiAppHost {
+  x3activity::InfoPages x3Info;
+  mutable ugly::MarkState mark_;
   ButtonNavigator buttonNavigator;
 
   WifiSelectionState state = WifiSelectionState::SCANNING;
@@ -61,11 +65,9 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   // Number of real (scanned) networks, excluding the synthetic hidden-network entry
   size_t realNetworkCount = 0;
 
-  // Row buffers derived from `networks`, rebuilt only when it changes
-  // (processWifiScanResults()) instead of on every repaint - buildListScreen()
-  // used to re-derive a "+ * ||||" status string per network on every render
-  // (cursor move, tap flash, ...).
-  std::vector<std::string> networkStatuses;
+  // Row items derived from `networks`, rebuilt only when it changes
+  // (processWifiScanResults()) instead of on every repaint.
+  std::vector<std::string> uglyNetworkStatuses;
   std::vector<freeink::ui::ListItem> networkRowItems;
   void rebuildNetworkRowItems();
 
@@ -94,6 +96,8 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   // picker leaves with a cancelled result instead of showing the network list
   // or the on-screen keyboard.
   const bool savedNetworkOnly;
+  // Update boot keeps the picker on the saved-network attempt until it fails.
+  const bool deferManualNetworkList;
 
   // Whether we are attempting to auto-connect or auto-scan saved networks.
   bool autoConnecting = false;
@@ -143,10 +147,16 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   void buildPromptDialog(UiScreen& screen);
 
   void renderNetworkList(const Rect* screen, const ThemeMetrics* metrics);
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  void drawRowFrame() const;
+#endif
   void renderPasswordEntry(const Rect* screen, const ThemeMetrics* metrics) const;
   void renderConnecting(const Rect* screen, const ThemeMetrics* metrics) const;
   void renderConnected(const Rect* screen, const ThemeMetrics* metrics) const;
   void renderConnectionFailed(const Rect* screen, const ThemeMetrics* metrics) const;
+  bool renderUglyNote() const;
+  void renderUglyList();
+  void renderUglyPrompt();
 
   void stopWifiRadio();
   void startWifiScan(bool autoScan = false);
@@ -164,7 +174,6 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   void handleAutoConnectFailure();
   void showNetworkListFromAutoConnect();
   bool hasAttemptedAutoSsid(const std::string& ssid) const;
-  static std::string getSignalStrengthIndicator(int32_t rssi);
 
   // True when this caller must not show the network list or the keyboard: the
   // picker reports "not connected" so the parent can start its own hotspot.
@@ -173,10 +182,14 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   void onComplete(bool connected);
 
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Network; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_WIFI_NETWORKS); }
   explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true,
-                                 bool syncClock = true, bool savedNetworkOnly = false);
+                                 bool syncClock = true, bool savedNetworkOnly = false,
+                                 bool deferManualNetworkList = false);
   void onEnter() override;
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
+  bool preventAutoSleep() override { return true; }
 };

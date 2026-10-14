@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "FontInstaller.h"
 #include "UploadSocket.h"
 #include "WebTransferAuth.h"
 
@@ -101,6 +102,7 @@ class CrossPointWebServer {
   // The owning activity applies and publishes the UI font tier under its
   // RenderLock. A server without an owner callback rejects this setting.
   void setUiTextSizeApplier(std::function<bool(uint8_t)> applier);
+  void setFontPackApplier(std::function<bool(const char*)> applier);
 
   // Asked on every received chunk of an HTTP upload. True drops that upload: the partial
   // file is removed and the client disconnected, so the request no longer holds the loop.
@@ -143,6 +145,9 @@ class CrossPointWebServer {
   bool udpActive = false;
   power_timeout::WebSessionLifecycle sessionLifecycle;
   std::function<bool(uint8_t)> uiTextSizeApplier;
+  std::function<bool(const char*)> fontPackApplier;
+  bool prepareFontPackUpload(String& path, const String& filename);
+  bool applyFontPackUpload(const String& path, const String& filename);
   std::function<bool()> uploadCancel;
   bool uploadCancelled();
   // Socket of the HTTP upload being read, for interruptUpload().
@@ -170,12 +175,14 @@ class CrossPointWebServer {
   // Request handlers
   void handleRoot() const;
   void handleTheme() const;
+  void handleWebI18n() const;
   void handleJszip() const;
   void handleNotFound() const;
   void handleStatus() const;
   void handleFileList() const;
   void handleFileListData() const;
   void handleDownload();
+  void handleQuotesExport();
   void handleUpload(UploadState& state);
   void handleUploadPost(UploadState& state) const;
   void handleCreateFolder() const;
@@ -203,6 +210,10 @@ class CrossPointWebServer {
     std::string filePath;
     bool valid = false;
     bool magicChecked = false;
+    bool pack = false;
+    bool vector = false;       // .ttf/.otf: header and size are judged by `check`
+    const char* code = nullptr;  // why a vector or name check failed (page maps it to text)
+    FontInstaller::VectorUploadCheck check;
     size_t bytesWritten = 0;
     size_t bufferPos = 0;
   } fontUpload;

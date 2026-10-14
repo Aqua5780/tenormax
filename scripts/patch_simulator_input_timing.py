@@ -63,6 +63,19 @@ patch(
             "    std::this_thread::sleep_for(std::chrono::milliseconds(refreshMs));\n"
             "}\n",
         ),
+        (
+            "void HalDisplay::displayWindow(int, int, int, int) {\n"
+            "  refreshDisplay(RefreshMode::FAST_REFRESH, false);\n"
+            "}\n",
+            "void HalDisplay::displayWindow(int x, int y, int width, int height) {\n"
+            "  std::printf(\"WINDOW begin ms=%lu panel=%d,%d %dx%d\\n\", millis(), x, y, width, height);\n"
+            "  refreshDisplay(RefreshMode::FAST_REFRESH, false);\n"
+            "  const char *windowMsValue = std::getenv(\"CROSSPOINT_SIM_WINDOW_MS\");\n"
+            "  const long windowMs = windowMsValue ? std::strtol(windowMsValue, nullptr, 10) : 0;\n"
+            "  if (windowMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(windowMs));\n"
+            "  std::printf(\"WINDOW end ms=%lu\\n\", millis());\n"
+            "}\n",
+        ),
     ],
 )
 
@@ -131,3 +144,131 @@ patch(
         ),
     ],
 )
+
+# A slow drag of 60 px or more (the flick's own distance) is a swipe whatever its duration, as in
+# InputManager::wasSwipe. A dependency patched when the distance was 160 px moves to 60 first.
+_gpio = root / "HalGPIO.cpp"
+_was = _gpio.read_text()
+_now = _was.replace("std::abs(dx) < 160 && std::abs(dy) < 160)", "std::abs(dx) < 60 && std::abs(dy) < 60)")
+if _now != _was:
+    _gpio.write_text(_now)
+patch(
+    root / "HalGPIO.cpp",
+    [
+        (
+            "  if (!touchState.releasedThisFrame || touchState.suppressed ||\n"
+            "      touchState.lastHeldMs > TOUCH_SWIPE_MAX_MS)\n"
+            "    return false;\n"
+            "  const float dx =\n"
+            "      (touchState.currentNx - touchState.startNx) * HalDisplay::DISPLAY_WIDTH;\n"
+            "  const float dy =\n"
+            "      (touchState.currentNy - touchState.startNy) * HalDisplay::DISPLAY_HEIGHT;\n",
+            "  if (!touchState.releasedThisFrame || touchState.suppressed)\n"
+            "    return false;\n"
+            "  const float dx =\n"
+            "      (touchState.currentNx - touchState.startNx) * HalDisplay::DISPLAY_WIDTH;\n"
+            "  const float dy =\n"
+            "      (touchState.currentNy - touchState.startNy) * HalDisplay::DISPLAY_HEIGHT;\n"
+            "  if (touchState.lastHeldMs > TOUCH_SWIPE_MAX_MS && std::abs(dx) < 60 && std::abs(dy) < 60)\n"
+            "    return false;\n",
+        ),
+    ],
+)
+
+# A SWIPE in the input script moves the finger: one point 20 ms after the touch-down, at the far end, so a
+# slow drag is a drag and not a hold (the real panel reports the finger all along).
+patch(
+    root / "HalGPIO.cpp",
+    [
+        ("  TouchDown,\n  TouchUp,\n", "  TouchDown,\n  TouchMove,\n  TouchUp,\n"),
+        (
+            "    case SyntheticAction::TouchUp:\n      endTouch(event.logicalNx, event.logicalNy);\n      break;\n",
+            "    case SyntheticAction::TouchMove:\n      moveTouch(event.logicalNx, event.logicalNy);\n      break;\n"
+            "    case SyntheticAction::TouchUp:\n      endTouch(event.logicalNx, event.logicalNy);\n      break;\n",
+        ),
+        (
+            "          syntheticEvents.push_back(\n"
+            "              {atMs + duration, SyntheticAction::TouchUp, -1, x2, y2});\n",
+            "          if (swipe)\n"
+            "            syntheticEvents.push_back({atMs + 20, SyntheticAction::TouchMove, -1, x2, y2});\n"
+            "          syntheticEvents.push_back(\n"
+            "              {atMs + duration, SyntheticAction::TouchUp, -1, x2, y2});\n",
+        ),
+    ],
+)
+
+# App-routing fixture for the SDK's already classified multi-contact queue.
+# MULTISWIPE:count,x0,y0,x1,y1,ms contains logical coordinates; it emits no
+# single-contact down/up. SDK classifier/GT911 acceptance is tested separately.
+patch(root / 'HalGPIO.h', [(
+    '  bool wasTouchActivity() const;\n',
+    '  bool popMultiTouchSwipe(uint8_t &contacts, float &sx, float &sy, float &ex, float &ey,\n'
+    '                          unsigned long &durationMs);\n'
+    '  bool wasTouchActivity() const;\n',
+), (
+    '  bool popMultiTouchSwipe(uint8_t &contacts, float &sx, float &sy, float &ex, float &ey,\n',
+    '  bool touchContactsAt(uint8_t &count, float &nx, float &ny) const;\n'
+    '  bool popMultiTouchSwipe(uint8_t &contacts, float &sx, float &sy, float &ex, float &ey,\n',
+)])
+patch(root / 'HalGPIO.cpp', [(
+    'std::vector<SyntheticEvent> syntheticEvents;\n',
+    'struct MultiSwipeEvent {\n'
+    '  unsigned long atMs, duration;\n'
+    '  uint8_t contacts;\n'
+    '  float sx, sy, ex, ey;\n'
+    '  bool handled = false;\n'
+    '};\n'
+    'std::vector<MultiSwipeEvent> multiSwipeEvents;\n'
+    'std::vector<SyntheticEvent> syntheticEvents;\n',
+), (
+    '      } else if ((key == "TAP" || key == "SWIPE") &&\n',
+    '      } else if (key == "MULTISWIPE" && secondColon != std::string::npos) {\n'
+    '        const std::string detail = item.substr(secondColon + 1);\n'
+    '        const auto comma = detail.find(\',\');\n'
+    '        const int contacts = std::atoi(detail.c_str());\n'
+    '        float sx = 0, sy = 0, ex = 0, ey = 0;\n'
+    '        unsigned long duration = 0;\n'
+    '        if (contacts >= 1 && contacts <= 4 && comma != std::string::npos &&\n'
+    '            parseTouchSpec(detail.substr(comma + 1), sx, sy, ex, ey, duration, true))\n'
+    '          multiSwipeEvents.push_back({atMs + duration, duration, static_cast<uint8_t>(contacts), sx, sy, ex, ey});\n'
+    '      } else if ((key == "TAP" || key == "SWIPE") &&\n',
+), (
+    'bool HalGPIO::wasSwipe(float &nxStart, float &nyStart, float &nxEnd,\n',
+    'bool HalGPIO::popMultiTouchSwipe(uint8_t &contacts, float &sx, float &sy, float &ex, float &ey,\n'
+    '                                unsigned long &durationMs) {\n'
+    '  for (auto &event : multiSwipeEvents) {\n'
+    '    if (event.handled || millis() < event.atMs) continue;\n'
+    '    event.handled = true;\n'
+    '    contacts = event.contacts;\n'
+    '    durationMs = event.duration;\n'
+    '    logicalToPanelNormalized(event.sx, event.sy, sx, sy);\n'
+    '    logicalToPanelNormalized(event.ex, event.ey, ex, ey);\n'
+    '    return true;\n'
+    '  }\n'
+    '  return false;\n'
+    '}\n\n'
+    'bool HalGPIO::wasSwipe(float &nxStart, float &nyStart, float &nxEnd,\n',
+), (
+    'bool HalGPIO::popMultiTouchSwipe(uint8_t &contacts, float &sx, float &sy, float &ex, float &ey,\n',
+    '// The simulator has one pointer: never two contacts live.\n'
+    'bool HalGPIO::touchContactsAt(uint8_t &count, float &, float &) const {\n'
+    '  count = 0;\n'
+    '  return false;\n'
+    '}\n\n'
+    'bool HalGPIO::popMultiTouchSwipe(uint8_t &contacts, float &sx, float &sy, float &ex, float &ey,\n',
+)])
+
+# The simulator's trimmed BoardConfig predates the warm-channel capability.
+# Persist the same setting key as the X4 Pro SDK profile.
+patch(root / 'BoardConfig.h', [(
+    '#pragma once\n',
+    '#pragma once\n\n#if defined(SIMULATOR_DEVICE_X4_PRO) && !defined(FREEINK_CAP_WARMLIGHT)\n'
+    '#define FREEINK_CAP_WARMLIGHT 1\n#endif\n',
+)])
+
+# The simulator refreshes synchronously, so the panel is never busy after a refresh returns.
+patch(root / 'HalDisplay.h', [(
+    '  bool supportsAsyncRefresh() const;\n',
+    '  bool supportsAsyncRefresh() const;\n'
+    '  bool refreshBusy() { return false; }\n',
+)])

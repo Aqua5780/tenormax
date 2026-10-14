@@ -1,4 +1,7 @@
 #include "OpdsBookBrowserActivity.h"
+#include "activities/X3ActivityLayout.h"
+
+#include "components/PageScrollbar.h"
 
 #include <Arduino.h>
 #include <FontCacheManager.h>
@@ -6,10 +9,15 @@
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
+#include <LibraryBuilder.h>
 #include <Logging.h>
 #include <OpdsStream.h>
 #include <WiFi.h>
 
+#include "shells/Shell.h"
+#include "shells/ugly/UglyChrome.h"
+#include "shells/ugly/UglyLayout.h"
+#include "shells/ugly/UglyNote.h"
 #include "CrossPointSettings.h"
 #include "FileTransferState.h"
 #include "MappedInputManager.h"
@@ -20,10 +28,12 @@
 #include "components/SettledListRender.h"
 #include "components/UIScale.h"
 #include "components/UITheme.h"
+#include "components/icons/headerIcons.h"
 #include "components/icons/search32.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
 #include "util/BookCacheUtils.h"
+#include "util/OpdsFeedError.h"
 #include "util/OpdsFilename.h"
 #include "util/StringUtils.h"
 #include "util/UrlUtils.h"
@@ -34,9 +44,27 @@ namespace {
 constexpr fui::ActionId ACTION_ROW = 1;
 constexpr fui::ActionId ACTION_SEARCH = 2;
 constexpr fui::ActionId ACTION_CANCEL = 3;
+constexpr fui::ActionId ACTION_BACK = 4;
 constexpr int DOWNLOAD_PROGRESS_STEP_PERCENT = 5;
 constexpr unsigned long DOWNLOAD_PROGRESS_MIN_UPDATE_MS = 5000;
 
+// Tells a dead server from a catalog that wants a password; both are a bare
+// "failed" to the fetch itself. Read right after a failed fetch.
+StrId feedFailureMessage() {
+  switch (classifyFeedFailure(HttpDownloader::lastStatus(), HttpDownloader::lastAnswerRedirected())) {
+    case OpdsFeedError::Unreachable:
+      return StrId::STR_FEED_UNREACHABLE;
+    case OpdsFeedError::Unauthorized:
+      return StrId::STR_FEED_UNAUTHORIZED;
+    case OpdsFeedError::Redirected:
+      return StrId::STR_FEED_REDIRECTED;
+    case OpdsFeedError::ServerError:
+      return StrId::STR_FEED_SERVER_ERROR;
+    case OpdsFeedError::Other:
+      break;
+  }
+  return StrId::STR_FETCH_FEED_FAILED;
+}
 }  // namespace
 
 OpdsBookBrowserActivity::OpdsBookBrowserActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -73,6 +101,7 @@ void OpdsBookBrowserActivity::onEnter() {
   app.on(ACTION_ROW, &OpdsBookBrowserActivity::onRowEvent, this);
   app.on(ACTION_SEARCH, &OpdsBookBrowserActivity::onSearchEvent, this);
   app.on(ACTION_CANCEL, &OpdsBookBrowserActivity::onCancelEvent, this);
+  app.on(ACTION_BACK, &OpdsBookBrowserActivity::onBackEvent, this);
   app.setScreen(&OpdsBookBrowserActivity::rootScreen, this);
   requestUpdate();
 
@@ -120,6 +149,13 @@ void OpdsBookBrowserActivity::onSearchEvent(const fui::ActionEvent&, void* user)
   self->launchSearch();
 }
 
+void OpdsBookBrowserActivity::onBackEvent(const fui::ActionEvent&, void* user) {
+  auto* self = static_cast<OpdsBookBrowserActivity*>(user);
+  if (self->state != BrowserState::BROWSING) return;
+  self->app.clearTapFlash();
+  self->navigateBack();
+}
+
 void OpdsBookBrowserActivity::onCancelEvent(const fui::ActionEvent&, void* user) {
   auto* self = static_cast<OpdsBookBrowserActivity*>(user);
   if (self->state != BrowserState::DOWNLOADING) return;
@@ -135,6 +171,13 @@ bool OpdsBookBrowserActivity::idleExitDue(const unsigned long now, const bool in
 }
 
 void OpdsBookBrowserActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() && state != BrowserState::BROWSING &&
+      x3Info.turn(mappedInput.wasReleased(MappedInputManager::Button::Up) ? -1 :
+                  mappedInput.wasReleased(MappedInputManager::Button::Down) ? 1 : 0)) {
+    requestUpdate();
+    return;
+  }
+
   const bool interaction = mappedInput.wasAnyPressed() || mappedInput.wasAnyReleased() ||
                            mappedInput.wasScreenTouchReleased();
   if (idleExitDue(millis(), interaction)) {
@@ -198,17 +241,26 @@ void OpdsBookBrowserActivity::loop() {
     if (!entries.empty()) {
       // Swipes scroll the viewport; the selection stays put (it may scroll
       // off-screen) and button navigation pulls the view back to it.
-      const auto swipe = mappedInput.wasSwipe();
-      if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down) {
-        const int delta = swipe == MappedInputManager::SwipeDir::Up ? listNav.visibleRows : -listNav.visibleRows;
-        if (listNav.scrollBy(delta, static_cast<int>(entries.size()))) requestUpdate();
-        return;
+      if (tenorchrome::kTouchShell) {
+        // Touch: the one rule for every list (UiAppHost::swipeRows).
+        const int delta = swipeRows(mappedInput, listNav, static_cast<int>(entries.size()), ACTION_ROW);
+        if (delta != 0) {
+          if (listNav.scrollBy(delta, static_cast<int>(entries.size()))) requestUpdate();
+          return;
+        }
+      } else {
+        const auto swipe = mappedInput.wasSwipe();
+        if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down) {
+          const int delta = swipe == MappedInputManager::SwipeDir::Up ? listNav.visibleRows : -listNav.visibleRows;
+          if (listNav.scrollBy(delta, static_cast<int>(entries.size()))) requestUpdate();
+          return;
+        }
       }
 
       const auto moveSelection = [this](const int index) {
         selectorIndex = index;
         listNav.selected = index;
-        listNav.follow(static_cast<int>(entries.size()));
+        followStep(listNav, static_cast<int>(entries.size()));
         requestUpdate();
       };
       buttonNavigator.onNextRelease(
@@ -243,32 +295,61 @@ void OpdsBookBrowserActivity::rootScreen(UiScreen& screen, void* user) {
 // Shared chrome for every state: reserve the firmware's button-hint band and
 // draw the themed header (padding, centering, and rule come from the theme).
 void OpdsBookBrowserActivity::screenHeader(UiScreen& screen, const bool withSearch) {
-  if (tenorchrome::enabled()) {
-    drawNavigationHeader(server.name.empty() ? tr(STR_OPDS_BROWSER) : server.name.c_str());
-    screen.setContentMarginFromScreen(fui::Insets{
-        tenorchrome::contentTop(), 0, static_cast<int16_t>(UITheme::getInstance().getMetrics().buttonHintsHeight), 0});
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto layout = tenorchrome::x3ScreenLayout(renderer);
+    screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(layout.bodyRect.y), 0,
+        static_cast<int16_t>(renderer.getScreenHeight() - layout.bodyRect.bottom()), 0});
     return;
   }
 
-  screen.takeBottom(static_cast<int16_t>(UITheme::getInstance().getMetrics().buttonHintsHeight));
-  // Same top offset as every GUI.drawHeader caller, so the band lines up with
-  // the rest of the firmware's screens.
-  screen.spacer(static_cast<int16_t>(UITheme::getInstance().getMetrics().topPadding));
+  if (tenorchrome::enabled()) {
+    drawNavigationHeader(server.name.empty() ? tr(STR_OPDS_BROWSER) : server.name.c_str());
+    screen.setContentMarginFromScreen(fui::Insets{
+        tenorchrome::contentTop(), 0,
+        static_cast<int16_t>(tenorchrome::footReserve(UITheme::getInstance().getMetrics().buttonHintsHeight)), 0});
+    return;
+  }
+
+  // Classic (non-Tenor) themes: upstream's unified header (#3689), with a
+  // touch back button and search icon.
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const auto& theme = screen.theme();
   fui::HeaderProps header;
   header.title = server.name.empty() ? tr(STR_OPDS_BROWSER) : server.name.c_str();
   header.borderEdges = fui::EdgeBottom;
+  // Same battery/clock band as every GUI.drawHeader screen; the header
+  // heights are unified across themes, so the buttons derive from the band.
+  GUI.applyHeaderStatus(renderer, header);
+  // Only the browsing state routes header taps (and only there does back mean
+  // anything); the loading/downloading/status headers stay passive.
+  if (state == BrowserState::BROWSING && mappedInput.hasTouch()) {
+    header.leadingIcon = fui::bitmapFromIcon(icon_header_back_32);
+    header.leadingAction = ACTION_BACK;
+  }
   if (withSearch && !searchTemplate.empty()) {
     header.trailingIcon = fui::bitmapFromIcon(icon_search_32);
     header.trailingAction = ACTION_SEARCH;
-    // Optically align the icon with the title glyphs: text hangs low in its
-    // line cell by the font's internal leading; drop the button to match.
-    const int titleFontId = uiScaleSpec().titleFontId;
-    header.actionOffsetY =
-        static_cast<int16_t>((renderer.getLineHeight(titleFontId) - renderer.getTextHeight(titleFontId)) / 2);
+    // Vertical placement comes from applyHeaderStatus: buttons center on the
+    // unified band.
   }
-  screen.header(header);
-  // Same breathing room between header and content as the legacy screens.
-  screen.spacer(static_cast<int16_t>(UITheme::getInstance().getMetrics().verticalSpacing));
+  header.titleText = theme.titleText;
+  header.titleText.align = theme.headerTitleAlign;
+  header.styles = theme.popup;
+  if (header.styles.normal.border.kind == fui::PaintKind::None && theme.headerUnderline > 0) {
+    header.styles.normal.border = fui::Paint::solid(fui::Color::Black);
+    header.styles.normal.borderWidth = theme.headerUnderline;
+  }
+  header.trailingStyles = fui::plainStyles(fui::Paint::solid(fui::Color::Black));
+  header.sidePadding = theme.headerSidePadding;
+  header.minTouchSize = theme.minTouchSize;
+  const auto frameRect = screen.frame().screen();
+  fui::header(screen.frame(),
+              fui::Rect{frameRect.x, static_cast<int16_t>(metrics.topPadding), frameRect.width,
+                        static_cast<int16_t>(metrics.headerHeight)},
+              header);
+  screen.setContentMarginFromScreen(
+      fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing), 0,
+                  static_cast<int16_t>(metrics.buttonHintsHeight), 0});
 }
 
 void OpdsBookBrowserActivity::buildBrowsingScreen(UiScreen& screen) {
@@ -290,17 +371,13 @@ void OpdsBookBrowserActivity::buildBrowsingScreen(UiScreen& screen) {
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
   props.valueInset = 8;               // air between the nav chevron and the row edge
   listNav.selected = selectorIndex;
-  int16_t rowHeight = screen.theme().rowHeight;
-  if (!mappedInput.hasTouch()) {
-    // Non-touch hardware (X3/X4) keeps the original, denser row height
-    // instead of FreeInkUI's touch-target-sized default (see
-    // UiListActivity::syncListViewport; this screen predates that base and
-    // syncs its own viewport directly). Book rows carry an author subtitle.
-    rowHeight = static_cast<int16_t>(UITheme::getInstance().getMetrics().listWithSubtitleRowHeight);
-    props.rowHeight = rowHeight;
-  }
-  listNav.syncToProps(screen.body(), rowHeight, screen.theme().listRowGap, static_cast<int>(entries.size()), props);
+  props.partialTrailingRow = true;
+  if (tenorchrome::kTouchShell) props.rowInset = tenorchrome::FOOT_BACK_X;
+  screen.syncListViewport(listNav, props, static_cast<int>(entries.size()));
+  props.scrollIndicator = false;
+  const auto viewport = screen.body();
   screen.list(props);
+  PageScrollbar::instance().drawList(renderer, screen.target(), viewport, listNav, static_cast<int>(entries.size()));
 }
 
 void OpdsBookBrowserActivity::buildDownloadScreen(UiScreen& screen) {
@@ -364,7 +441,58 @@ void OpdsBookBrowserActivity::buildStatusScreen(UiScreen& screen) {
   screen.centeredText(statusMessage.c_str(), centered);
 }
 
+// Every state but the list is a note page: loading, the download with its bar, an error with its reason.
+void OpdsBookBrowserActivity::renderUglyNote() {
+  const char* title = server.name.empty() ? tr(STR_OPDS_BROWSER) : server.name.c_str();
+  ugly::Hints hints;
+  hints.back = true;
+  if (state == BrowserState::DOWNLOADING) {
+    const int percent =
+        downloadTotal > 0 ? static_cast<int>(static_cast<uint64_t>(downloadProgress) * 100 / downloadTotal) : -1;
+    ugly::notePage(renderer, mappedInput, title, tr(STR_UGLY_OPDS_DOWNLOADING), statusMessage.c_str(), percent, hints);
+  } else if (state == BrowserState::ERROR) {
+    hints.confirm = true;
+    ugly::notePage(renderer, mappedInput, title, tr(STR_UGLY_OPDS_FAILED), errorMessage.c_str(), -1, hints);
+  } else {
+    ugly::notePage(renderer, mappedInput, title, statusMessage.c_str(), nullptr, -1, hints);
+  }
+}
+
 void OpdsBookBrowserActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    if (state == BrowserState::BROWSING) {
+      x3Info.page = 0;
+      x3Info.pages = 1;
+      const auto layout = tenorchrome::x3ScreenLayout(renderer);
+      renderer.clearScreen();
+      renderSettledList(listNav, [this] { renderUi(); });
+      x3activity::drawBar(renderer, layout.barRect, server.name.empty() ? tr(STR_OPDS_BROWSER) : server.name.c_str(),
+                          navigationPrefix.c_str());
+      const char* confirm = !entries.empty() && entries[selectorIndex].type == OpdsEntryType::BOOK ? tr(STR_DOWNLOAD) : tr(STR_OPEN);
+      const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirm,
+          !searchTemplate.empty() && selectorIndex == 0 ? tr(STR_SEARCH) : tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+      GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+      renderer.displayBuffer();
+      return;
+    }
+    char progress[64] = {};
+    if (state == BrowserState::DOWNLOADING) snprintf(progress, sizeof(progress), "%lu / %lu B",
+        static_cast<unsigned long>(downloadProgress), static_cast<unsigned long>(downloadTotal));
+    const char* tip = nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip, 8));
+    renderer.clearScreen();
+    x3Info.draw(renderer, layout.bodyRect, {state == BrowserState::ERROR ? errorMessage.c_str() : statusMessage.c_str(), progress});
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect, 8);
+    x3activity::drawBar(renderer, layout.barRect, server.name.empty() ? tr(STR_OPDS_BROWSER) : server.name.c_str(), navigationPrefix.c_str());
+    const auto labels = mappedInput.mapLabels(state == BrowserState::DOWNLOADING ? tr(STR_CANCEL) : tr(STR_BACK), state == BrowserState::ERROR ? tr(STR_RETRY) : "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+    renderer.displayBuffer();
+    return;
+  }
+
+  const bool ugly = shell::uglyParts();
+  if (ugly && state != BrowserState::BROWSING) return renderUglyNote();
   MappedInputManager::Labels labels;
   switch (state) {
     case BrowserState::BROWSING: {
@@ -387,9 +515,17 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   renderSettledList(listNav, [&] {
     renderer.clearScreen();
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-    renderUi();
+    if (!ugly) return renderUi();
+    // The list by hand where the layout put it, the circle on the chosen entry.
+    ugly::layoutByHand(renderer, uiTarget, [this] { renderUi(); });
+    const auto box = app.publishedRect(ACTION_ROW, static_cast<int16_t>(selectorIndex));
+    if (!box.empty()) uglychrome::marks(renderer, box, {true}, mark_.get(selectorIndex));
   });
+  if (ugly) PageScrollbar::instance().repaint(renderer, uiTarget);
   renderer.displayBuffer();
+#ifdef UGLY_FRAME_LOG
+  if (ugly) LOG_INF("UGLY", "OPDS list frame entries=%u sel=%d", static_cast<unsigned>(entries.size()), selectorIndex);
+#endif
 }
 
 void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
@@ -407,7 +543,7 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
     OpdsParserStream stream{parser};
     if (!HttpDownloader::fetchUrl(url, stream, server.username, server.password)) {
       state = BrowserState::ERROR;
-      errorMessage = tr(STR_FETCH_FEED_FAILED);
+      errorMessage = I18N.get(feedFailureMessage());
       requestUpdate();
       return;
     }
@@ -571,11 +707,11 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
         }
         // The activity loop is blocked for the whole download; pump input here
         // so the Cancel button or a Back press can abort mid-transfer.
-        mappedInput.update();
+        mappedInput.update(true);
         if (mappedInput.wasReleased(MappedInputManager::Button::Back)) cancelDownload = true;
-        // This update() consumes the one-shot home event before the central
-        // ActivityManager dispatch can see it, so honor it here: abort the
-        // download, then exit to home once the abort unwinds.
+        // Home cancels immediately; other configured actions are deferred to
+        // the next main-loop pass by the transfer input pump. A held Back is
+        // Tenor's own cancel shortcut alongside the released-Back check above.
         if (mappedInput.wasLongPressed(MappedInputManager::Button::Back, 1000) || mappedInput.wasHomeGesture()) {
           cancelDownload = true;
           goHomeAfterCancel = true;
@@ -596,6 +732,10 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
       &cancelDownload, server.username, server.password);
 
   if (result == HttpDownloader::OK) {
+    // Restored: a same-path re-download must not serve a stale cached frame,
+    // and the library index (#3366/#3608) needs to pick up the new file.
+    clearBookCache(filename);
+    library::markLibraryIndexDirty();
     state = BrowserState::LOADING;
     statusMessage = tr(STR_LOADING);
     fetchFeed(currentPath);

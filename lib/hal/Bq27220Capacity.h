@@ -3,9 +3,11 @@
 #include <cstdint>
 
 // Loads the fitted battery's capacity into a BQ27220 fuel gauge that still holds TI's 3000 mAh
-// default, following the Data Memory update of the BQ27220 Technical Reference Manual (SLUUBD4A,
-// section 6.1). The gauge keeps that memory in RAM only (TRM 3.1, 8.1.4): a power-on reset, such
-// as a battery run flat, brings 3000 mAh back, so the check runs at every start.
+// default, or whose FullChargeCapacity() reads more than a quarter above it (a capacity learned
+// against that default), following the Data Memory update of the BQ27220 Technical Reference
+// Manual (SLUUBD4A, section 6.1). The gauge keeps that memory in RAM only (TRM 3.1, 8.1.4): a
+// power-on reset, such as a battery run flat, brings 3000 mAh back, so the check runs at every
+// start.
 //
 // Nothing here blocks: tick() makes the bus transactions that are due and returns, and the waits
 // the gauge needs are deadlines against the clock passed in. Every path that unlocked the gauge
@@ -24,7 +26,9 @@ class Bq27220Capacity {
     ~Bus() = default;
   };
 
-  enum class Result : uint8_t { Pending, NotNeeded, Loaded, Failed };
+  // Resealed: the target was already in, but the gauge was left in CONFIG UPDATE or unsealed (a
+  // load cut short before a restart), and the check took it out and sealed it.
+  enum class Result : uint8_t { Pending, NotNeeded, Loaded, Resealed, Failed };
   // Where the load is, or where it gave up.
   enum class Stage : uint8_t { Check, Access, WaitEnter, Block, WaitExit, Seal, Done };
 
@@ -42,6 +46,8 @@ class Bq27220Capacity {
   bool running() const { return stage != Stage::Check && stage != Stage::Done; }
   // DesignCapacity() read after sealing (or the one that needed no load), 0 when unread.
   uint16_t designCapacity() const { return dcRead; }
+  // OperationStatus() read by the check, 0 when unread.
+  uint16_t statusAtCheck() const { return checkStatus; }
 
   // TRM 6.1 step 11: the new MACDataSum() from the old one, replacing one two-byte parameter.
   static uint8_t replaceChecksum(uint8_t oldSum, uint8_t oldMsb, uint8_t oldLsb, uint8_t newMsb, uint8_t newLsb);
@@ -63,7 +69,8 @@ class Bq27220Capacity {
 
  public:
   // Where a Data Memory write stopped, for the log: 1 select, 2 read back (value = what came back),
-  // 3 reads, 4 length (value = length and sum), 5 old value (value = the old value), 6 writes.
+  // 3 reads, 4 length (value = length and sum), 5 old value neither replaced nor the target (value =
+  // the old value), 6 writes.
   uint8_t detail = 0;
   uint16_t detailValue = 0;
 
@@ -73,7 +80,9 @@ class Bq27220Capacity {
   bool failed = false;
   bool inConfigUpdate = false;  // ENTER_CFG_UPDATE sent, no exit sent yet
   bool wroteData = false;       // a MACData() write was started
+  bool resealing = false;       // the check found the target in, the gauge not yet sealed
   uint16_t dcRead = 0;
+  uint16_t checkStatus = 0;
   uint32_t sentAt = 0;
   uint32_t nextAt = 0;
 };

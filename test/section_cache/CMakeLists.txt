@@ -28,6 +28,7 @@ add_executable(SectionCacheTest
   ${SECTION_SOURCE_ROOT}/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
   ${SECTION_SOURCE_ROOT}/lib/Epub/Epub/css/CssParser.cpp
   ${SECTION_SOURCE_ROOT}/lib/Epub/Epub/ParsedText.cpp
+  ${SECTION_SOURCE_ROOT}/lib/Epub/Epub/WordStore.cpp
   ${SECTION_SOURCE_ROOT}/lib/Epub/Epub/converters/ImageDimsProbe.cpp
   ${SECTION_SOURCE_ROOT}/lib/Utf8/Utf8.cpp
 )
@@ -47,5 +48,5 @@ target_include_directories(SectionCacheTest PRIVATE
   ${SECTION_SOURCE_ROOT}/lib/XmlParserUtils
   ${REPO_ROOT}/freeink-sdk/libs/hardware/SDCardManager/include)
 target_link_libraries(SectionCacheTest PRIVATE GTest::gtest_main expat)
-# Keep host scheduling contention out of the paired partial/cold timing gate.
-gtest_discover_tests(SectionCacheTest PROPERTIES RUN_SERIAL TRUE)
+target_compile_definitions(SectionCacheTest PRIVATE TENOR_SECTION_HOST_TEST=1)
+gtest_discover_tests(SectionCacheTest)

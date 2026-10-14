@@ -1,7 +1,9 @@
 #include "XtcReaderActivity.h"
+#include "components/TenorMenuChrome.h"
 
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HeapFloor.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Memory.h>
@@ -76,7 +78,7 @@ XtcReaderActivity::StatusBarInfo XtcReaderActivity::getStatusBarInfo() const {
   std::string title = sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE ? xtc->getTitle() : "";
 
   if (!xtc->hasChapters()) {
-    return StatusBarInfo{bookPage, bookPageCount, std::move(title)};
+    return StatusBarInfo{bookPage, bookPageCount, std::move(title), {}};
   }
 
   const auto& chapters = xtc->getChapters();
@@ -85,7 +87,7 @@ XtcReaderActivity::StatusBarInfo XtcReaderActivity::getStatusBarInfo() const {
   });
 
   if (chapterIt == chapters.end() || chapterIt->endPage < chapterIt->startPage) {
-    return StatusBarInfo{bookPage, bookPageCount, std::move(title)};
+    return StatusBarInfo{bookPage, bookPageCount, std::move(title), {}};
   }
 
   if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
@@ -93,7 +95,8 @@ XtcReaderActivity::StatusBarInfo XtcReaderActivity::getStatusBarInfo() const {
   }
 
   return StatusBarInfo{static_cast<int>(currentPage - chapterIt->startPage) + 1,
-                       static_cast<int>(chapterIt->endPage - chapterIt->startPage) + 1, std::move(title)};
+                       static_cast<int>(chapterIt->endPage - chapterIt->startPage) + 1, std::move(title),
+                       chapterIt->name.empty() ? tr(STR_UNNAMED) : chapterIt->name};
 }
 
 void XtcReaderActivity::renderStatusBarOverlay(GfxRenderer& renderer, const StatusBarOverlayPosition position) const {
@@ -141,23 +144,31 @@ void XtcReaderActivity::renderStatusBarOverlay(GfxRenderer& renderer, const Stat
   const int pageCount = static_cast<int>(xtc->getPageCount());
   const int displayPage = static_cast<int>(currentPage) + 1;
   const float progress = pageCount > 0 ? (static_cast<float>(displayPage) * 100.0f) / pageCount : 0.0f;
-  const auto pageInfo = getStatusBarInfo();
-  GUI.drawStatusBar(renderer, progress, pageInfo.currentPage, pageInfo.pageCount, pageInfo.title, paddingBottom);
+  auto pageInfo = getStatusBarInfo();
+  const bool linkNote = sb.showsTitle() && linkNoteTitle(pageInfo.title);
+  if (sb.slotsEnabled) {
+    tenorchrome::drawReaderSlots(renderer, pageInfo.title.c_str(), pageInfo.currentPage, pageInfo.pageCount, progress,
+                                 false, false, -1, -1, pageInfo.chapterName.c_str(), !linkNote);
+    return;
+  }
+  GUI.drawStatusBar(renderer, progress, pageInfo.currentPage, pageInfo.pageCount, pageInfo.title, paddingBottom, 0,
+                    true, false, false, !linkNote);
 }
 
 void XtcReaderActivity::renderPage() {
   const uint16_t pageWidth = xtc->getPageWidth();
   const uint16_t pageHeight = xtc->getPageHeight();
   const uint8_t bitDepth = xtc->getBitDepth();
+  // XTC 2-bit stores native raster grays, so the glyph AA policy does not change them.
 
   size_t pageBufferSize;
   if (bitDepth == 2) {
-    pageBufferSize = ((static_cast<size_t>(pageWidth) * pageHeight + 7) / 8) * 2;
+    pageBufferSize = static_cast<size_t>(pageWidth) * ((static_cast<size_t>(pageHeight) + 7) / 8) * 2;
   } else {
     pageBufferSize = ((pageWidth + 7) / 8) * pageHeight;
   }
 
-  uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));
+  uint8_t* pageBuffer = static_cast<uint8_t*>(heapfloor::take(pageBufferSize, "xtc-page"));
   if (!pageBuffer) {
     LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes)", pageBufferSize);
     renderer.clearScreen();
@@ -182,7 +193,7 @@ void XtcReaderActivity::renderPage() {
   const uint16_t maxSrcY = pageHeight;
 
   if (bitDepth == 2) {
-    const size_t planeSize = (static_cast<size_t>(pageWidth) * pageHeight + 7) / 8;
+    const size_t planeSize = static_cast<size_t>(pageWidth) * ((static_cast<size_t>(pageHeight) + 7) / 8);
     const uint8_t* plane1 = pageBuffer;
     const uint8_t* plane2 = pageBuffer + planeSize;
     const size_t colBytes = (pageHeight + 7) / 8;
@@ -260,6 +271,7 @@ void XtcReaderActivity::renderPage() {
     free(pageBuffer);
 
     LOG_DBG("XTR", "Rendered page %lu/%lu (2-bit grayscale)", currentPage + 1, xtc->getPageCount());
+    markPageRendered();
     return;
   } else {
     const size_t srcRowBytes = (pageWidth + 7) / 8;
@@ -290,6 +302,7 @@ void XtcReaderActivity::renderPage() {
   ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
 
   LOG_DBG("XTR", "Rendered page %lu/%lu (%u-bit)", currentPage + 1, xtc->getPageCount(), bitDepth);
+  markPageRendered();
 }
 
 bool XtcReaderActivity::latTrangThat(bool isForward) {

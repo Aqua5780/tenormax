@@ -10,8 +10,8 @@
 #include <EpdFontFamily.h>
 #include <CjkTextWrap.h>
 #include <Utf8.h>
-#include <builtinFonts/bevietnampro_8_regular.h>
-#include <builtinFonts/bevietnampro_10_regular.h>
+#include <builtinFonts/geist_8_regular.h>
+#include <builtinFonts/geist_10_regular.h>
 #include <builtinFonts/geist_12_regular.h>
 
 constexpr int SMALL_FONT_ID = 1;
@@ -21,7 +21,11 @@ struct Settings {
   bool hidden = false, large = false, tenorButtonSymbols = true;
   bool globalStatusBarHidden() const { return hidden; }
   bool globalStatusBarLarge() const { return large; }
+  int clockFormat = 0;
 } SETTINGS;
+// The hand-drawn key bar of tenor/ugly asks the clock; this harness measures tenor/cross only.
+namespace clockstatus { inline bool hasValidTime() { return false; } }
+struct { bool formatTime(char*, int, bool) const { return false; } } halClock;
 int normalizedUiTextSize(int value) { return value; }
 struct GPIO { bool hasTouch() const { return false; } } gpio;
 struct Metrics { int buttonHintsHeight; };
@@ -42,10 +46,10 @@ struct GfxRenderer {
   int fontOverride = -1;
   const EpdFontData& font() const {
     const int face = fontOverride < 0 ? SETTINGS.uiTextSize : fontOverride;
-    return face == 0 ? bevietnampro_8_regular : face == 1 ? bevietnampro_10_regular : geist_12_regular;
+    return face == 0 ? geist_8_regular : face == 1 ? geist_10_regular : geist_12_regular;
   }
   const EpdFont& fontObject() const {
-    static const EpdFont fonts[] = {EpdFont(&bevietnampro_8_regular), EpdFont(&bevietnampro_10_regular), EpdFont(&geist_12_regular)};
+    static const EpdFont fonts[] = {EpdFont(&geist_8_regular), EpdFont(&geist_10_regular), EpdFont(&geist_12_regular)};
     return fonts[SETTINGS.uiTextSize];
   }
   const std::map<int, EpdFontFamily> fontMap = {{SMALL_FONT_ID, EpdFontFamily(&fontObject())}};
@@ -150,6 +154,24 @@ namespace buttonSymbols {
 struct SymbolBounds { int left, right; };
 SymbolBounds horizontalBounds(const char* label, int) { return std::strcmp(label, "symbol") == 0 ? SymbolBounds{8, 8} : SymbolBounds{0, 0}; }
 bool drawLabel(const GfxRenderer&, const char* label, int, int, int) { return std::strcmp(label, "symbol") == 0; }
+int labelId(const char*) { return -1; }
+}
+// tenor/cross geometry only: the hand-drawn branch of tenor/ugly is never taken here.
+namespace shell {
+inline bool uglyParts() { return false; }
+}
+namespace ugly {
+enum class Size { S22 };
+enum class Mark { Left, Right, Up, Down, Tick, Back };
+inline int paragraph(const GfxRenderer&, Size, int, int, int, int, const char*, bool = true) { return 1; }
+inline void mark(const GfxRenderer&, Mark, int, int) {}
+inline std::string fit(const GfxRenderer&, Size, const std::string& s, int) { return s; }
+inline int width(const GfxRenderer&, Size, const char*) { return 0; }
+struct Box { int x0, y0, x1, y1; };
+inline Box textBounds(const GfxRenderer&, Size, const char*) { return {0, 0, 0, 0}; }
+inline int ascent(Size) { return 20; }
+inline int text(const GfxRenderer&, Size, int, int, const char*, bool = true) { return 0; }
+inline void statusBar(const GfxRenderer&, const char*, const char*, const char*, const char*) {}
 }
 int fallbackCalls = 0;
 struct BaseTheme {
@@ -159,7 +181,8 @@ struct TenorTheme {
   void drawButtonHints(GfxRenderer&, const char*, const char*, const char*, const char*) const;
   static void drawHintLabel(const GfxRenderer& r, int font, const char* label, int x, int width, int top, int height, int offset) {
     ++fallbackCalls;
-    assert(top == r.getScreenHeight() - UITheme::getInstance().getMetrics().buttonHintsHeight);
+    const int lift = SETTINGS.uiTextSize == 0 && !SETTINGS.globalStatusBarLarge() ? 1 : 0;
+    assert(top == r.getScreenHeight() - UITheme::getInstance().getMetrics().buttonHintsHeight - lift);
     assert(height == UITheme::getInstance().getMetrics().buttonHintsHeight - 5);
     assert(offset == 4);
     BaseTheme::drawHintLabel(r, font, label, x, width, top, height, offset);
@@ -213,7 +236,8 @@ int main() {
     bool retained = true;
     for (size_t i = 0; i < before.size(); ++i) if (before[i] && !fallback.pixels[i]) retained = false;
     check(retained, "text fallback clear erased a legacy tip");
-    check(fallback.ys.size() == 3, "fallback did not render its two supplied wrapped lines");
+    // Tier 0 stacks the two wrapped lines in the footer box; larger text keeps one row under the path bar.
+    check(fallback.ys.size() == (tier == 0 ? 3 : 2), "fallback caption has the wrong number of rows for its size");
     SETTINGS.tenorButtonSymbols = false;
     GfxRenderer text;
     tenorchrome::drawTip(text, "g");
@@ -223,7 +247,7 @@ int main() {
     GfxRenderer off;
     tenorchrome::drawTip(off, "g");
     TenorTheme{}.drawButtonHints(off, "symbol", "symbol", "symbol", "symbol");
-    check(off.ys.empty() && std::none_of(off.pixels.begin(), off.pixels.end(), [](auto p) { return p != 0; }), "status off drew footer ink");
+    check(off.ys.size() == 1, "status off must keep tips and omit button-label text");
     SETTINGS.hidden = false;
     std::printf("tier=%d caption=%d fallback reserve=%d\n", tier, text.getLineHeight(1), UITheme::getInstance().getMetrics().buttonHintsHeight);
 
@@ -242,7 +266,7 @@ int main() {
               forced.ys.front() + forced.getTextInkTop(1, firstForcedLine, EpdFontFamily::REGULAR),
           "footer-tip reserve must begin at the first actual glyph row");
   }
-  assert(fallbackCalls == 3);
+  assert(fallbackCalls == 1);
   for (int tier = 0; tier < 3; ++tier) {
     SETTINGS.uiTextSize = tier;
     for (const char* label : {"Cập nhật", "Chọn mạng", "Download", "Mạng", "Tải về", "ẤN CHỌN", "ẬP ẬP"}) {
@@ -256,18 +280,42 @@ int main() {
                   r.getTextWidth(1, label), r.ys.size(), r.attemptedInkTop, r.attemptedInkBottom, boxTop, boxBottom);
       check(r.attemptedInkTop >= boxTop && r.attemptedInkBottom <= boxBottom,
             "fallback label ink escapes its box into panel edge or dither");
-      if (std::strcmp(label, "Cập nhật") == 0 || std::strcmp(label, "Chọn mạng") == 0)
+      // A two-word action wraps only when it is wider than one line holds: Geist 8 sets "Cập nhật" in 69 px.
+      const bool wraps = r.getTextWidth(1, label) > 72;
+      if (tier == 0 && wraps && (std::strcmp(label, "Cập nhật") == 0 || std::strcmp(label, "Chọn mạng") == 0))
         check(r.ys.size() == 2, "readable two-word action lost its second line");
-      if (std::strcmp(label, "Cập nhật") == 0)
+      if (tier == 0 && wraps && std::strcmp(label, "Cập nhật") == 0)
         check(r.paintedText == std::vector<std::string>{"Cập", "nhật"}, "update action lost letters or accents");
-      if (std::strcmp(label, "Chọn mạng") == 0)
+      if (tier == 0 && std::strcmp(label, "Chọn mạng") == 0)
         check(r.paintedText == std::vector<std::string>{"Chọn", "mạng"}, "network action lost letters or accents");
-      if (r.getTextWidth(1, label) <= 72) {
-        const int expected = boxTop + (tier == 0 ? 4 : std::max(1, (reserve - 5 - r.getLineHeight(1)) / 2));
-        check(r.ys.front() == expected, "ordinary single-line label moved");
+      // Larger text: one row in the empty cells beside the caption, never a second line over the path bar.
+      if (tier != 0 && label[0] != '\0') check(r.ys.size() == 1, "larger text caption must stay on one row");
+      if (r.getTextWidth(1, label) <= 72 || tier != 0) {
+        const auto bar = tenorchrome::x3ScreenLayout(r).barRect;
+        check(r.attemptedInkTop >= bar.bottom() && r.attemptedInkBottom <= 787,
+              "symbol-mode caption touches the shared path bar");
       }
     }
   }
+  // A caption beside a symbol may use the room up to the symbol's ink, not up to the symbol's whole 80 px cell.
+  SETTINGS.uiTextSize = 1;
+  {
+    GfxRenderer r;
+    r.screenHeight = 792;
+    TenorTheme{}.drawButtonHints(r, "Cập nhật", "symbol", "", "");
+    check(r.paintedText == std::vector<std::string>{"Cập nhật"}, "caption beside a symbol was cut short");
+  }
+  // The text footer at the largest size is one row: no label wraps into a second line or loses a word.
+  SETTINGS.uiTextSize = 2;
+  SETTINGS.tenorButtonSymbols = false;
+  {
+    GfxRenderer r;
+    r.screenHeight = 792;
+    TenorTheme{}.drawButtonHints(r, "« Trở về", "Bật/tắt", "Lên", "Xuống");
+    check(r.paintedText == std::vector<std::string>{"« Trở về", "Bật/tắt", "Lên", "Xuống"},
+          "text footer label wrapped or cut at the larger size");
+  }
+  SETTINGS.tenorButtonSymbols = true;
   // Same production painter, with the 40px Base/Lyra and 35px Tenor boxes.
   // Small caption fonts also model Base's 10pt hint font while uiTextSize=0.
   for (int face = 0; face < 2; ++face) {

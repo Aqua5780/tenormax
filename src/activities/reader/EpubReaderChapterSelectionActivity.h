@@ -9,6 +9,7 @@
 class EpubReaderChapterSelectionActivity final : public UiListActivity {
   std::shared_ptr<Epub> epub;
   int currentSpineIndex = 0;
+  int currentTocIndex = -1;  // the chapter being read, marked at the end of its row
 
   // Windowed row buffers: TOC entries are SD-backed (BookMetadataCache LUT
   // reads), so only the rows around the viewport are materialized. A
@@ -44,6 +45,10 @@ class EpubReaderChapterSelectionActivity final : public UiListActivity {
     return !epub ? 0 : filterNumber ? (searching ? 0 : matchCount + (moreMatches ? 1 : 0)) : epub->getTocItemsCount();
   }
   void buildScreen(UiScreen& screen) override;
+  bool ownsX3Chrome() const override { return true; }
+  bool framedOnButtons() const override { return true; }
+  tenorchrome::X3ScreenLayout screenLayout() const;
+  void drawX3Content() const;
   void activateIndex(int index) override;
   // Back cancels with a result and Confirm activates on RELEASE here, and a
   // missing epub swallows everything past Back.
@@ -52,6 +57,8 @@ class EpubReaderChapterSelectionActivity final : public UiListActivity {
   void drawChrome() override;
 
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Position; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_SELECT_CHAPTER); }
   explicit EpubReaderChapterSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                               const std::shared_ptr<Epub>& epub, int currentSpineIndex);
   void onEnter() override;

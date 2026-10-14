@@ -1,8 +1,24 @@
 #pragma once
+#include "shells/ugly/UglyMarkSeed.h"
+
+#include <array>
 
 #include "activities/Activity.h"
+#include "components/OptionPopup.h"
+#include "components/FileSearchReveal.h"
+#include "components/PageScrollbar.h"
+#include "components/SettingsChoiceStyle.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UiAppHost.h"
 #include "util/ButtonNavigator.h"
+
+// Touch (C1): every list's row frame is the one panel ring (tenorchrome::drawPanel). A list whose rows sit on a
+// page that scrolls under the chrome (Stats) cuts the frame to the band the rows show in.
+struct ListRowFrameStyle {
+  // Band the frame is cut to; 0, 0 = no cut.
+  int16_t clipTop = 0;
+  int16_t clipBottom = 0;
+};
 
 // Base for activities hosting a single FreeInkUI list screen. UiAppHost owns
 // the app-hosting protocol (render target, FreeInkApp, uiReady handshake);
@@ -17,6 +33,7 @@
 class UiListActivity : public Activity, protected UiAppHost {
  public:
   void onEnter() override;
+  void onResume() override;
   std::string navigationLabel() const override {
     const auto* title = headerTitle();
     return title ? title : "";
@@ -26,6 +43,9 @@ class UiListActivity : public Activity, protected UiAppHost {
   void restoreNavigation(const MenuNavigationState& state) override;
   void loop() override;
   void render(RenderLock&&) override;
+  uint64_t uglyIconPageKey() override { return static_cast<uint32_t>(activeNav().top); }
+  // Every list screen polls the motion sensor itself: the row tilt walks its rows.
+  bool managesTiltSensor() const override { return true; }
 
   // Kep con tro ve trong so dong dang co.
   //
@@ -51,9 +71,107 @@ class UiListActivity : public Activity, protected UiAppHost {
   }
 
  protected:
+  mutable ugly::MarkState mark_;
+  // A pin toggle for the selected row (or `row`), applied by the next loop pass that can take the render lock.
+  void queuePinToggle(const int row = -1) {
+    pendingPin = true;
+    pendingPinFromTouch = true;
+    pendingPinRow = row;
+  }
+  // Touch: the actions of a held row in one menu anchored to it (rowMenu). `anchorAction`/`anchorValue`
+  // name the hit the menu hangs from: the row itself, or another touch target (the Home card's lines).
+  OptionPopup rowMenu;
+  void showRowMenu(const StrId* labels, int count, std::function<void(int)> onSelect, freeink::ui::ActionId anchorAction,
+                   int anchorValue);
   void renderUi();
+  virtual int settingsChoiceCount(int row) const { return 0; }
+  // ListProps::rowHasMark: the row carries the pop-up mark renderUi draws after its value.
+  static bool rowHasPopupMark(const void* list, uint16_t row);
+  virtual SettingsChoiceStyle rowChoiceStyle(int row) const {
+    return settingsChoiceStyle(settingsChoiceCount(row), tenorchrome::kTouchShell);
+  }
+  void showSettingsChoices(OptionPopup& popup, StrId title, const std::vector<std::string>& labels,
+                           int selected, int row, std::function<void(int)> onSelect);
+  void showSettingsChoices(OptionPopup& popup, StrId title, const StrId* labels, int count,
+                           int selected, int row, std::function<void(int)> onSelect);
   bool tabBandDrawn = false;
   void reserveFixedMenuContent(UiScreen& screen);
+  // Touch (dynamic bar rule 7, C1): list rows in a round grey frame, grey dotted rules between them.
+  // syncListViewport and syncTabListViewport set the rows in (frameRows); renderUi draws the frame.
+  virtual bool listFramed() const { return true; }
+  // The button boards (X3) frame the rows of the screens that ask, as the touch board frames every list: the group ring
+  // across the tab bar's width, the rules between rows, the cursor pill kept inside it.
+  virtual bool framedOnButtons() const { return false; }
+  bool framedByDesign() const;
+  // The pinned row's heart stands after its name (the reader menu) rather than before it.
+  virtual bool pinMarkAfterName() const { return false; }
+  virtual void drawPinMarks() {}
+  // A File screen (founder 07/10): its rows keep the framed list's rules, fades and scroll bar, without the ring
+  // (tenorchrome::roundFrames).
+  virtual bool fileList() const { return false; }
+  virtual bool canSearchFiles() const { return false; }
+  virtual const char* fileSearchText() const { return ""; }
+  virtual void openFileSearch() {}
+  filesearch::Reveal fileSearchReveal;
+  void buildFileSearch(UiScreen& screen);
+  // A row that opens a deeper screen: drawRowFrame ends it with the grey ">" (its value stands before it).
+  virtual bool rowOpens(int row) const { return false; }
+  // A row under a section heading (ListItem::sectionHeading): drawRowFrame closes the frame above it and opens
+  // one more, a frame a group.
+  virtual bool rowStartsGroup(int row) const { return false; }
+  void frameRows(freeink::ui::ListProps& props);
+  // The band a list's frame is cut to (ListRowFrameStyle).
+  using RowFrameStyle = ListRowFrameStyle;
+  virtual RowFrameStyle rowFrameStyle() const { return {}; }
+  void drawRowFrame(const RowFrameStyle& style = {});
+  void measurePageScrollbar(UiScreen& screen, const freeink::ui::ListProps& props);
+  void setPageScrollRegion(int top, int bottom, int length, int offset);
+  void drawPageScrollbar();
+  struct PageScrollRegion {
+    int top = 0, bottom = 0, length = 0, offset = 0;
+  } pageScrollRegion;
+  // Bounds of the panel ring actually painted around a visible row.  This is
+  // the single source of truth for nested choices: callers pass these bounds
+  // to OptionPopup::showInFrame instead of reconstructing a second geometry.
+  bool rowFrameFor(freeink::ui::ActionId action, int value, freeink::ui::Rect& out) const;
+  bool rowsFramed = false;
+  // Where the lines of a row frame go for a row gap: the grey rule `rule` px above a row's top (in the gap), the
+  // ring `top` px above the first row and `bottom` px below the last, so that every row, the first and the last
+  // too, has the same height between its lines. One rule for the framed lists and Home's Settings groups.
+  struct RowFrameLines {
+    int rule, top, bottom;
+  };
+  // `air` is the least height kept between the ring and the first or last row (a cursor pill needs it).
+  static RowFrameLines rowFrameLines(int rowGap, int air = 0);
+  int rowFrameAir() const { return tenorchrome::kTouchShell ? 0 : 8; }
+  // Keeps the room of the ring above and below the rows of a framed list; records the list body's foot.
+  void reserveRowFrame(UiScreen& screen, int rowGap);
+  int rowFrameGap = 0;
+  // The rows the last layout drew from, for the hand-drawn skin (syncListViewport/syncTabListViewport keep it).
+  const freeink::ui::ListItem* uglyItems_ = nullptr;
+  uint16_t uglyItemsFirst_ = 0;
+  void (*uglyRowProvider_)(void*, uint16_t, freeink::ui::ListItem&) = nullptr;
+  void* uglyRowCtx_ = nullptr;
+  void keepUglyRows(const freeink::ui::ListProps& props);
+  // Foot of the list body the rows were laid out in: the fade under the last full row stops there, above any
+  // chrome under the list (the touch tab bar).
+  int rowFrameFloor = 0;
+  struct DrawnRowFrame {
+    freeink::ui::ActionId action = 0;
+    int first = -1;
+    int last = -1;
+    freeink::ui::Rect rect{};
+  };
+  static constexpr int MAX_DRAWN_ROW_FRAMES = 16;
+  std::array<DrawnRowFrame, MAX_DRAWN_ROW_FRAMES> drawnRowFrames{};
+  int drawnRowFrameCount = 0;
+  // Rows a page turn keeps from the page before: the faded first row of a framed list.
+  int fadeKeepRows() const { return rowsFramed ? 1 : 0; }
+  // The faded ends of a framed list as the last frame drew them (y from, y to; empty when to <= from): a row
+  // there takes no tap of its own, a tap there scrolls to it. Written by the render task, read by the loop.
+  int fadeTopFrom = 0, fadeTopTo = 0, fadeFootFrom = 0, fadeFootTo = 0;
+  bool routeFadedTap();
+  bool rowsHaveIcons = false;
   // Base-owned row action; subclass-registered actions start at ACTION_USER.
   static constexpr freeink::ui::ActionId ACTION_ROW = 1;
   static constexpr freeink::ui::ActionId ACTION_USER = 2;
@@ -73,11 +191,14 @@ class UiListActivity : public Activity, protected UiAppHost {
   virtual void activateIndex(int index) = 0;
   // Touch long-press on a row; only fires when the subclass opted in via the
   // wantsTouchLongPress constructor flag (rows must also carry InputLongPress).
-  virtual void onRowLongPress(int index) {}
+  // Default on the touch shell: a row that can be pinned offers Pin or Unpin in the row menu.
+  virtual void onRowLongPress(int index);
+  virtual unsigned long touchHoldMs() const { return 0; }
   // The selection/viewport state the loop, sync, and row dispatch operate on.
   // Default is the single `nav` member; UiTabListActivity redirects it to the
   // active tab's per-tab state.
   virtual freeink::ui::ListNav& activeNav() { return nav; }
+  virtual uint64_t selectionMarkKey() { return static_cast<uint32_t>(activeNav().selected); }
   // Bounds-checked ACTION_ROW dispatch. Default: selection follows the tapped
   // row, then long-press/activate. UiTabListActivity remaps row -> ring.
   virtual void onRowAction(const freeink::ui::ActionEvent& event);
@@ -126,6 +247,18 @@ class UiListActivity : public Activity, protected UiAppHost {
   // Subclass clamp, run under the render lock after every applied intent and on
   // every pass with an empty queue (UiTabListActivity: the ring cursor).
   virtual bool clampAfterNav() { return false; }
+  // The motion sensor, once per pass before the buttons: a plain list takes the row tilt alone;
+  // UiTabListActivity adds the tab flick.
+  virtual void pollTilt();
+  // The row tilt, armed after the poll (the sensor reads the arming one pass later): one gesture
+  // is one row, wrap included, as the up and down buttons move. A value list open over the rows
+  // (tiltPopup) takes it instead.
+  void pollRowTilt();
+  virtual bool allowsTiltMenuNavigation() const { return true; }
+  bool acceptsTiltMenuNavigation() const;
+  bool queueTiltMenuNavigation(bool up, bool down);
+  // The screen's value list, when it has one; the row tilt steps it while it is open.
+  virtual OptionPopup* tiltPopup() { return nullptr; }
   // Release edges for Select/Back. A Select that arrives while moves are still
   // queued is remembered and reported on the pass that applies them, so it acts
   // on the row the user can see; with an empty queue it fires immediately. Back
@@ -138,14 +271,17 @@ class UiListActivity : public Activity, protected UiAppHost {
   virtual bool supportsFavorites() const { return false; }
   virtual std::string favoriteKey(int row) const { return {}; }
   virtual int favoriteSelectedRow() { return activeNav().selected; }
+  virtual bool buttonHoldOpensRowMenu(int row) const { return false; }
   virtual int focusFavorite(const std::string& key);
   virtual void favoritesChanged() {}
   virtual bool toggleFavorite(int row);
   virtual bool rowIsPinned(int row) const;
   void decoratePinnedRows(freeink::ui::ListProps& props);
   void reserveFavoriteHint(UiScreen& screen);
-  void reserveMoreBelowChevron(UiScreen& screen, int16_t rowHeight, int rowGap);
-  const char* favoriteHintText();
+  // Buttons: the faded band under the last full row when rows go on, and where it stops on the right.
+  void fadeMoreBelow();
+  int rowFadeRight = 0;
+  virtual const char* favoriteHintText();
   virtual int favoriteHintLinesAbove() const { return 0; }
   virtual bool handleCustomInput() { return false; }
   // Back/Confirm handling; override wholesale for press/release or hold
@@ -155,9 +291,21 @@ class UiListActivity : public Activity, protected UiAppHost {
   // Header band, drawn before the app renders. Default paints GUI.drawHeader
   // with headerTitle(); override either for custom chrome.
   virtual const char* headerTitle() const { return nullptr; }
+  // tenor/ugly on the button boards: the list is laid out as usual and its words written by hand where they
+  // stand, with the pen marks of the rows; the header, the tips and the key bar draw by hand on their own. A
+  // screen that paints what the hand cannot follow yet says false.
+  virtual bool uglySkin() const { return true; }
+  // Lays out and paints the list by hand when the skin applies; the caller then displays the buffer.
+  bool renderUglyList();
   virtual void drawChrome();
+  virtual bool ownsX3Chrome() const { return false; }
   // Button hints, drawn after the app renders. Default: Back/Select/Up/Down.
   virtual void drawFooter();
+  // The side-button arrows (Tenor chrome, setting tenorSideArrows). A screen with a drawing level with them,
+  // where they would read as part of it, turns them off.
+  virtual bool showsSideArrows() const { return true; }
+  // Whether drawPageHints puts the arrows on the screen edges now.
+  bool drawsSideArrows() const;
 
   // --- helpers ---------------------------------------------------------------
   // Measure visibleRows for the screen band, apply follow-on-build, clamp the
@@ -190,10 +338,20 @@ class UiListActivity : public Activity, protected UiAppHost {
   // activeNav() in shared code; `nav` is the single-list default storage.
   freeink::ui::ListNav nav;
   ButtonNavigator buttonNavigator;
+  bool favoriteSaveFailed = false;
 
  private:
   static void screenTrampoline(UiScreen& screen, void* user);
   static void rowActionTrampoline(const freeink::ui::ActionEvent& event, void* user);
+  static void fileSearchTrampoline(const freeink::ui::ActionEvent& event, void* user);
+  static constexpr freeink::ui::ActionId ACTION_FILE_SEARCH = 0x7FFE;
+  bool routeFileSearchDrag();
+  freeink::ui::Rect fileSearchBody{};
+  filesearch::Reveal pendingFileSearchReveal;
+  bool fileSearchRevealPending = false;
+  bool fileSearchDragTracked = false;
+  bool fileSearchDragAtTop = false;
+  bool fileSearchDragBlocked = false;
   // Named apart from UiAppHost::routeTouch so the host overload stays visible
   // (not name-hidden) to subclasses with extra touch surfaces.
   bool routeListTouch();
@@ -205,13 +363,13 @@ class UiListActivity : public Activity, protected UiAppHost {
   bool applyBoundary(bool last, bool ring);
   NavIntent popNavIntent();
 
-  void drawPageHints();
+  void drawPageHints(bool overScrollbar = false);
   const bool wantsTouchLongPress;
   std::string pendingFavorite;
   std::string favoriteOrigin;
   bool activateFavorite = true;
-  bool favoriteSaveFailed = false;
   int favoriteHintY = -1;
+  int pageAnchorRow = -1;  // touch: the row whose page the next layout shows (syncListViewport)
   NavIntent navQueue[NAV_QUEUE_SIZE];
   uint8_t navQueueHead = 0;
   uint8_t navQueueCount = 0;
@@ -219,4 +377,6 @@ class UiListActivity : public Activity, protected UiAppHost {
   // confirmReleased), and a pin hold waiting for a pass that can take the lock.
   bool pendingConfirm = false;
   bool pendingPin = false;
+  bool pendingPinFromTouch = false;  // for the log line only
+  int pendingPinRow = -1;
 };

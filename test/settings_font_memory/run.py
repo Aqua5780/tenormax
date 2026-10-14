@@ -40,12 +40,20 @@ base = (r / 'src/activities/Activity.h').read_text()
 (out / 'activities/settings').mkdir(parents=True, exist_ok=True)
 descriptor = header[header.index('enum class SettingType'):header.index('class SettingsActivity final')]
 (out / 'activities/settings/SettingsActivity.h').write_text(
-    '#pragma once\n#include <functional>\n#include <string>\n#include <vector>\n'
+    '#pragma once\n#include <functional>\n#include <span>\n#include <string>\n#include <vector>\n'
     '#include <I18n.h>\n#include "CrossPointSettings.h"\n'
-    '#include "activities/settings/SettingsTabs.h"\n' + descriptor)
+    '#include "activities/settings/SettingsTabs.h"\n'
+    '#include "components/SettingsChoiceStyle.h"\n'
+    'namespace tenorchrome {\n'
+    '#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO\n'
+    'constexpr bool kTouchShell = true;\n'
+    '#else\n'
+    'constexpr bool kTouchShell = false;\n'
+    '#endif\n}\n' + descriptor)
 methods = ''.join(method(source, sig) for sig in [
     'std::vector<SettingInfo>& SettingsActivity::danhSachCuaThe',
-    'void SettingsActivity::rebuildSettingsLists()',
+    'bool SettingsActivity::listedAsRow(',
+    'void SettingsActivity::rebuildSettingsLists(',
     'void SettingsActivity::rebuildRowItems()'])
 for name in ['onPause', 'onResume']:
     signature = 'void SettingsActivity::' + name + '()'
@@ -61,7 +69,11 @@ font_source = (r / 'src/activities/settings/FontDownloadActivity.cpp').read_text
 (out / 'PostWifiMethods.inc').write_text(method(font_source, 'void FontDownloadActivity::onWifiSelectionComplete'))
 # Reuse the established hardware/storage boundaries, not its SettingsActivity test double.
 boundary = (r / 'test/settings_catalog/category/harness.cpp').read_text()
-boundary = boundary[boundary.index('HalTiltSensor halTiltSensor;'):boundary.index('struct SettingsActivity {')]
+# Keep shared hardware/storage boundaries; this harness owns its lock and form boundaries.
+end = boundary.index('struct RenderLock {') if 'struct RenderLock {' in boundary else boundary.index('struct SettingsActivity {')
+boundary = boundary[boundary.index('HalTiltSensor halTiltSensor;'):end]
+boundary = boundary.replace('struct FontBoundary {',
+    'struct FontBoundary { template<class Renderer> void releaseReaderForDownload(Renderer&) {}')
 (out / 'Boundaries.inc').write_text(boundary)
 for name in ['HalTiltSensor', 'HalClock']:
     instance = name[0].lower() + name[1:]
@@ -70,7 +82,7 @@ for name in ['HalTiltSensor', 'HalClock']:
         name + ' ' + instance + ';\n')
 incs = ['test/host_stubs', 'src', '.pio/libdeps/gh_release/ArduinoJson/src',
         'lib/Epub', 'lib/Logging', 'lib/EpdFont', 'lib/Serialization', 'lib/KOReaderSync',
-        'freeink-sdk/libs/hardware/BoardConfig/include', 'freeink-sdk/libs/ui/FreeInkUI/include', 'lib/I18n']
+        'freeink-sdk/libs/hardware/BoardConfig/include', 'lib/BlePageTurner/include', 'freeink-sdk/libs/ui/FreeInkUI/include', 'lib/I18n']
 cmd = [os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-g', '-ffunction-sections',
        '-fdata-sections', '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections',
        '-DFREEINK_DEVICE_X3=1', '-DFREEINK_DEVICE_X4=1', '-DENABLE_ARDUINO_FEATURES=0',

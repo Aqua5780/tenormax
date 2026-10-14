@@ -1,7 +1,10 @@
 #pragma once
 #include <I18n.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace readermenu {
@@ -39,8 +42,24 @@ enum class Action {
 // la ban ghi cu tro toi mot lenh khong con ton tai.
 inline constexpr int ACTION_COUNT = static_cast<int>(Action::TILT_PAGE_TURN) + 1;
 
-enum class Tab : uint8_t { FAVORITES, POSITION, READING, TOOLS };
+enum class Tab : uint8_t { FAVORITES, POSITION, READING, TOOLS, TEXT };
 inline constexpr int TAB_COUNT = 4;
+inline constexpr int X3_TAB_COUNT = 5;
+
+// The tools of the toolbar reader menu (its tabs on the button boards, the X4 Pro's reader bar), in the order they
+// stand from left to right (founder 07/10: Favorites first). The one place that says it: a tool's value is its
+// place on the bar, and every icon, name and panel is looked up from the tool, never from a place.
+enum class Tool : uint8_t { FAVORITES, CONTENTS, TEXT, MORE };
+inline constexpr int TOOL_COUNT = 4;
+constexpr StrId toolName(const Tool tool) {
+  switch (tool) {
+    case Tool::FAVORITES: return StrId::STR_READER_TAB_FAVORITES;
+    case Tool::CONTENTS: return StrId::STR_TOOL_CONTENTS;
+    case Tool::TEXT: return StrId::STR_TOOL_TEXT;
+    case Tool::MORE: break;
+  }
+  return StrId::STR_TOOL_MORE;
+}
 
 struct Item {
   Action action;
@@ -55,6 +74,7 @@ void buildItems(std::vector<Item>& items, bool hasFootnotes, bool hasBookmarks, 
 
 // Toolbar More keeps its original order independently of the tab layout.
 void buildMoreItems(std::vector<Item>& items, bool hasFootnotes, bool hasBookmarks, bool hasFrontlight);
+void separateTextTab(std::vector<Item>& items);
 
 // Hai ham duoi ghi CHI SO trong `all` vao `out`, toi da `max` chi so, va tra ve
 // so dong ghi duoc. Tra chi so chu khong tra ban sao vi hai le: man hinh can chi
@@ -68,6 +88,38 @@ int rowsOfTab(const std::vector<Item>& all, Tab tab, uint8_t* out, int max);
 // khong ton tai o cuon sach nay (vi du Den nen tren X3) bi bo qua.
 int rowsOfFavorites(const std::vector<Item>& all, const Action* favorites, int count, uint8_t* out, int max);
 
+// Ten sau muc thanh trang thai khi doc, theo dung thu tu CrossPointSettings::READER_STATUS_BAR_MODE (gia tri
+// luu). Mot danh sach cho popup cua menu danh sach va danh sach gia tri cua menu thanh cong cu.
+inline constexpr StrId STATUS_BAR_MODE_LABELS[] = {
+    StrId::STR_STATE_OFF,                   StrId::STR_STATUS_BAR_CLOCK_BATTERY, StrId::STR_STATUS_BAR_DEFAULT,
+    StrId::STR_STATUS_BAR_CHAPTER_PROGRESS, StrId::STR_STATUS_BAR_CHAPTER_CLOCK, StrId::STR_STATUS_BAR_CHAPTER_BATTERY,
+    StrId::STR_STATUS_BAR_CLOCK_CHAPTER_PROGRESS, StrId::STR_STATUS_BAR_BOOK_DETAILS};
+
+// Dong cua lenh nay mo mot danh sach hay mot man khac (co mui ten ">" mo o cuoi dong, nhu Cai dat), hay lam
+// ngay tai cho (bat tat, chup, dat dau trang: khong mui ten).
+constexpr bool rowOpens(const Action action) {
+  return action != Action::TOGGLE_BOOKMARK && action != Action::NIGHT_MODE && action != Action::FRONTLIGHT &&
+         action != Action::SCREENSHOT && action != Action::TILT_PAGE_TURN;
+}
+
+// How a row of a reader menu ends, by what the row does (the design's 3.3, 3.5 and 3.6): a switch for an on/off that turns
+// where it stands, the up-down mark for a choice of a few values made on the spot, the chevron for a row that opens a list
+// or another screen, nothing for an action done at once. The panels of the toolbar menu ask here.
+enum class RowEnd : uint8_t { None, Opens, Switch, Choice };
+constexpr RowEnd rowEnd(const Action action) {
+  switch (action) {
+    case Action::NIGHT_MODE:
+    case Action::FRONTLIGHT:
+    case Action::TILT_PAGE_TURN: return RowEnd::Switch;
+    case Action::ROTATE_SCREEN:
+    case Action::AUTO_PAGE_TURN: return RowEnd::Choice;
+    case Action::TOGGLE_BOOKMARK:
+    case Action::SCREENSHOT: return RowEnd::None;
+    default: break;
+  }
+  return RowEnd::Opens;
+}
+
 // Danh sach yeu thich mac dinh khi nguoi dung chua tu xep: dong bo tenor/kosync.
 inline constexpr Action DEFAULT_FAVORITES[] = {Action::SYNC};
 
@@ -75,17 +127,76 @@ inline constexpr Action DEFAULT_FAVORITES[] = {Action::SYNC};
 // mot tab dai qua thi mat chinh cai loi cua no.
 inline constexpr int TOI_DA_GHIM = 8;
 
+// Nhip giu nut Chon de ghim hay go mot dong, mili giay. Mot nguong cho ca hai menu doc tren may nut
+// (menu danh sach va menu thanh cong cu), bang nguong cua trinh duyet tep.
+inline constexpr unsigned long GIU_GHIM_MS = 1000;
+
 // --- ghim va xep --------------------------------------------------------------------
 //
 // Ba ham duoi la LUAT cua tab Yeu thich. Chung thuan, khong dung toi man hinh hay the
 // nho, nen bai kiem giu duoc chung (test/reader_menu_tabs).
 
 // Muc nay dang duoc ghim chua.
-bool daGhim(const std::vector<Action>& ghim, Action action);
+template <class T>
+bool daGhim(const std::vector<T>& ghim, const T muc) {
+  for (const auto m : ghim)
+    if (m == muc) return true;
+  return false;
+}
 
 // Giu nut Chon tren mot dong la goi ham nay: dang ghim thi go ra, chua ghim thi them
 // vao CUOI. Tra ve true neu danh sach doi; false nghia la ghim day roi.
-bool doiGhim(std::vector<Action>& ghim, Action action);
+// Mot luat cho ca hai menu: X3 ghim lenh (Action), X4 Pro ghim ma ghim (PIN_TEXT).
+template <class T>
+bool doiGhim(std::vector<T>& ghim, const T muc) {
+  for (size_t i = 0; i < ghim.size(); i++) {
+    if (ghim[i] != muc) continue;
+    ghim.erase(ghim.begin() + static_cast<long>(i));
+    return true;
+  }
+  // Go ra thi luc nao cung duoc, ke ca khi day; chi viec THEM moi vuong tran.
+  if (static_cast<int>(ghim.size()) >= TOI_DA_GHIM) return false;
+  ghim.push_back(muc);
+  return true;
+}
+
+// Touch (the order screen): the pins `wanted` (each pinned, each once) in that order, in the places they hold in
+// `ghim`; a pin left out (an action this book lacks) keeps its place. False, and `ghim` unchanged, when one is not
+// pinned. The X3 moves one pin a step at a time (dayBac).
+template <class T>
+bool xepLai(std::vector<T>& ghim, const std::vector<T>& wanted) {
+  std::vector<size_t> slots;
+  for (const T muc : wanted) {
+    size_t at = 0;
+    while (at < ghim.size() && ghim[at] != muc) ++at;
+    if (at == ghim.size()) return false;
+    for (const size_t taken : slots)
+      if (taken == at) return false;
+    slots.push_back(at);
+  }
+  std::sort(slots.begin(), slots.end());
+  for (size_t i = 0; i < slots.size(); ++i) ghim[slots[i]] = wanted[i];
+  return true;
+}
+
+// X4 Pro (founder 06/10): the reader menu's Favorites pins actions and text settings. A pin is one byte in
+// readerFavorites: an Action (below ACTION_COUNT), or PIN_TEXT | the text setting's place in TEXT_KEYS.
+// settings.json keeps an Action as its number, as every earlier file does, and a text setting as
+// "text/<key>", so an old file loads unchanged.
+inline constexpr uint8_t PIN_TEXT = 0x80;
+inline constexpr const char* TEXT_KEYS[] = {
+    "fontFamily",    "fontSize",        "lineSpacing",       "paragraphAlignment", "dropCapMode",
+    "letterSpacing", "wordSpacing",     "extraParagraphSpacing", "screenMargin",   "paragraphIndent",
+    "embeddedStyle", "hyphenationEnabled", "readerInkWeight", "textAntiAliasing"};
+inline constexpr int TEXT_KEY_COUNT = static_cast<int>(sizeof(TEXT_KEYS) / sizeof(TEXT_KEYS[0]));
+static_assert(TEXT_KEY_COUNT < PIN_TEXT, "a text pin fits under the flag");
+// The pin of "text/<key>", or 0 when the key is no text setting.
+inline uint8_t textPin(const char* storedKey) {
+  if (!storedKey || std::strncmp(storedKey, "text/", 5) != 0) return 0;
+  for (int i = 0; i < TEXT_KEY_COUNT; i++)
+    if (std::strcmp(storedKey + 5, TEXT_KEYS[i]) == 0) return static_cast<uint8_t>(PIN_TEXT | i);
+  return 0;
+}
 
 // Giu nut Len hoac Xuong trong tab Yeu thich la goi ham nay: day muc o `viTri` di mot
 // bac theo `huong` (-1 len, 1 xuong). QUAY VONG, vi ca may quay vong, va vi nho vay dua

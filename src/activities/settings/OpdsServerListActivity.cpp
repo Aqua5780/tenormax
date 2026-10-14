@@ -1,4 +1,5 @@
 #include "OpdsServerListActivity.h"
+#include "activities/settings/X3SettingsLayout.h"
 
 #include <GfxRenderer.h>
 #include <I18n.h>
@@ -84,24 +85,33 @@ void OpdsServerListActivity::rebuildRowItems() {
     item.label = servers[i].name.empty() ? servers[i].url.c_str() : servers[i].name.c_str();
     if (!servers[i].name.empty()) item.subtitle = servers[i].url.c_str();
     item.actionValue = static_cast<int16_t>(i);
+    item.opensNext = true;
     rowItems_.push_back(item);
   }
   fui::ListItem addServer;
   addServer.label = tr(STR_ADD_SERVER);
   addServer.actionValue = static_cast<int16_t>(serverCount);
+  addServer.opensNext = true;
   rowItems_.push_back(addServer);
 
   if (!pickerMode) {
     fui::ListItem folder;
     folder.label = tr(STR_OPDS_DOWNLOAD_FOLDER);
     folder.actionValue = static_cast<int16_t>(serverCount + 1);
+    folder.opensNext = true;
     rowItems_.push_back(folder);  // subtitle refreshed per render below
 
     fui::ListItem format;
     format.label = tr(STR_OPDS_FILENAME_FORMAT);
     format.actionValue = static_cast<int16_t>(serverCount + 2);
+    format.opensNext = rowChoiceStyle(static_cast<int>(rowItems_.size())) == SettingsChoiceStyle::Page;
     rowItems_.push_back(format);  // subtitle refreshed per render below
   }
+}
+
+int OpdsServerListActivity::settingsChoiceCount(const int row) const {
+  return !pickerMode && row == static_cast<int>(OPDS_STORE.getServers().size()) + 2
+             ? static_cast<int>(OpdsFilenameFormat::Count) : 0;
 }
 
 bool OpdsServerListActivity::handleCustomInput() {
@@ -174,12 +184,12 @@ void OpdsServerListActivity::handleSelection() {
   if (nav.selected == serverCount + 2) {
     static constexpr StrId formatLabels[] = {StrId::STR_FMT_AUTHOR_TITLE, StrId::STR_FMT_TITLE_AUTHOR,
                                              StrId::STR_FMT_TITLE};
-    optionPopup.show(StrId::STR_OPDS_FILENAME_FORMAT, formatLabels, static_cast<int>(OpdsFilenameFormat::Count),
-                     SETTINGS.opdsFilenameFormat, [this](int idx) {
-                       SETTINGS.opdsFilenameFormat = static_cast<uint8_t>(idx);
-                       SETTINGS.saveToFile();
-                     });
-    requestUpdate();
+    const auto onSelect = [this](int idx) {
+      SETTINGS.opdsFilenameFormat = static_cast<uint8_t>(idx);
+      SETTINGS.saveToFile();
+    };
+    showSettingsChoices(optionPopup, StrId::STR_OPDS_FILENAME_FORMAT, formatLabels,
+                        static_cast<int>(OpdsFilenameFormat::Count), SETTINGS.opdsFilenameFormat, nav.selected, onSelect);
     return;
   }
 
@@ -203,16 +213,22 @@ void OpdsServerListActivity::buildScreen(UiScreen& screen) {
   // Content below the GUI.drawHeader band, above the button hints; derived
   // from the safe area so board bezel insets apply (same as LanguageSelect).
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-  screen.setContentMarginFromScreen(
-      fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-                  static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
-                  static_cast<int16_t>(safe.x)});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  if (x3settings::beginScreen(screen, renderer)) {
+    tabBandDrawn = true;
+  } else {
+    screen.setContentMarginFromScreen(
+        fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
+                    static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
+                    static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
+                    static_cast<int16_t>(safe.x)});
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   const int itemCount = getItemCount();
   if (itemCount == 0) {
-    screen.centeredText(tr(STR_NO_SERVERS), screen.theme().bodyText);
+    if (tenorchrome::x3ScreenLayoutEnabled())
+      tenorchrome::drawInfoInRect(renderer, tr(STR_NO_SERVERS), tenorchrome::x3ScreenLayout(renderer).bodyRect);
+    else screen.centeredText(tr(STR_NO_SERVERS), screen.theme().bodyText);
     return;
   }
 
@@ -225,6 +241,10 @@ void OpdsServerListActivity::buildScreen(UiScreen& screen) {
     rowItems_[serverCount + 1].subtitle =
         SETTINGS.opdsDownloadFolder[0] ? SETTINGS.opdsDownloadFolder : tr(STR_OPDS_SD_ROOT);
     rowItems_[serverCount + 2].subtitle = I18N.get(opdsFormatLabel(SETTINGS.opdsFilenameFormat));
+    if (tenorchrome::kTouchShell) {
+      rowItems_[serverCount + 2].value = rowItems_[serverCount + 2].subtitle;
+      rowItems_[serverCount + 2].subtitle = nullptr;
+    }
   }
 
   fui::ListProps props;
@@ -232,7 +252,7 @@ void OpdsServerListActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(rowItems_.size());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
-  syncListViewport(screen, props, /*hasSubtitle=*/true);
+  syncListViewport(screen, props);
   screen.list(props);
 }
 

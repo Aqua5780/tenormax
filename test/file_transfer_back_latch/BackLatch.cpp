@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include "../host_stubs/X3LayoutBoundary.h"
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -14,7 +15,10 @@
 
 using namespace std::chrono;
 static const auto started = steady_clock::now();
-unsigned long millis() { return duration_cast<milliseconds>(steady_clock::now() - started).count(); }
+static thread_local unsigned long mainInputMillis = 0;
+unsigned long millis() {
+  return mainInputMillis ? mainInputMillis : duration_cast<milliseconds>(steady_clock::now() - started).count();
+}
 static std::atomic<int> rawKey{-1};
 static std::atomic<int> samples{0};
 static std::atomic<bool> slowSample{false}, insideSample{false};
@@ -63,7 +67,8 @@ struct PhysicalInput {
   unsigned long lastDebounceTime = 0, buttonPressStart = 0, buttonPressFinish = 0;
   unsigned long powerButtonPressStart = 0, powerButtonPressFinish = 0;
   bool touchPressedEvent = false, touchReleasedEvent = false, touchLongPressEvent = false;
-  bool multiTouchSwipeEvent = false, multiTouchRotationEvent = false, touchHomeKeyEvent = false;
+  bool multiTouchSwipeEvent = false, multiTouchRotationEvent = false, multiTouchPinchEvent = false;
+  bool touchHomeKeyEvent = false;
   bool touchHomeKeyTapEvent = false, touchHomeKeyLongEvent = false;
   uint8_t getState() const { return rawKey == -2 ? (1u << 3) : rawKey >= 0 ? (1u << rawKey) : 0; }
   void updateConfirmBackHold(unsigned long) {}
@@ -74,12 +79,12 @@ struct PhysicalInput {
 };
 #include "production-input.inc"
 struct MappedInputManager {
-  enum class Button { Back };
+  enum class Button { Back, Left, Right, Up, Down };
   PhysicalInput physical;
   uint8_t backKey = 0;
   void update() { physical.update(); }
   uint8_t physicalBack() const { return backKey; }
-  bool wasReleased(Button) const { return (physical.releasedEvents & (1u << backKey)) != 0; }
+  bool wasReleased(Button button) const { return button == Button::Back && (physical.releasedEvents & (1u << backKey)) != 0; }
   bool wasHomeGesture() const { return false; }
 };
 #define LOG_DBG(...) ((void)0)
@@ -114,9 +119,11 @@ struct FakeServer {
   bool stalled = false;
   std::atomic<bool> interrupted{false};
   std::function<bool(uint8_t)> uiTextSizeApplier;
+  std::function<bool(const char*)> fontPackApplier;
   std::function<bool()> uploadCancel;
   bool isRunning() const { return running; }
   void setUiTextSizeApplier(std::function<bool(uint8_t)> applier) { uiTextSizeApplier = std::move(applier); }
+  void setFontPackApplier(std::function<bool(const char*)> applier) { fontPackApplier = std::move(applier); }
   void setUploadCancel(std::function<bool()> cancel) { uploadCancel = std::move(cancel); }
   void interruptUpload() { interrupted = true; }
   void begin() {
@@ -162,6 +169,11 @@ using CrossPointWebServer = FakeServer;
 template<class T> std::unique_ptr<T> makeUniqueNoThrow() { return std::make_unique<T>(); }
 struct FakeFontCache { void releaseSdFontCaches() {} };
 struct FakeRenderer { FakeFontCache* getFontCacheManager() { return nullptr; } };
+struct FontPackInstaller { static unsigned scan() { return 0; } };
+struct {
+  void markRegistryDirty() {}
+  void ensureLoaded(FakeRenderer&) {}
+} sdFontSystem;
 static int renderLockAcquisitions = 0;
 struct RenderLock {
   template<class T> explicit RenderLock(T&) { ++renderLockAcquisitions; }
@@ -194,6 +206,8 @@ struct ReaderActivity {
 struct { void replaceActivity(std::unique_ptr<ReaderActivity>&&) { require(false, "session outside a book reopened one"); } } activityManager;
 enum class WebServerActivityState { SERVER_RUNNING, SHUTTING_DOWN, AP_STARTING };
 struct CrossPointWebServerActivity {
+  x3activity::InfoPages x3Info;
+  int x3Step = 0;
   WebServerActivityState state = WebServerActivityState::SERVER_RUNNING;
   bool isApMode = true;
   std::unique_ptr<FakeServer> webServer = std::make_unique<FakeServer>();
@@ -334,10 +348,13 @@ void run(const std::string& name) {
     activity.webServer->handlerMs = 0;
     require(activity.backLatch.start(gpio, 3), "sampler start failed");
     settle();
+    unsigned long inputAt = millis() + 1;
     auto frames = [&](unsigned duration) {
-      const auto end = millis() + duration;
-      while (millis() < end && activity.exits == 0) {
+      for (unsigned frame = 0; frame < duration && activity.exits == 0; ++frame) {
+        // Keep the main debounce clock deterministic when the host scheduler stalls.
+        mainInputMillis = inputAt++;
         activity.mappedInput.update();
+        mainInputMillis = 0;
         activity.loop();
         vTaskDelay(1);
       }

@@ -1,12 +1,16 @@
 #include "EpubReaderBookmarksActivity.h"
+#include "activities/home/X3FileReaderChrome.h"
 
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <Logging.h>
+#include <Memory.h>
 
 #include <algorithm>
 
 #include "../../util/BookmarkFile.h"
 #include "MappedInputManager.h"
+#include "activities/util/KeyboardEntryActivity.h"
 #include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "components/SettledListRender.h"
@@ -16,7 +20,7 @@
 namespace fui = freeink::ui;
 
 namespace {
-constexpr int ENTER_DELETE_MODE_MS = 700;
+constexpr int ENTER_ACTIONS_MODE_MS = 700;
 }  // namespace
 
 EpubReaderBookmarksActivity::EpubReaderBookmarksActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -63,7 +67,7 @@ void EpubReaderBookmarksActivity::rebuildBookmarkRowItems() {
     bookmarkSubtitles.push_back(std::move(subtitle));
 
     fui::ListItem item;
-    item.label = bookmark.summary.c_str();
+    item.label = bookmark.name.empty() ? bookmark.summary.c_str() : bookmark.name.c_str();
     item.subtitle = bookmarkSubtitles.back().c_str();
     item.icon = listIconFor(UIIcon::Bookmark, 32);  // subtitle rows carry the larger icon
     item.actionValue = static_cast<int16_t>(bookmarkRowItems.size());
@@ -109,18 +113,13 @@ void EpubReaderBookmarksActivity::activateIndex(const int index) {
 void EpubReaderBookmarksActivity::onRowLongPress(const int index) {
   if (confirmPopup.isActive()) return;
   if (index < 0 || index >= listCount()) return;
-  // The row is deleted; a lingering flash would gray an unrelated row on the
-  // next render.
   app.clearTapFlash();
   nav.selected = index;
-  // Touch long-press asks the same Cancel/Delete confirmation as the physical
-  // hold (the popup is tap-operable), matching the file browser's long-press
-  // delete flow. Does not open the bookmark.
-  showDeleteConfirmation();
+  showBookmarkActions();
 }
 
 bool EpubReaderBookmarksActivity::handleCustomInput() {
-  // Delete confirmation popup
+  // Bookmark action or delete confirmation popup.
   if (confirmPopup.handleInput(mappedInput, [this] { requestUpdate(); })) return true;
   if (confirmingDelete) {
     // Popup dismissed without a selection (Back button or tap outside): cancel delete
@@ -132,6 +131,11 @@ bool EpubReaderBookmarksActivity::handleCustomInput() {
 }
 
 bool EpubReaderBookmarksActivity::handleButtons() {
+  if (mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, ENTER_ACTIONS_MODE_MS)) {
+    showBookmarkActions();
+    return true;
+  }
+
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
@@ -141,15 +145,58 @@ bool EpubReaderBookmarksActivity::handleButtons() {
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (mappedInput.getHeldTime() > ENTER_DELETE_MODE_MS) {
-      showDeleteConfirmation();
-    } else {
-      openSelectedBookmark();
-    }
+    openSelectedBookmark();
     return true;
   }
 
   return false;
+}
+
+void EpubReaderBookmarksActivity::startRename() {
+  if (bookmarks.empty() || nav.selected < 0 || nav.selected >= listCount()) {
+    return;
+  }
+
+  app.clearTapFlash();
+  const int renameIndex = nav.selected;
+  auto keyboard =
+      makeUniqueNoThrow<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_RENAME), bookmarks[renameIndex].name,
+                                               BookmarkEntry::MAX_NAME_LENGTH, InputType::Text);
+  if (!keyboard) {
+    LOG_ERR("EPB", "OOM: bookmark rename keyboard");
+    return;
+  }
+  startActivityForResult(std::move(keyboard), [this, renameIndex](const ActivityResult& result) {
+    if (result.isCancelled || renameIndex < 0 || renameIndex >= listCount()) {
+      return;
+    }
+    std::string previousName = std::move(bookmarks[renameIndex].name);
+    bookmarks[renameIndex].name = std::get<KeyboardResult>(result.data).text;
+    rebuildBookmarkRowItems();
+    if (!BookmarkFile::save(epubPath, bookmarks)) {
+      LOG_ERR("EPB", "Failed to save bookmarks after rename");
+      bookmarks[renameIndex].name = std::move(previousName);
+      rebuildBookmarkRowItems();
+    }
+    requestUpdate();
+  });
+}
+
+void EpubReaderBookmarksActivity::showBookmarkActions() {
+  if (bookmarks.empty() || confirmPopup.isActive()) {
+    return;
+  }
+  const StrId options[] = {StrId::STR_OPEN, StrId::STR_RENAME, StrId::STR_DELETE};
+  confirmPopup.show(StrId::STR_BOOKMARKS, options, 3, -1, [this](const int idx) {
+    if (idx == 0) {
+      openSelectedBookmark();
+    } else if (idx == 1) {
+      startRename();
+    } else if (idx == 2) {
+      showDeleteConfirmation();
+    }
+  });
+  requestUpdate();
 }
 
 void EpubReaderBookmarksActivity::showDeleteConfirmation() {
@@ -158,13 +205,22 @@ void EpubReaderBookmarksActivity::showDeleteConfirmation() {
   }
   confirmingDelete = true;
   const char* options[] = {tr(STR_CANCEL), tr(STR_DELETE)};
-  confirmPopup.show(tr(STR_CONFIRM_DELETE_BOOKMARK), options, 2, 0, [this](int idx) {
+  // Touch: a question over the bar with its one action, the bookmark named in it; "<" or a tap outside cancels.
+  constexpr int skip = tenorchrome::kTouchShell ? 1 : 0;
+  const auto onSelect = [this](int idx) {
     confirmingDelete = false;
-    if (idx == 1) {
+    if (idx + skip == 1) {
       deleteSelectedBookmark();
     }
     requestUpdate();
-  });
+  };
+  if (tenorchrome::kTouchShell) {
+    const auto& b = bookmarks[nav.selected];
+    confirmPopup.show(tr(STR_CONFIRM_DELETE_BOOKMARK), (b.name.empty() ? b.summary : b.name).c_str(), options + skip,
+                      2 - skip, -1, onSelect);
+  } else {
+    confirmPopup.show(tr(STR_CONFIRM_DELETE_BOOKMARK), options, 2, -1, onSelect);
+  }
   requestUpdate();
 }
 
@@ -197,25 +253,33 @@ void EpubReaderBookmarksActivity::deleteSelectedBookmark() {
 
 void EpubReaderBookmarksActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false, UITheme::StatusBarScope::Reader);
-  // Content: the safe area minus the title band render() paints.
-  screen.setContentMarginFromScreen(fui::Insets{
-      static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-      static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-      static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)), static_cast<int16_t>(safe.x)});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  const bool x3 = tenorchrome::x3ScreenLayoutEnabled();
+  if (x3) {
+    const auto body = screenLayout().bodyRect;
+    screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(body.y), 0,
+                                                  static_cast<int16_t>(renderer.getScreenHeight() - body.bottom()), 0});
+  } else {
+    const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false, UITheme::StatusBarScope::Reader);
+    // Content: the safe area minus the title band render() paints.
+    screen.setContentMarginFromScreen(fui::Insets{
+        static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
+        static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
+        static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)), static_cast<int16_t>(safe.x)});
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   if (bookmarks.empty()) {
+    if (x3) return;
     screen.centeredText(tr(STR_NO_BOOKMARKS), screen.theme().bodyText);
     return;
   }
 
-  // "Hold Open to Delete" names a physical button; on touch boards the row
-  // long-press covers deletion, so the hint would be wrong there.
-  if (!mappedInput.hasTouch() && !SETTINGS.globalStatusBarHidden()) {
+  // "Hold Open for Actions" names a physical button; on touch boards the row
+  // long-press opens the same actions, so the hint would be wrong there.
+  if (!x3 && !mappedInput.hasTouch() && !SETTINGS.globalStatusBarHidden()) {
     const int reserved = screen.body().y + screen.body().height - tenorchrome::tipY(renderer) + 2;
     if (reserved > 0) screen.takeBottom(static_cast<int16_t>(reserved));
-    tenorchrome::drawTip(renderer, tr(STR_HOLD_OPEN_TO_DELETE));
+    tenorchrome::drawTip(renderer, tr(STR_HOLD_OPEN_FOR_ACTIONS));
   }
 
   // bookmarkSubtitles/bookmarkRowItems are built once whenever `bookmarks`
@@ -224,13 +288,20 @@ void EpubReaderBookmarksActivity::buildScreen(UiScreen& screen) {
   props.items = bookmarkRowItems.data();
   props.count = static_cast<uint16_t>(bookmarkRowItems.size());
   props.action = ACTION_ROW;
-  // Tap opens; long-press deletes (physical buttons stay in loop()).
+  // Tap opens; long-press shows bookmark actions (physical buttons stay in loop()).
   props.inputMask = fui::InputTouch | fui::InputLongPress;
   syncListViewport(screen, props, /*hasSubtitle=*/true);
   screen.list(props);
 }
 
+const char* EpubReaderBookmarksActivity::headerTitle() const { return tr(STR_BOOKMARKS); }
+
 void EpubReaderBookmarksActivity::render(RenderLock&&) {
+  if (renderUglyList()) {
+    if (confirmPopup.processRender(renderer, mappedInput)) return;
+    renderer.displayBuffer();
+    return;
+  }
   const auto pageWidth = renderer.getScreenWidth();
   const auto orientation = renderer.getOrientation();
   // Landscape orientation: reserve a horizontal gutter for button hints.
@@ -249,15 +320,38 @@ void EpubReaderBookmarksActivity::render(RenderLock&&) {
       contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, tr(STR_BOOKMARKS), EpdFontFamily::BOLD)) / 2;
   renderSettledList(activeNav(), [&] {
     renderer.clearScreen();
-    renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, tr(STR_BOOKMARKS), true, EpdFontFamily::BOLD);
+    // Touch: the name goes to the dynamic bar; the top of the screen is the status strip's.
+    if (tenorchrome::x3ScreenLayoutEnabled())
+      x3readerchrome::drawPath(renderer, screenLayout().barRect, icon_tenor_reader_position_40, tr(STR_BOOKMARKS));
+    else if (tenorchrome::kTouchShell)
+      tenorchrome::noteScreenTitle(tr(STR_BOOKMARKS));
+    else
+      renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, tr(STR_BOOKMARKS), true, EpdFontFamily::BOLD);
     renderUi();
   });
 
   if (confirmPopup.processRender(renderer, mappedInput)) return;
+
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    drawX3Content();
+  }
 
   const auto confirmLabel = bookmarks.size() > 0 ? tr(STR_SELECT) : "";
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();
+}
+
+tenorchrome::X3ScreenLayout EpubReaderBookmarksActivity::screenLayout() const {
+  return tenorchrome::x3ScreenLayout(
+      renderer, bookmarks.empty() ? 0 : tenorchrome::tipHeight(renderer, tr(STR_HOLD_OPEN_FOR_ACTIONS)));
+}
+
+void EpubReaderBookmarksActivity::drawX3Content() const {
+  const auto layout = screenLayout();
+  if (bookmarks.empty())
+    tenorchrome::drawInfoInRect(renderer, tr(STR_NO_BOOKMARKS), layout.bodyRect);
+  else
+    tenorchrome::drawTipInRect(renderer, tr(STR_HOLD_OPEN_FOR_ACTIONS), layout.tipRect);
 }

@@ -1,4 +1,5 @@
 #include "QuoteTrimActivity.h"
+#include "X3FileReaderChrome.h"
 
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
@@ -9,8 +10,12 @@
 #include <cstdio>
 
 #include "QuoteDetailActivity.h"
+#include "components/PageScrollbar.h"
+#include "components/TouchScroll.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyInk.h"
 
 namespace {
 
@@ -94,11 +99,16 @@ const char* QuoteTrimActivity::wordText(const Word& word) const {
   return scratch.c_str();
 }
 
-int QuoteTrimActivity::areaTop() const { return quotesHeaderBottom() + TOP_GAP; }
+int QuoteTrimActivity::areaTop() const {
+  return tenorchrome::x3ScreenLayoutEnabled() ? screenLayout().bodyRect.y : quotesHeaderBottom() + TOP_GAP;
+}
 
 int QuoteTrimActivity::linesPerArea() const {
-  const int bottom = renderer.getScreenHeight() - UITheme::getInstance().getMetrics().buttonHintsHeight -
-                     statusBlockHeight(renderer);
+  const int bottom =
+      tenorchrome::x3ScreenLayoutEnabled()
+          ? screenLayout().bodyRect.bottom() - tenorchrome::tipHeight(renderer, screenInfo().c_str(), 4) - 8
+          : renderer.getScreenHeight() - UITheme::getInstance().getMetrics().buttonHintsHeight -
+                statusBlockHeight(renderer);
   return std::max(1, (bottom - areaTop()) / renderer.getLineHeight(WORD_FONT_ID));
 }
 
@@ -130,6 +140,31 @@ void QuoteTrimActivity::move(const int direction) {
     first = std::max(0, std::min(last, first + direction));
   logArea();
   requestUpdate();
+}
+
+void QuoteTrimActivity::setBoundary(const int word) {
+  if (word < first || (word <= last && word - first <= last - word)) {
+    movingEnd = false;
+    first = std::min(word, last);
+  } else {
+    movingEnd = true;
+    last = std::max(word, first);
+  }
+  logArea();
+  requestUpdate();
+}
+
+int QuoteTrimActivity::wordAt(const int x, const int y) const {
+  const int lineHeight = renderer.getLineHeight(WORD_FONT_ID);
+  const int top = areaTop(), firstLine = firstShownLine();
+  if (y < top) return -1;
+  const int line = firstLine + (y - top) / lineHeight;
+  if (line >= std::min(lineCount, firstLine + linesPerArea())) return -1;
+  const int space = renderer.getSpaceWidth(WORD_FONT_ID);
+  for (size_t i = 0; i < words.size(); ++i)
+    if (words[i].line == line && x >= words[i].x - space / 2 && x < words[i].x + words[i].width + space / 2)
+      return static_cast<int>(i);
+  return -1;
 }
 
 void QuoteTrimActivity::save() {
@@ -178,6 +213,31 @@ void QuoteTrimActivity::loop() {
     save();
     return;
   }
+  // Touch: tap a word to make it the first or the last word kept; an up or down swipe moves the end being set by a
+  // screen of lines, to reach words past this screen; the bar's pill saves.
+  if (tenorchrome::kTouchShell) {
+    int x = 0, y = 0, dy = 0;
+    unsigned long heldMs = 0;
+    if (mappedInput.wasScreenTapped(x, y)) {
+      if (tenorchrome::footActionAt(x, y) == 0) {
+        save();
+        return;
+      }
+      const int word = wordAt(x, y);
+      if (word >= 0) setBoundary(word);
+      return;
+    }
+    if (mappedInput.wasVerticalSwipe(dy, heldMs)) {
+      const int lines = touchscroll::rows(dy, heldMs, renderer.getLineHeight(WORD_FONT_ID), linesPerArea());
+      const int active = movingEnd ? last : first;
+      const int line = std::max(0, std::min(lineCount - 1, static_cast<int>(words[active].line) + lines));
+      int target = active;
+      while (target + 1 < static_cast<int>(words.size()) && words[target].line < line) ++target;
+      while (target > 0 && words[target].line > line) --target;
+      move(target - active);
+      return;
+    }
+  }
   if (mappedInput.wasReleased(Button::PageForward) || mappedInput.wasReleased(Button::PageBack)) {
     movingEnd = !movingEnd;
     logArea();
@@ -190,7 +250,11 @@ void QuoteTrimActivity::loop() {
 
 void QuoteTrimActivity::render(RenderLock&&) {
   renderer.clearScreen();
-  drawNavigationHeader(tr(STR_QUOTES_MENU_EDIT));
+  const bool x3 = tenorchrome::x3ScreenLayoutEnabled();
+  if (x3)
+    x3readerchrome::drawPath(renderer, screenLayout().barRect, icon_tenor_reader_tools_40, tr(STR_QUOTES_MENU_EDIT));
+  else
+    drawNavigationHeader(tr(STR_QUOTES_MENU_EDIT));
 
   const int lineHeight = renderer.getLineHeight(WORD_FONT_ID);
   const int ascender = renderer.getFontAscenderSize(WORD_FONT_ID);
@@ -199,6 +263,7 @@ void QuoteTrimActivity::render(RenderLock&&) {
   const int firstLine = firstShownLine();
   const int shownLines = std::min(perArea, lineCount - firstLine);
   const int top = areaTop();
+  const bool byHand = shell::uglyParts();
 
   char keep[48];
   snprintf(keep, sizeof(keep), tr(STR_QUOTES_TRIM_KEEP), last - first + 1, static_cast<int>(words.size()));
@@ -220,29 +285,83 @@ void QuoteTrimActivity::render(RenderLock&&) {
         int width = word.width;
         const bool nextDropped = index + 1 < static_cast<int>(words.size()) && (index + 1 < first || index + 1 > last);
         if (nextDropped && words[i + 1].line == word.line) width = words[i + 1].x - word.x;
-        renderer.fillRect(word.x, y + ascender * 7 / 10, width, STRIKE_HEIGHT);
+        if (byHand) ugly::line(renderer, word.x, y + ascender * 7 / 10 + 1, word.x + width, y + ascender * 7 / 10 - 1, 900 + index, 2);
+        else renderer.fillRect(word.x, y + ascender * 7 / 10, width, STRIKE_HEIGHT);
       }
-      if (index == active)
-        renderer.fillRect(word.x, y + ascender + UNDERLINE_GAP, word.width, UNDERLINE_HEIGHT);
+      if (index == active) {
+        if (byHand) ugly::underline(renderer, word.x, word.x + word.width, y + ascender + UNDERLINE_GAP + 2, 905, 3);
+        else renderer.fillRect(word.x, y + ascender + UNDERLINE_GAP, word.width, UNDERLINE_HEIGHT);
+      }
     }
+    // tenor/ugly on the button readers: the count, the end being moved and the keys written by hand; the words of
+    // the quote keep their book font.
+    const auto line = [&](const int fontId, const int y, const char* text) {
+      if (byHand) ugly::text(renderer, ugly::Size::S22, TEXT_X0, y + renderer.getFontAscenderSize(fontId), text);
+      else renderer.drawText(fontId, TEXT_X0, y, text);
+    };
+    if (x3) continue;
     int y = top + shownLines * lineHeight + STATUS_GAP;
-    renderer.drawText(STATUS_FONT_ID, TEXT_X0, y, keep);
+    line(STATUS_FONT_ID, y, keep);
     y += renderer.getLineHeight(STATUS_FONT_ID) + STATUS_STEP_PAD;
-    renderer.drawText(STATUS_FONT_ID, TEXT_X0, y, moving);
+    line(STATUS_FONT_ID, y, moving);
     y += renderer.getLineHeight(STATUS_FONT_ID) + STATUS_STEP_PAD + HELP_GAP;
-    for (const char* help : {tr(STR_QUOTES_TRIM_HELP_MOVE), tr(STR_QUOTES_TRIM_HELP_SWITCH), tr(STR_QUOTES_TRIM_HELP_BACK)}) {
-      renderer.drawText(HELP_FONT_ID, TEXT_X0, y, help);
-      y += renderer.getLineHeight(HELP_FONT_ID);
+    // Touch: the help names the tap, not keys the board does not have.
+    const char* helps[] = {tr(STR_QUOTES_TRIM_HELP_MOVE), tr(STR_QUOTES_TRIM_HELP_SWITCH), tr(STR_QUOTES_TRIM_HELP_BACK)};
+    const char* touchHelps[] = {tr(STR_QUOTES_TRIM_HELP_TAP), tr(STR_QUOTES_TRIM_HELP_BACK), nullptr};
+    for (const char* help : tenorchrome::kTouchShell ? touchHelps : helps) {
+      if (!help) continue;
+      line(HELP_FONT_ID, y, help);
+      y += byHand ? std::max(renderer.getLineHeight(HELP_FONT_ID), 30) : renderer.getLineHeight(HELP_FONT_ID);
     }
   }
 
+  if (x3) {
+    drawX3Content();
+  }
+
+  // Touch: Save is a pill in the bar; its "<" discards.
+  if (tenorchrome::kTouchShell) tenorchrome::noteFootActions(tr(STR_QUOTES_SAVE));
   // Back discards the trim, so its hint says Cancel rather than showing the Back symbol.
   const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_QUOTES_SAVE), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  if (tenorchrome::kTouchShell) {
+    auto target = makeUiTarget(renderer);
+    PageScrollbar::instance().draw(renderer, target, top, top + perArea * lineHeight,
+                                   lineCount * lineHeight, firstLine * lineHeight, this);
+  }
+#ifdef UGLY_FRAME_LOG
+  if (byHand) LOG_INF("UGLY", "QuoteTrim frame first=%d last=%d end=%d", first, last, movingEnd);
+#endif
   if (failure) {
     // drawPopup lays its box over the frame and refreshes the panel itself.
     GUI.drawPopup(renderer, failure);
     return;
   }
   renderer.displayBuffer();
+}
+
+std::string QuoteTrimActivity::screenTip() const {
+  return std::string(tr(STR_QUOTES_TRIM_HELP_MOVE)) + "\n" + tr(STR_QUOTES_TRIM_HELP_SWITCH) + "\n" +
+         tr(STR_QUOTES_TRIM_HELP_BACK);
+}
+
+std::string QuoteTrimActivity::screenInfo() const {
+  char keep[64];
+  snprintf(keep, sizeof(keep), tr(STR_QUOTES_TRIM_KEEP), last - first + 1, static_cast<int>(words.size()));
+  return std::string(keep) + "\n" + (movingEnd ? tr(STR_QUOTES_TRIM_END) : tr(STR_QUOTES_TRIM_START));
+}
+
+tenorchrome::X3ScreenLayout QuoteTrimActivity::screenLayout() const {
+  const auto tip = screenTip();
+  return tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip.c_str(), 12));
+}
+
+void QuoteTrimActivity::drawX3Content() const {
+  const auto layout = screenLayout();
+  const auto info = screenInfo();
+  const int height = tenorchrome::tipHeight(renderer, info.c_str(), 4);
+  tenorchrome::drawInfoInRect(renderer, info.c_str(),
+                              {layout.bodyRect.x, layout.bodyRect.bottom() - height, layout.bodyRect.width, height}, 4);
+  const auto tip = screenTip();
+  tenorchrome::drawTipInRect(renderer, tip.c_str(), layout.tipRect, 12);
 }

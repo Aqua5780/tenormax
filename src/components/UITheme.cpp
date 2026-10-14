@@ -16,57 +16,33 @@
 #include "UIThemeSizing.h"
 #include "components/themes/BaseTheme.h"
 #include "components/themes/TenorTheme.h"
-#include "components/themes/lyra/Lyra3CoversTheme.h"
-#include "components/themes/lyra/LyraTheme.h"
-#include "components/themes/roundedraff/RoundedRaffTheme.h"
+#include <FreeInkUIGfxRenderer.h>
+#include "activities/Activity.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyIconInk.h"
 
 UITheme UITheme::instance;
 
-UITheme::UITheme() {
-  auto themeType = static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme);
-  setTheme(themeType);
-}
+UITheme::UITheme() { setTheme(); }
 
-void UITheme::reload() {
-  auto themeType = static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme);
-  setTheme(themeType);
-}
+void UITheme::reload() { setTheme(); }
 
-void UITheme::setTheme(CrossPointSettings::UI_THEME type) {
+void UITheme::setTheme() {
   buttonSymbols::install();
-  switch (type) {
-    case CrossPointSettings::UI_THEME::TENOR_UI: {
-      LOG_DBG("UI", "Using tenor/cross theme");
-      auto next = makeUniqueNoThrow<TenorTheme>();
-      if (!next) {
-        LOG_ERR("UI", "Unable to allocate tenor/cross theme");
-        return;
-      }
-      currentTheme = std::move(next);
-      currentMetrics = &TenorMetrics::values;
-      break;
-    }
-    case CrossPointSettings::UI_THEME::CLASSIC:
-      LOG_DBG("UI", "Using Classic theme");
-      currentTheme = std::make_unique<BaseTheme>();
-      currentMetrics = &BaseMetrics::values;
-      break;
-    case CrossPointSettings::UI_THEME::LYRA:
-      LOG_DBG("UI", "Using Lyra theme");
-      currentTheme = std::make_unique<LyraTheme>();
-      currentMetrics = &LyraMetrics::values;
-      break;
-    case CrossPointSettings::UI_THEME::ROUNDEDRAFF:
-      LOG_DBG("UI", "Using RoundedRaff theme");
-      currentTheme = std::make_unique<RoundedRaffTheme>();
-      currentMetrics = &RoundedRaffMetrics::values;
-      break;
-    case CrossPointSettings::UI_THEME::LYRA_3_COVERS:
-      LOG_DBG("UI", "Using Lyra 3 Covers theme");
-      currentTheme = std::make_unique<Lyra3CoversTheme>();
-      currentMetrics = &Lyra3CoversMetrics::values;
-      break;
+  inlineSymbols::configurePainter(ugly::iconSymbol, [] { return shell::isUgly(); });
+  freeink::ui::GfxRendererTarget::setBitmapPainter(
+      [](const GfxRenderer& renderer, freeink::ui::Rect rect, freeink::ui::BitmapRef bitmap) {
+        return shell::isUgly() && ugly::iconAsset(renderer, bitmap.data,
+                    {rect.x, rect.y, rect.width, rect.height}, ugly::iconFrameSeed(), bitmap.width, bitmap.height);
+      });
+  LOG_DBG("UI", "Using tenor/cross theme");
+  auto next = makeUniqueNoThrow<TenorTheme>();
+  if (!next) {
+    LOG_ERR("UI", "Unable to allocate tenor/cross theme");
+    return;
   }
+  currentTheme = std::move(next);
+  currentMetrics = &TenorMetrics::values;
   metricsValid = false;
 }
 
@@ -74,7 +50,8 @@ const ThemeMetrics& UITheme::getMetrics() const {
   // Touch capability and footer visibility can change after the first layout.
   // Refresh the cached metrics when either input changes.
   const bool touch = gpio.hasTouch();
-  const bool statusBarHidden = SETTINGS.globalStatusBarHidden();
+  // The hints off with the status in the top strip free the foot as the status bar Off does.
+  const bool statusBarHidden = SETTINGS.globalStatusBarHidden() || tenorchrome::statusOnTop();
   const uint8_t textSize = normalizedUiTextSize(SETTINGS.uiTextSize);
   if (!metricsValid || touch != metricsForTouch || statusBarHidden != metricsForHiddenStatusBar ||
       textSize != metricsForTextSize) {
@@ -84,6 +61,9 @@ const ThemeMetrics& UITheme::getMetrics() const {
       // nut tra ve 0 va vung an toan lay lai dung phan do.
       adjustedMetrics.buttonHintsHeight = 0;
     }
+    // Touch shell: the header row is the status strip alone; screens laid out under the header band
+    // start right under the strip.
+    if (tenorchrome::kTouchShell) adjustedMetrics.headerHeight = tenorchrome::TOUCH_STRIP_HEIGHT - adjustedMetrics.topPadding;
     metricsForTextSize = textSize;
     metricsForTouch = touch;
     metricsForHiddenStatusBar = statusBarHidden;
@@ -102,8 +82,10 @@ Rect UITheme::getScreenSafeArea(const GfxRenderer& renderer, bool hasFrontButton
   const ThemeMetrics metrics = getMetrics();
   // Dai day that = max(nhan nut, lan trang thai cua pham vi nay). Khi thanh Tat thi
   // ca hai deu 0 va vung noi dung lay lai dung phan do.
-  const int daiDay =
-      hasFrontButtonHints ? std::max<int>(metrics.buttonHintsHeight, getStatusBarHeight(scope)) : 0;
+  // Touch shell: the status strip is at the top and the foot belongs to the dynamic bar.
+  const int daiDay = !hasFrontButtonHints         ? 0
+                     : tenorchrome::kTouchShell ? tenorchrome::footBackReserve()
+                                                : std::max<int>(metrics.buttonHintsHeight, getStatusBarHeight(scope));
   switch (orientation) {
     case GfxRenderer::Orientation::Portrait:
       safeArea.height -= daiDay;
@@ -131,6 +113,14 @@ std::string UITheme::getCoverThumbPath(std::string coverBmpPath, int coverHeight
   return coverBmpPath;
 }
 
+std::string UITheme::getCoverThumbPath(std::string coverBmpPath, int coverWidth, int coverHeight) {
+  size_t pos = coverBmpPath.find("[HEIGHT]", 0);
+  if (pos != std::string::npos) {
+    coverBmpPath.replace(pos, 8, std::to_string(coverWidth) + "x" + std::to_string(coverHeight));
+  }
+  return coverBmpPath;
+}
+
 UIIcon UITheme::getFileIcon(const std::string& filename) {
   if (filename.back() == '/') {
     return Folder;
@@ -152,8 +142,10 @@ int UITheme::getStatusBarHeight(StatusBarScope scope) {
     // Trong trinh doc: muc 0 la Tat, nam muc con lai cung mot chieu cao nen doi
     // muc chi ve lai thanh, khong dan lai trang.
     if (SETTINGS.readerStatusBarHidden()) return 0;
+    const auto spec = SETTINGS.statusBarSpec();
+    if (spec.slotsEnabled && !spec.textLaneVisible(true)) return 0;
     if (tenorchrome::enabled()) return tenorchrome::statusHeight();
-  } else if (SETTINGS.globalStatusBarHidden()) {
+  } else if (SETTINGS.globalStatusBarHidden() || tenorchrome::statusOnTop()) {
     return 0;
   } else if (tenorchrome::enabled()) {
     return tenorchrome::statusHeight(SETTINGS.globalStatusBarLarge());

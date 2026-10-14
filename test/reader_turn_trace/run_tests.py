@@ -81,7 +81,8 @@ guard = re.search(r"(?m)^  const bool turnGuardActive = RenderLock::peek\(\) \|\
 drain_start = re.search(r"(?m)^  if \(pendingManualTurn != 0 && !turnGuardActive.*\{$", epub).start()
 drain = "void EpubReaderActivity::drainManual() {\n" + guard + "\n" + block(epub, drain_start) + "\n}"
 manual_end = epub.index("  if (pageTurn(!prevPageTriggered)) requestUpdate();", drain_start)
-manual_start = epub.rfind("  if (!section) {", drain_start, manual_end)
+manual_matches = list(re.finditer(r"(?m)^  if \(!section(?: && !xemTruoc)?\) \{", epub[drain_start:manual_end]))
+manual_start = drain_start + manual_matches[-1].start()
 manual_slice = epub[manual_start:manual_end + len("  if (pageTurn(!prevPageTriggered)) requestUpdate();")]
 manual = ("void EpubReaderActivity::manualInput(bool prevTriggered, bool prevPageTriggered, "
           "bool touchTriggered, bool fromTilt) {\n"
@@ -127,10 +128,10 @@ projection.write_text(fixture + "\n" + "\n\n".join(function(name) for name in na
                       "\n" + exit_method + "\n" +
                       ("" if stay_after_exit else "void ReaderActivity::stayAfterDroppedExit() {}\n") + cases)
 (args.output / "source-hashes.json").write_text(json.dumps({
-    str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (reader_cpp, reader_h, epub_cpp, epub_h)
+    str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (reader_cpp, reader_h, epub_cpp, epub_h, args.source / "src/activities/reader/ReaderPace.h")
 }, indent=2))
 command = [args.compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
-           "-fsanitize=address,undefined", "-g", "-DTENOR_UI_ACCEPTANCE", "-DTENOR_TURN_TRACE", str(projection),
+           "-fsanitize=address,undefined", "-g", "-I" + str(args.source / "src"), "-DTENOR_UI_ACCEPTANCE", "-DTENOR_TURN_TRACE", str(projection),
            "-o", str(args.output / "projection")]
 (args.output / "compile-command.json").write_text(json.dumps(command, indent=2))
 compiled = subprocess.run(command, capture_output=True, text=True)

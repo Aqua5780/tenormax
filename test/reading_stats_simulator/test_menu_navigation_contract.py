@@ -13,6 +13,8 @@ from cai_dat_truoc_tenor import truoc_tenor
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = Path(os.environ.get('TEST_PROGRAM', REPO / '.pio/build/simulator_x3_uc8279/program'))
 SETTINGS_ORDER = [0, 7, 1, 2, 3, 4, 5, 6]
+# X3 has Motion (ID 8); File Transfer is the first machine row.
+HOME_SETTINGS_ORDER = [0, 7, 1, 2, 8, None, 3, 4, 5, 6]
 
 
 class MenuNavigationContractTest(unittest.TestCase):
@@ -60,9 +62,8 @@ class MenuNavigationContractTest(unittest.TestCase):
 
     @staticmethod
     def group(index):
-        # Home Settings begins on Transfer, followed by the persisted display
-        # order. Stable tab IDs remain 0..6, with Sleep appended as ID 7.
-        return ['UP'] + ['RIGHT'] * (SETTINGS_ORDER.index(index) + 1) + ['CONFIRM']
+        # Home Settings starts on Display; partitioned rows keep stable source IDs.
+        return ['UP'] + ['RIGHT'] * HOME_SETTINGS_ORDER.index(index) + ['CONFIRM']
 
     def test_clock_cursor_preserves_legacy_hidden_value(self):
         self.settings['statusBarClock'] = 0
@@ -74,7 +75,7 @@ class MenuNavigationContractTest(unittest.TestCase):
 
     def test_legacy_action_pin_redirects_to_display(self):
         self.write_pins(['action/2'])
-        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'BACK'])
+        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'RIGHT', 'CONFIRM', 'BACK'])
         self.assertIn('Entering activity: Settings', log)
         self.assertNotIn('Entering activity: StatusBarSettings', log)
         self.assertEqual(saved['statusBarClock'], 2, log)
@@ -82,9 +83,9 @@ class MenuNavigationContractTest(unittest.TestCase):
 
     def test_legacy_status_pin_still_opens_clock_corners(self):
         self.write_pins(['status/statusBarClock'])
-        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'BACK'])
+        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'RIGHT', 'CONFIRM', 'BACK'])
         self.assertIn('Entering activity: StatusBarSettings', log)
-        self.assertEqual(saved['statusBarClock'], 2, log)
+        self.assertEqual(saved['readerStatusLeft'], 2, log)
 
     def test_keyboard_axis_keeps_numeric_toggle_persistence(self):
         # Keyboard tab rows since 18/09/2026: Hang phim, Ban phim truc (the layouts
@@ -105,8 +106,8 @@ class MenuNavigationContractTest(unittest.TestCase):
 
     def test_renamed_legacy_pins_open_current_settings_without_rewriting_pin_keys(self):
         cases = [
-            ('text/focusReadingEnabled', 'dropCapMode', 0, 1, 'TextSettings', []),
-            ('settings/hideGlobalStatusBar', 'globalStatusBarMode', 0, 1, 'Settings', []),
+            ('text/focusReadingEnabled', 'dropCapMode', 0, 1, 'TextSettings', ['RIGHT', 'CONFIRM']),
+            ('settings/hideGlobalStatusBar', 'globalStatusBarMode', 0, 1, 'Settings', ['RIGHT', 'CONFIRM']),
             ('settings/hideReaderStatusBar', 'readerStatusBarMode', 2, 3, 'Settings', ['RIGHT', 'CONFIRM']),
         ]
         for pin, field, initial, expected, activity, choice in cases:
@@ -123,13 +124,12 @@ class MenuNavigationContractTest(unittest.TestCase):
                 self.assertEqual(persisted['pins'], [pin])
 
     def test_text_spacing_pins_retain_their_setting_keys(self):
-        # Opening a Layout favorite advances its setting once. Moving right
-        # after launch would select a different setting.
+        # U11 opens the pinned row's picker; Right then Select commits its next value.
         for field in ('letterSpacing', 'wordSpacing'):
             with self.subTest(field=field):
                 self.write_settings()
                 self.write_pins(['text/' + field])
-                log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'BACK'])
+                log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'RIGHT', 'CONFIRM', 'BACK'])
                 self.assertIn('Entering activity: TextSettings', log)
                 self.assertEqual(saved[field], 1, log)
                 other = 'wordSpacing' if field == 'letterSpacing' else 'letterSpacing'
@@ -149,7 +149,7 @@ class MenuNavigationContractTest(unittest.TestCase):
         self.settings['tiltMenuNavigation'] = 0
         self.write_settings()
         self.write_pins(['settings/tiltTabNavigation'])
-        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'BACK'])
+        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'RIGHT', 'CONFIRM', 'BACK'])
         self.assertIn('Entering activity: Settings', log)
         self.assertEqual(saved['tiltTabNavigation'], 1, log)
         self.assertEqual(saved['tiltPageTurn'], 2, log)
@@ -167,7 +167,7 @@ class MenuNavigationContractTest(unittest.TestCase):
         self.settings['tiltMenuNavigation'] = 0
         self.write_settings()
         self.write_pins(['settings/tiltMenuNavigation'])
-        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'BACK'])
+        log, saved = self.run_keys(['DOWN', 'DOWN', 'CONFIRM', 'RIGHT', 'CONFIRM', 'BACK'])
         self.assertIn('Entering activity: Settings', log)
         self.assertEqual(saved['tiltMenuNavigation'], 1, log)
         self.assertEqual((saved['tiltPageTurn'], saved['tiltTabNavigation']), (2, 2), log)
@@ -179,10 +179,9 @@ class MenuNavigationContractTest(unittest.TestCase):
         self.settings['globalStatusBarMode'] = 0
         self.write_settings()
         log, saved = self.run_keys(
-            # Display begins on UI theme. UI text size is row 2 and the
-            # global status bar is row 3.
-            self.group(0) + ['RIGHT', 'RIGHT', 'CONFIRM', 'BACK', 'CONFIRM'],
-            [(3300, 'small'), (3850, 'off-live'), (5100, 'off-reopened')])
+            # Display begins on UI text size. The global status bar is row 2.
+            self.group(0) + ['RIGHT', 'CONFIRM', 'RIGHT', 'CONFIRM', 'BACK', 'CONFIRM'],
+            [(2300, 'small'), (3800, 'off-live'), (4800, 'off-reopened')])
         self.assertEqual(saved['globalStatusBarMode'], 1, log)
 
         def footer_ink(name):
@@ -196,9 +195,11 @@ class MenuNavigationContractTest(unittest.TestCase):
         # Sleep rows moved out of Display, so there is no eleventh row to probe.
         # Measure the actual footer band: Small paints it; Off removes it both
         # immediately and after reopening the same screen.
-        self.assertGreater(footer_ink('small'), 400, log)
-        self.assertEqual(footer_ink('off-live'), 0, log)
-        self.assertEqual(footer_ink('off-live'), footer_ink('off-reopened'), log)
+        small_ink = footer_ink('small')
+        off_ink = footer_ink('off-live')
+        self.assertGreater(small_ink, 400, log)
+        self.assertEqual(off_ink, 0, log)
+        self.assertEqual(off_ink, footer_ink('off-reopened'), log)
 
     def test_file_browser_reclaims_hidden_footer_tip_space(self):
         books = self.sd / 'books'

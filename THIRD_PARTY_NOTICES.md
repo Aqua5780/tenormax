@@ -4,7 +4,7 @@ The root MIT licence applies to the application code covered by that licence. It
 
 ## Which release these notices cover
 
-The dependency list below describes v1.0.18. Match notices to the firmware release you downloaded; library versions changed between releases.
+The dependency list below describes v1.0.55. Match notices to the firmware release you downloaded; library versions changed between releases.
 
 | Firmware release | wolfSSL version | Bundled COPYING | Source licence notice |
 | --- | --- | --- | --- |
@@ -21,11 +21,18 @@ The dependency list below describes v1.0.18. Match notices to the firmware relea
 | v1.0.16 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
 | v1.0.17 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
 | v1.0.18 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
+| v1.0.19 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
+| v1.0.50 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
+| v1.0.51 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
+| v1.0.52 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
+| v1.0.53 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
+| v1.0.54 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
+| v1.0.55 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
 | v1.0.9 | wolfSSL 5.9.2 | GNU GPL version 3 | GPL version 3 or any later version, or a separate commercial licence |
 
 For v1.0.1, see the [licence archive supplied with that release](https://github.com/TenorGroup/cross-releases/releases/download/v1.0.1/tenor-cross-v1.0.1-licenses.zip). For v1.0.2 and v1.0.3, see [COPYING](third_party/wolfssl/COPYING), [LICENSING](third_party/wolfssl/LICENSING) and [source provenance](third_party/wolfssl/PROVENANCE.md). The historical GPL v2 COPYING is retained at `licenses/historical/v1.0.1/Arduino-wolfSSL/COPYING` for its original dependency version. The current PlatformIO dependency is also named `Arduino-wolfSSL`; its 5.9.2 COPYING and LICENSING are retained verbatim in both `third_party/wolfssl/` and `licenses/dependencies/Arduino-wolfSSL/`.
 
-## Dependencies in v1.0.18
+## Dependencies in v1.0.55
 
 - CrossPoint Reader: copyright Dave Allie and contributors, MIT. Original notices in source files remain.
 - FreeInk SDK: MIT, copyright FreeInk. The SDK NOTICE preserves the Open X4 E-Paper Contributors attribution. Lucide icons retain their ISC and MIT notices in the nested submodule.
@@ -37,13 +44,15 @@ For v1.0.1, see the [licence archive supplied with that release](https://github.
 - WebSockets: retain its LGPL licence and libb64 notices in `licenses/dependencies/WebSockets/`.
 - FreeType 2.13.2: dual-licensed; the FreeType Project Licence is included with its required attribution. Portions of this software are copyright the FreeType Project (www.freetype.org). All rights reserved.
 - FreeInkBook's embedded expat, miniz, pngle and hyphenation patterns retain their notices in the SDK tree.
-- Noto Sans, Noto Serif, Noto Sans Arabic, Noto Sans Hebrew, Noto Sans SC, Geist, Be Vietnam Pro and OpenDyslexic: retain the supplied SIL Open Font License texts. Noto Sans SC's licence is in `licenses/fonts/`. Other family notices accompany their source fonts.
+- Noto Sans, Noto Serif, Noto Sans Arabic, Noto Sans Hebrew, Noto Sans SC, Geist, Be Vietnam Pro, Mansalva and OpenDyslexic: retain the supplied SIL Open Font License texts. Noto Sans SC's licence is in `licenses/fonts/`. Other family notices accompany their source fonts.
 - Ubuntu fonts: retain the Ubuntu Font Licence in the font source directory.
 - ESP-IDF, Arduino-ESP32 and platform toolchain components are fetched by PlatformIO and retain their package licences. Their licences also apply to redistributable portions incorporated in firmware.
 
 The complete licence obligations of a compiled image depend on its linked components. Firmware built with the bundled wolfSSL uses the GPLv3 distribution route; the root MIT licence does not relicense those dependencies. Release source archives must include the linked sources, build scripts and configuration described in the release manifest. Historical binaries require a separate source/version match.
 
-The UI font sources used for v1.0.18 are retained under `lib/EpdFont/builtinFonts/source/Geist/` and `lib/EpdFont/builtinFonts/source/BeVietnamPro/`, each with its SIL Open Font License text. `Geist/ui-source-manifest.json` records the source hashes for both families. The release licence archive includes these source fonts and preserves the original family notices.
+Mansalva (copyright 2022 The Mansalva Project Authors, SIL Open Font License 1.1) is the handwriting face of the tenor/ugly shell. Its source font and licence are in `lib/EpdFont/builtinFonts/source/Mansalva/`, and `scripts/ugly/gen_font.py` bakes it, one fixed variant per character, into `src/shells/ugly/fonts/`.
+
+The UI font sources used for v1.0.55 are retained under `lib/EpdFont/builtinFonts/source/Geist/` and `lib/EpdFont/builtinFonts/source/BeVietnamPro/`, each with its SIL Open Font License text. `Geist/ui-source-manifest.json` records the source hashes for both families. The release licence archive includes these source fonts and preserves the original family notices.
 
 Official references: [wolfSSL licensing](https://www.wolfssl.com/license/), [GNU linking FAQ](https://www.gnu.org/licenses/gpl-faq.html#GPLStaticVsDynamic), [GNU GPL compatibility](https://www.gnu.org/licenses/license-list.html#apache2).
 

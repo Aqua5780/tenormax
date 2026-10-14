@@ -16,6 +16,8 @@ import unittest
 
 from PIL import Image, ImageChops
 
+from pill_row import pill_band
+
 REPO = Path(__file__).resolve().parents[2]
 ART = Path(os.environ.get("CROSSPOINT_TEST_ARTIFACTS", REPO.parent / "research/ui-layout/simulator"))
 BODY_LINES = (33, 38, 43)
@@ -51,24 +53,8 @@ class Timeline:
 
 
 def selected_band(image, top=125, bottom=700):
-    """Longest mostly black list-row fill, excluding header/footer surfaces."""
-    gray = image.convert("L")
-    pixels = gray.load()
-    # Sample the inner left fill before glyphs begin. A wide scan splits the
-    # band at long white labels and reports a fraction of its true height.
-    xs = range(26, 30)
-    bands = []
-    start = None
-    for y in range(top, min(bottom, image.height)):
-        filled = sum(pixels[x, y] < 100 for x in xs) > len(xs) * 0.65
-        if filled and start is None:
-            start = y
-        elif not filled and start is not None:
-            bands.append((start, y))
-            start = None
-    if start is not None:
-        bands.append((start, bottom))
-    return max(bands, key=lambda b: b[1] - b[0]) if bands else None
+    """Rows of the selected list row, from its top ring line to its bottom one (a white pill since v1.0.52)."""
+    return pill_band(image, top, min(bottom, image.height))
 
 
 def other_book_row(image):
@@ -85,19 +71,23 @@ def other_book_row(image):
     if rule is None:
         return None
     below = [y for y in inked if y > rule]
-    top = below[0]
-    bottom = top
-    # The row is one line of text; accents may leave a one or two pixel gap above the letters.
-    while any(bottom < y <= bottom + 3 for y in below):
-        bottom = max(y for y in below if bottom < y <= bottom + 3)
+    runs = []
+    for y in below:
+        if runs and y - runs[-1][1] <= 10:
+            runs[-1] = (runs[-1][0], y)
+        else:
+            runs.append((y, y))
+    if not runs:
+        return None
+    top, bottom = runs[0][0], runs[-1][1]
     following = next((y for y in below if y > bottom), image.height)
     return rule, top, bottom, following
 
 
 def selected_text_ink(image, band):
-    """Measure real white glyph ink inside a black selected row, in label area."""
-    crop = image.crop((42, band[0] + 3, 270, band[1] - 3)).convert("L")
-    return crop.point(lambda p: 255 if p > 180 else 0).getbbox()
+    """Measure real glyph ink inside the pill, in the label area (x from 56, past the ring's curved end)."""
+    crop = image.crop((56, band[0] + 3, 270, band[1] - 3)).convert("L")
+    return crop.point(lambda p: 255 if p < 100 else 0).getbbox()
 
 
 class UiSizesV108Test(unittest.TestCase):
@@ -192,9 +182,10 @@ class UiSizesV108Test(unittest.TestCase):
             t.key("CONFIRM").shot("stats-return")
             t.key("RIGHT")
         t.key("CONFIRM").shot("habits").key("BACK")
-        t.key("DOWN").shot("home-settings").key("RIGHT").key("CONFIRM").shot("display")
-        t.key("CONFIRM").shot("popup").key("RIGHT").shot("popup-next").key("LEFT").key("CONFIRM")
-        t.key("LEFT").shot("display-last").key("RIGHT")
+        t.key("DOWN").shot("home-settings").key("CONFIRM").shot("display")
+        # Refresh frequency is Display row 7, after the clock placement and battery rows.
+        t.key("RIGHT", 6).key("CONFIRM").shot("popup").key("RIGHT").shot("popup-next").key("LEFT").key("CONFIRM")
+        t.key("RIGHT", 2).shot("display-last").key("RIGHT")
         # Motion sensor sits between Controls and System: Device is six groups down, Reader four up.
         t.key("DOWN", 6).shot("device").key("RIGHT").key("CONFIRM").shot("keyboard")
         t.key("RIGHT").key("CONFIRM").shot("keyboard-edit").key("BACK").shot("keyboard-return")
@@ -224,7 +215,7 @@ class UiSizesV108Test(unittest.TestCase):
             except AssertionError as error:
                 raise AssertionError(f"{locale} tier{tier} {label}: {error}") from error
         glyphs = selected_text_ink(images["display"], measured["display"])
-        self.assertIsNotNone(glyphs, "Selected setting label has no visible white glyph ink")
+        self.assertIsNotNone(glyphs, "Selected setting label has no visible glyph ink")
         if tier:
             measured["stats-page1"] = self.assert_row(images["stats-page1"], tier)
             self.assertIsNotNone(ImageChops.difference(images["stats-page0"], images["stats-page1"]).getbbox())
@@ -234,7 +225,7 @@ class UiSizesV108Test(unittest.TestCase):
         self.assertIsNotNone(ImageChops.difference(images["keyboard"], images["keyboard-edit"]).getbbox())
         saved = json.loads((sd / ".crosspoint/settings.json").read_text())
         self.assertEqual(saved["uiTextSize"], tier)
-        self.assertEqual(saved["uiTheme"], 4)
+        self.assertNotIn("uiTheme", saved)
         self.assertEqual(saved["fontSize"], 14)
         self.assertTrue(saved["deviceName"].startswith("Reader-ABCDEFGHIJKLMNOPQR"))
         self.assertEqual(len(saved["deviceName"]), len("Reader-ABCDEFGHIJKLMNOPQR") + 1)
@@ -275,9 +266,9 @@ class UiSizesV108Test(unittest.TestCase):
         bands = []
         glyph_heights = []
         for tier in (1, 2, 0):
-            # Each process starts at Home. A single Confirm cycles the size row.
-            t = Timeline().key("UP").key("RIGHT").key("CONFIRM").key("RIGHT").shot("before")
-            t.key("CONFIRM").shot("after").key("BACK").key("DOWN").shot("home-after")
+            # U11: choose the next size in the picker, then check the repainted parent.
+            t = Timeline().key("UP").key("CONFIRM").shot("before")
+            t.key("CONFIRM").key("RIGHT").key("CONFIRM").shot("after").key("BACK").key("DOWN").shot("home-after")
             images, log = self.run_sim(sd, output, f"set-{tier}", t)
             self.assertIn("Exiting activity: Settings", log)
             bands.append(self.assert_row(images["after"], tier))

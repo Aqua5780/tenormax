@@ -22,19 +22,66 @@ static constexpr uint32_t LOG_RTC_MAGIC = 0xDEADBEEF;
 #ifdef TENOR_PRESS_PROBE
 // Probe builds keep a RAM copy of the log from boot, so a wake measured over a cable that
 // only reconnects after USB enumerates still has its earliest lines (CMD:LOGDUMP).
+#if TENOR_COLD_LOG
+// Everything sent to the cable lands here and goes to the card after each script step.
+// The lite probe (TENOR_PROBE_LITE) keeps 4 KB so a radio measurement is not skewed by 28 KB of RAM.
+#ifdef TENOR_PROBE_LITE
+static char probeLog[4096];
+#else
+static char probeLog[32768];
+#endif
+static size_t probeLogDropped = 0;
+static portMUX_TYPE probeLogLock = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t probeLogBinaryTask = nullptr;
+#else
 static char probeLog[6144];
+#endif
 static size_t probeLogLen = 0;
+#if TENOR_COLD_LOG
+void probeLogAppend(const char* data, const size_t n) {
+  if (probeLogBinaryTask && probeLogBinaryTask == xTaskGetCurrentTaskHandle()) return;
+  portENTER_CRITICAL_SAFE(&probeLogLock);
+  if (probeLogLen + n > sizeof(probeLog)) {
+    probeLogDropped += n;
+  } else {
+    memcpy(probeLog + probeLogLen, data, n);
+    probeLogLen += n;
+  }
+  portEXIT_CRITICAL_SAFE(&probeLogLock);
+}
+const char* probeLogPending(size_t& len, size_t& dropped) {
+  portENTER_CRITICAL(&probeLogLock);
+  len = probeLogLen;
+  dropped = probeLogDropped;
+  portEXIT_CRITICAL(&probeLogLock);
+  return probeLog;
+}
+void probeLogConsume(size_t len) {
+  portENTER_CRITICAL(&probeLogLock);
+  len = std::min(len, probeLogLen);
+  memmove(probeLog, probeLog + len, probeLogLen - len);
+  probeLogLen -= len;
+  probeLogDropped = 0;
+  portEXIT_CRITICAL(&probeLogLock);
+}
+LogSerialBinary::LogSerialBinary() { probeLogBinaryTask = xTaskGetCurrentTaskHandle(); }
+LogSerialBinary::~LogSerialBinary() { probeLogBinaryTask = nullptr; }
+#else
 static void probeLogAppend(const char* line) {
   const size_t n = strlen(line);
   if (probeLogLen + n > sizeof(probeLog)) return;
   memcpy(probeLog + probeLogLen, line, n);
   probeLogLen += n;
 }
+#endif
 void probeLogDump() {
+  [[maybe_unused]] LogSerialBinary binary;
   logSerial.printf("LOGDUMP_START:%u\n", static_cast<unsigned>(probeLogLen));
   logSerial.write(reinterpret_cast<const uint8_t*>(probeLog), probeLogLen);
   logSerial.printf("LOGDUMP_END\n");
-  probeLogLen = 0;
+#if !TENOR_COLD_LOG
+  probeLogLen = 0;  // the cold log keeps them for the card
+#endif
 }
 #endif
 
@@ -58,6 +105,11 @@ void addToLogRingBuffer(const char* message) {
 void logPrintf(const char* level, const char* origin, const char* format, ...) {
   va_list args;
   va_start(args, format);
+  vlogPrintf(level, origin, format, args);
+  va_end(args);
+}
+
+void vlogPrintf(const char* level, const char* origin, const char* format, va_list args) {
   char buf[MAX_ENTRY_LEN];
   char* c = buf;
   // add timestamp, level and origin
@@ -66,7 +118,6 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
     int len = snprintf(c, sizeof(buf), "[%lu] [%s] [%s] ", ms, level, origin);
     // error while writing => return
     if (len < 0) {
-      va_end(args);
       return;
     }
     // clamp c to be in buffer range
@@ -76,23 +127,20 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
   {
     int len = vsnprintf(c, sizeof(buf) - (c - buf), format, args);
     if (len < 0) {
-      va_end(args);
       return;
     }
   }
-  va_end(args);
 #if FREEINK_LOG_TRANSPORT == FREEINK_LOG_TRANSPORT_ROM_PRINTF
-  // IDF/ROM console path for boards monitored over USB-Serial-JTAG, where the
-  // HWCDC `operator bool` reads false under `pio device monitor` and logs would
-  // otherwise be silently dropped (e.g. Sticky).
+  // Sticky's USB serial bridge uses UART0; ROM output also works before Serial0.begin().
   esp_rom_printf("%s", buf);
+#elif TENOR_COLD_LOG
+  logSerial.print(buf);  // the tee keeps the copy, with or without a host on the port
 #else
-  if (logSerial) {
-    logSerial.print(buf);
-  }
+  // HWCDC queues the bytes and re-arms TX even while its low-clock connection flag is false.
+  logSerial.print(buf);
 #endif
   addToLogRingBuffer(buf);
-#ifdef TENOR_PRESS_PROBE
+#if defined(TENOR_PRESS_PROBE) && !TENOR_COLD_LOG
   probeLogAppend(buf);
 #endif
 }

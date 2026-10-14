@@ -1,9 +1,12 @@
 #include "FontDownloadActivity.h"
+#include "activities/settings/X3SettingsLayout.h"
 
 #include <ArduinoJson.h>
 #include <FontCacheManager.h>
+#include <HeapFloor.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <HalPowerManager.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -17,20 +20,58 @@
 #include "MappedInputManager.h"
 #include "FileTransferState.h"
 #include "SdCardFontSystem.h"
+#include "FontPackInstaller.h"
 #include "SettingsList.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/ConfirmationActivity.h"
+#include "activities/settings/FontDownloadTransfer.h"
+#include "activities/settings/FontDownloadHeap.h"
 #include "components/UITheme.h"
 #include "components/SettledListRender.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "network/HttpRangeTransfer.h"
 #include "network/WebDavReplace.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyNote.h"
 
 namespace fui = freeink::ui;
 
+#ifdef TENOR_PRESS_PROBE
+namespace {
+void logFontDownloadHeap(const char* stage) {
+  LOG_INF("FONT_HEAP", "stage=%s free=%u largest=%u min=%u", stage, ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+}
+}
+#endif
+
 FontDownloadActivity::FontDownloadActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : UiListActivity("FontDownload", renderer, mappedInput), fontInstaller_(sdFontSystem.registry()) {}
+
+bool FontDownloadActivity::installDownloadedPack(const char* path) {
+  const auto workspace = FontPackInstaller::workingSetBytes();
+  LOG_INF("FONT", "Pack install start free=%u largest=%u min=%u workspace=%u", ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap(), ESP.getMinFreeHeap(), static_cast<unsigned>(workspace));
+  if (!fontdownload::canInstallPack(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), workspace)) {
+    failureReason_ = tr(STR_MEMORY_ERROR);
+    errorMessage_ = failureReason_;
+    return false;
+  }
+  const auto result = FontPackInstaller::install(path);
+  if (result != FontPackInstaller::Result::OK) {
+    LOG_ERR("FONT", "Pack install failed path=%s result=%d", path, static_cast<int>(result));
+    failureReason_ = result == FontPackInstaller::Result::INVALID_PACK ? tr(STR_FONT_PACK_INVALID)
+                                                                     : tr(STR_FONT_PACK_INSTALL_ERROR);
+    errorMessage_ = failureReason_;
+    return false;
+  }
+  sdFontSystem.markRegistryDirty();
+  LOG_INF("FONT", "Pack committed free=%u largest=%u min=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+          ESP.getMinFreeHeap());
+  return true;
+}
 
 void FontDownloadActivity::activateIndex(const int index) {
   switch (state_) {
@@ -123,12 +164,26 @@ void FontDownloadActivity::onWifiSelectionComplete(const bool success) {
 
   {
     RenderLock lock(*this);
+#ifdef TENOR_PRESS_PROBE
+    logFontDownloadHeap("after-wifi");
+#endif
     // Wi-Fi time/timezone persistence may have rebuilt the settings catalog.
     // Release it after that child exits and before manifest/file TLS starts.
 #ifdef ESP_PLATFORM
     const uint32_t before = ESP.getFreeHeap();
 #endif
     releaseBaseSettingsList();
+#ifdef TENOR_PRESS_PROBE
+    logFontDownloadHeap("settings-released");
+#endif
+    if (auto* cache = renderer.getFontCacheManager()) cache->releaseSdFontCaches();
+#ifdef TENOR_PRESS_PROBE
+    logFontDownloadHeap("wifi-caches-released");
+#endif
+    sdFontSystem.releaseReaderForDownload(renderer);
+#ifdef TENOR_PRESS_PROBE
+    logFontDownloadHeap("wifi-reader-released");
+#endif
 #ifdef ESP_PLATFORM
     const uint32_t after = ESP.getFreeHeap();
     LOG_INF("FONT", "Settings catalog released=%u heap=%u largest=%u", after >= before ? after - before : 0u,
@@ -149,6 +204,16 @@ void FontDownloadActivity::onWifiSelectionComplete(const bool success) {
     }
     return;
   }
+#ifdef TENOR_PRESS_PROBE
+  logFontDownloadHeap("after-manifest");
+  LOG_INF("FONT_HEAP", "catalog arena=%u files=%u families=%u groups=%u indices=%u rows=%u/%u", arenaCapacity_,
+          fileEntryCount_ * static_cast<unsigned>(sizeof(ManifestFile)),
+          static_cast<unsigned>(families_.capacity() * sizeof(ManifestFamily)),
+          static_cast<unsigned>(scriptGroupLabels_.capacity() * sizeof(StrRef)),
+          static_cast<unsigned>(filteredIndices_.capacity() * sizeof(int)),
+          static_cast<unsigned>(rowLabels_.capacity() * sizeof(std::string)),
+          static_cast<unsigned>(rowItems_.capacity() * sizeof(fui::ListItem)));
+#endif
 
 #ifdef FREEINK_TLS_AUDIT
   if (auditDownload_) {
@@ -239,9 +304,12 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   // response carries the crc32 values that are the only integrity anchor for
   // those plain-HTTP downloads.
   auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr);
+#ifdef TENOR_PRESS_PROBE
+  logFontDownloadHeap("manifest-http-closed");
+#endif
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Failed to fetch manifest from %s", FONT_MANIFEST_URL);
-    errorMessage_ = "Failed to fetch font list";
+    errorMessage_ = tr(STR_FONT_LIST_FETCH_FAILED);
     Storage.remove(MANIFEST_TMP);
     return false;
   }
@@ -251,7 +319,7 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   if (!Storage.openFileForRead("FONT", MANIFEST_TMP, manifestFile)) {
     LOG_ERR("FONT", "Failed to open temp manifest");
     Storage.remove(MANIFEST_TMP);
-    errorMessage_ = "Failed to read font list";
+    errorMessage_ = tr(STR_FONT_LIST_READ_FAILED);
     return false;
   }
 
@@ -285,7 +353,7 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   int version = doc["version"] | 0;
   if (version != FONTS_MANIFEST_VERSION) {
     LOG_ERR("FONT", "Unsupported manifest version: %d", version);
-    errorMessage_ = "Unsupported manifest version";
+    errorMessage_ = tr(STR_FONT_MANIFEST_VERSION_UNSUPPORTED);
     return false;
   }
 
@@ -355,7 +423,14 @@ bool FontDownloadActivity::fetchAndParseManifest() {
       manifestFileCount++;
     }
   }
-  stringArena_ = makeUniqueNoThrow<char[]>(arenaBytes);
+  const uint64_t catalogBytes = uint64_t{arenaBytes} + uint64_t{manifestFileCount} * sizeof(ManifestFile) +
+                                uint64_t{groupCount} * sizeof(StrRef) +
+                                uint64_t{familiesArr.size()} * (sizeof(ManifestFamily) + sizeof(int)) + 128;
+  if (!fontdownload::canAllocateCatalog(catalogBytes, ESP.getFreeHeap(), ESP.getMaxAllocHeap())) {
+    errorMessage_ = tr(STR_MEMORY_ERROR);
+    return false;
+  }
+  stringArena_ = heapfloor::array<char[]>(arenaBytes, "font-catalog");
   if (!stringArena_) {
     LOG_ERR("FONT", "OOM: %zu byte string arena", arenaBytes);
     errorMessage_ = tr(STR_MEMORY_ERROR);
@@ -425,7 +500,12 @@ bool FontDownloadActivity::fetchAndParseManifest() {
 
     family.fileStart = fileEntryCount_;
     for (JsonObject fileObj : fObj["files"].as<JsonArray>()) {
-      if (!FontInstaller::isValidCpfontRelativePath(fileObj["name"] | "")) {
+      const char* fileName = fileObj["name"] | "";
+      const auto kind = fontdownload::classifyManifestFile(fileName);
+      if (kind == fontdownload::ManifestFileKind::Invalid ||
+          (kind == fontdownload::ManifestFileKind::Pack &&
+           (fObj["files"].size() != 1 || !fontdownload::packMatchesFamily(fileName, str(family.name)) ||
+            fileObj["size"].as<uint32_t>() > 128 * 1024 * 1024))) {
         errorMessage_ = tr(STR_INVALID_FONT_MANIFEST);
         return false;
       }
@@ -450,7 +530,8 @@ bool FontDownloadActivity::fetchAndParseManifest() {
       // manifest with one unbuildable path is rejected whole instead of
       // failing mid-transfer or creating a truncated path on SD.
       char path[FontInstaller::MAX_FONT_PATH_SIZE];
-      if (!FontInstaller::buildFontPath(str(family.name), str(file.name), path, sizeof(path))) {
+      if (kind == fontdownload::ManifestFileKind::SingleFont &&
+          !FontInstaller::buildFontPath(str(family.name), str(file.name), path, sizeof(path))) {
         LOG_ERR("FONT", "Invalid font path in manifest: %s/%s", str(family.name), str(file.name));
         errorMessage_ = tr(STR_INVALID_FONT_MANIFEST);
         return false;
@@ -460,7 +541,9 @@ bool FontDownloadActivity::fetchAndParseManifest() {
       // Not a checksum, but a size mismatch reliably indicates a rebuild in
       // practice. hasUpdate latches rather than stopping the scan, so the path
       // preflight above still covers the remaining files.
-      if (family.installed && !family.hasUpdate) {
+      if (kind == fontdownload::ManifestFileKind::Pack) {
+        family.hasUpdate = family.installed;
+      } else if (family.installed && !family.hasUpdate) {
         HalFile f;
         if (Storage.openFileForRead("FONT", path, f)) {
           const size_t actual = f.fileSize();
@@ -485,10 +568,6 @@ bool FontDownloadActivity::fetchAndParseManifest() {
     families_.push_back(family);
   }
 
-  const size_t rowCapacity = std::max(families_.size() + 2, scriptGroupLabels_.size() + 1);
-  rowLabels_.reserve(rowCapacity);
-  rowItems_.reserve(rowCapacity);
-
   LOG_DBG("FONT", "Manifest loaded: %zu families, %zu script groups", families_.size(), scriptGroupLabels_.size());
   return true;
 }
@@ -496,29 +575,70 @@ bool FontDownloadActivity::fetchAndParseManifest() {
 // --- Download ---
 
 void FontDownloadActivity::downloadAll() {
-  cancelRequested_ = false;
-  for (const int familyIndex : filteredIndices_) {
-    if (families_[familyIndex].installed) continue;
-    downloadFamily(families_[familyIndex]);
-    if (state_ == ERROR || cancelRequested_) return;
-  }
-
-  {
-    RenderLock lock(*this);
-    state_ = COMPLETE;
-  }
+  downloadSelected(false);
 }
 
 void FontDownloadActivity::updateAll() {
-  cancelRequested_ = false;
-  for (const int familyIndex : filteredIndices_) {
-    if (!families_[familyIndex].hasUpdate) continue;
-    downloadFamily(families_[familyIndex]);
-    if (state_ == ERROR || cancelRequested_) return;
-  }
+  downloadSelected(true);
+}
 
+void FontDownloadActivity::downloadSelected(const bool updates) {
+  HalPowerManager::Lock fullSpeed;
   {
     RenderLock lock(*this);
+    cancelRequested_ = false;
+    goHomeRequested_ = false;
+    batchRunning_ = true;
+    batchResult_ = false;
+    batchTotalBytes_ = 0;
+    batchDownloadedBytes_ = 0;
+    batchFamilyIndex_ = 0;
+    batchFamilyCount_ = 0;
+    batchSuccessCount_ = 0;
+    batchFailureCount_ = 0;
+    terminalIdleTimerStarted_ = false;
+    progressRenderGate_.reset();
+    for (auto& family : families_) {
+      family.failureReason = nullptr;
+      family.requiredMb = 0;
+    }
+    for (const int familyIndex : filteredIndices_) {
+      const auto& family = families_[familyIndex];
+      if (updates ? !family.hasUpdate : family.installed) continue;
+      batchTotalBytes_ += family.totalSize;
+      ++batchFamilyCount_;
+    }
+  }
+  for (const int familyIndex : filteredIndices_) {
+    auto& family = families_[familyIndex];
+    if (updates ? !family.hasUpdate : family.installed) continue;
+    {
+      RenderLock lock(*this);
+      ++batchFamilyIndex_;
+    }
+    downloadFamily(family);
+    RenderLock lock(*this);
+    if (cancelRequested_) {
+      batchRunning_ = false;
+      return;
+    }
+    if (state_ == ERROR) {
+      family.failureReason = failureReason_ ? failureReason_ : tr(STR_FONT_PACK_INSTALL_ERROR);
+      family.requiredMb = requiredMb_;
+      ++batchFailureCount_;
+    } else {
+      ++batchSuccessCount_;
+    }
+    state_ = DOWNLOADING;
+  }
+  waitForDownloadPaint();
+  {
+    RenderLock lock(*this);
+    batchRunning_ = false;
+    batchResult_ = true;
+    resultFailureIndex_ = 0;
+    while (resultFailureIndex_ < static_cast<int>(families_.size()) &&
+           !families_[resultFailureIndex_].failureReason) ++resultFailureIndex_;
     state_ = COMPLETE;
   }
 }
@@ -626,55 +746,94 @@ size_t FontDownloadActivity::totalUpdateSize() const {
   return total;
 }
 
-// Standard CRC32 matching zlib/Python zlib.crc32().
-bool FontDownloadActivity::computeFileCrc32(const char* path, uint32_t& outCrc) {
-  HalFile f;
-  if (!Storage.openFileForRead("FONT", path, f)) {
-    return false;
+void FontDownloadActivity::updateDownloadProgress(size_t downloaded, size_t total) {
+  mappedInput.update();
+  if (mappedInput.isPressed(MappedInputManager::Button::Back) ||
+      mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    cancelRequested_ = true;
   }
-  constexpr size_t BUF_SIZE = 128;
-  uint8_t buf[BUF_SIZE];
-  uint32_t crc = 0;
-  while (f.available()) {
-    const int n = f.read(buf, BUF_SIZE);
-    if (n <= 0) break;
-    crc = esp_rom_crc32_le(crc, buf, static_cast<uint32_t>(n));
+  if (mappedInput.wasLongPressed(MappedInputManager::Button::Back, 1000) || mappedInput.wasHomeGesture()) {
+    cancelRequested_ = true;
+    goHomeRequested_ = true;
   }
-  outCrc = crc;
-  return true;
+  const unsigned long now = millis();
+  RenderLock lock(RenderLock::TryTake{});
+  if (!lock.acquired()) return;
+  fileProgress_ = downloaded;
+  if (!progressRenderGate_.requestDue(downloaded, total ? total : fileTotal_, now)) return;
+  lock.unlock();
+  requestUpdate(true);
+}
+
+void FontDownloadActivity::waitForDownloadPaint() {
+  unsigned long paintDelay = 0;
+  {
+    RenderLock lock(*this);
+    paintDelay = progressRenderGate_.nextPaintDelay(millis());
+  }
+  if (paintDelay) delay(paintDelay);
+}
+
+bool FontDownloadActivity::prepareDownloadHeap() {
+  RenderLock lock(*this);
+#ifdef TENOR_PRESS_PROBE
+  logFontDownloadHeap("before-release");
+#endif
+  std::vector<fui::ListItem>().swap(rowItems_);
+  std::vector<std::string>().swap(rowLabels_);
+  rowsDirty_ = true;
+#ifdef TENOR_PRESS_PROBE
+  logFontDownloadHeap("rows-released");
+#endif
+  releaseBaseSettingsList();
+#ifdef TENOR_PRESS_PROBE
+  logFontDownloadHeap("download-settings-released");
+#endif
+  if (auto* cache = renderer.getFontCacheManager()) cache->releaseSdFontCaches();
+#ifdef TENOR_PRESS_PROBE
+  logFontDownloadHeap("download-caches-released");
+#endif
+  sdFontSystem.releaseReaderForDownload(renderer);
+#ifdef TENOR_PRESS_PROBE
+  logFontDownloadHeap("download-reader-released");
+  logFontDownloadHeap("before-tls-check");
+#endif
+  return fontdownload::hasTlsHeadroom(ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+                                    HttpDownloader::MIN_TLS_FREE_HEAP, HttpDownloader::MIN_TLS_MAX_ALLOC);
 }
 
 void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
+  HalPowerManager::Lock fullSpeed;
   const bool wasInstalled = family.installed;
   {
     RenderLock lock(*this);
     state_ = DOWNLOADING;
     downloadingFamilyIndex_ = static_cast<int>(&family - families_.data());
     fileProgress_ = 0;
-    fileTotal_ = 0;
-    progressRenderGate_.reset();
-    cancelRequested_ = false;
-    goHomeRequested_ = false;
+    fileTotal_ = family.fileCount ? files_[family.fileStart].size : 0;
+    if (!batchRunning_) {
+      progressRenderGate_.reset();
+      cancelRequested_ = false;
+      goHomeRequested_ = false;
+      batchResult_ = false;
+    }
+    familyDownloadedBytes_ = 0;
+    streamedBytes_ = 0;
+    failureReason_ = nullptr;
+    requiredMb_ = 0;
+    installingPack_ = false;
+    errorMessage_.clear();
+    currentFileIndex_ = 0;
+    currentFileTotal_ = family.fileCount;
   }
-  requestUpdateAndWait();
-
-  // Rebuildable SD-font caches (glyph/kern arenas, CJK fallback tables) can
-  // hold tens of KB the TLS session needs; release them up front rather than
-  // starving the transfer. They repopulate on demand after the download.
-  if (auto* fcm = renderer.getFontCacheManager()) {
-    RenderLock lock(*this);
-    fcm->releaseSdFontCaches();
-    LOG_DBG("FONT", "Free heap after SD font cache release: %d bytes", ESP.getFreeHeap());
-  }
-
   // Check before touching the family directory so a failed update leaves the
   // installed family unchanged.
-  if (ESP.getFreeHeap() < HttpDownloader::MIN_TLS_FREE_HEAP ||
-      ESP.getMaxAllocHeap() < HttpDownloader::MIN_TLS_MAX_ALLOC) {
+  if (!prepareDownloadHeap()) {
     LOG_ERR("FONT", "Low heap for download (%u free, %u max block)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     RenderLock lock(*this);
     state_ = ERROR;
-    errorMessage_ = tr(STR_MEMORY_ERROR);
+    failureReason_ = tr(STR_MEMORY_ERROR);
+    errorMessage_ = failureReason_;
     return;
   }
 
@@ -684,105 +843,139 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
   // behind or start a transfer to a truncated target. One buffer is reused by
   // this preflight and by the per-file loop below.
   char destPath[FontInstaller::MAX_FONT_PATH_SIZE];
+  const bool pack = family.fileCount == 1 &&
+                    fontdownload::classifyManifestFile(str(files_[family.fileStart].name)) ==
+                        fontdownload::ManifestFileKind::Pack;
   for (uint32_t i = 0; i < family.fileCount; i++) {
-    if (!FontInstaller::buildFontPath(str(family.name), str(files_[family.fileStart + i].name), destPath,
-                                      sizeof(destPath))) {
+    const char* name = str(files_[family.fileStart + i].name);
+    if (pack ? !fontdownload::packMatchesFamily(name, str(family.name))
+             : !FontInstaller::buildFontPath(str(family.name), name, destPath, sizeof(destPath))) {
       LOG_ERR("FONT", "Invalid font path: %s/%s", str(family.name), str(files_[family.fileStart + i].name));
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = tr(STR_INVALID_FONT_MANIFEST);
+      failureReason_ = tr(STR_INVALID_FONT_MANIFEST);
+      errorMessage_ = failureReason_;
       return;
     }
   }
 
-  if (!fontInstaller_.ensureFamilyDir(str(family.name))) {
+  if (!pack && !fontInstaller_.ensureFamilyDir(str(family.name))) {
     RenderLock lock(*this);
     state_ = ERROR;
-    errorMessage_ = "Failed to create font directory";
+    failureReason_ = tr(STR_FONT_PACK_IO_ERROR);
+    errorMessage_ = failureReason_;
     return;
   }
 
   for (uint32_t i = 0; i < family.fileCount; i++) {
     const ManifestFile& file = files_[family.fileStart + i];
-
+    waitForDownloadPaint();
     {
       RenderLock lock(*this);
       fileProgress_ = 0;
       fileTotal_ = file.size;
+      streamedBytes_ = 0;
       progressRenderGate_.reset();
+      progressRenderGate_.requestDue(0, file.size, millis());
     }
     requestUpdateAndWait();
 
     // Rebuilt into the same buffer per file: the path may only become
     // unbuildable if storage changed since the preflight above, and that must
     // fail closed rather than download to a truncated target.
-    if (!FontInstaller::buildFontPath(str(family.name), str(file.name), destPath, sizeof(destPath))) {
+    if (!pack && !FontInstaller::buildFontPath(str(family.name), str(file.name), destPath, sizeof(destPath))) {
       LOG_ERR("FONT", "Invalid font path: %s/%s", str(family.name), str(file.name));
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = tr(STR_INVALID_FONT_MANIFEST);
+      failureReason_ = tr(STR_INVALID_FONT_MANIFEST);
+      errorMessage_ = failureReason_;
       return;
     }
 
     downloadUrl_.assign(baseUrl_).append(str(file.name));
 
-    if (!fontInstaller_.ensureFontDir(str(family.name), str(file.name))) {
+    const auto fetch = [&](const auto& onData) {
+      size_t received = 0;
+      uint32_t parts = 0, retries = 0;
+      HttpDownloader::RangeSession session;
+      return http_range::transfer(file.size, received, cancelRequested_,
+          [&](size_t first, size_t last, bool& whole, bool& stop) {
+#ifdef TENOR_PRESS_PROBE
+        if (session.hasTlsContext()) logFontDownloadHeap("before-tls-reuse");
+#endif
+        if (!session.hasTlsContext() && !prepareDownloadHeap()) {
+          RenderLock lock(*this);
+          failureReason_ = tr(STR_MEMORY_ERROR);
+          stop = true;
+          return false;
+        }
+        const auto countedData = [&](const uint8_t* bytes, const size_t count) {
+          const auto written = onData(bytes, count);
+          received += written.bytes;
+          streamedBytes_ += static_cast<uint32_t>(written.bytes);
+          stop = written.fatal;
+          return written.complete;
+        };
+        HttpDownloader::TransferStats part;
+        const bool ok = HttpDownloader::fetchRange(downloadUrl_, first, last, countedData, nullptr,
+            [&](size_t, size_t) { updateDownloadProgress(received, file.size); },
+            &cancelRequested_, &part, &whole, &session);
+        updateDownloadProgress(received, file.size);
+#ifdef TENOR_PRESS_PROBE
+        LOG_INF("FONT_RANGE", "part=%u first=%u bytes=%u written=%u status=%d ok=%d free=%u largest=%u min=%u retries=%u stop=%d",
+                parts + 1, static_cast<unsigned>(first), part.bytes, static_cast<unsigned>(received),
+                part.status, ok, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap(), retries, stop);
+        if (!ok && !cancelRequested_ && !stop && !whole && retries < http_range::MAX_PART_RETRIES)
+          LOG_INF("FONT_RANGE", "retry=%u first=%u", retries + 1, static_cast<unsigned>(received));
+#endif
+        return ok;
+      }, parts, retries);
+    };
+    auto transfer = fontdownload::TransferResult::OK;
+    if (pack) {
+      LOG_INF("FONT", "Pack download bytes=%u free=%u largest=%u min=%u", file.size, ESP.getFreeHeap(),
+              ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+      transfer = fontdownload::downloadAndInstallPack(
+          str(file.name), file.size, file.crc32, cancelRequested_, fetch,
+          [&](const char* path) {
+            waitForDownloadPaint();
+            {
+              RenderLock lock(*this);
+              installingPack_ = true;
+              fileProgress_ = file.size;
+              progressRenderGate_.reset();
+              progressRenderGate_.requestDue(fileProgress_, fileTotal_, millis());
+            }
+            requestUpdateAndWait();
+            return installDownloadedPack(path);
+          });
+    } else {
+      if (!fontInstaller_.ensureFontDir(str(family.name), str(file.name))) {
+        transfer = fontdownload::TransferResult::IoError;
+      } else {
+        bool backupCleanupPending = false;
+        const auto installed = webdav::installVerifiedFile(
+            Storage, destPath,
+            [&](const char* staging) {
+              transfer = fontdownload::streamVerifiedFile(staging, file.size, file.crc32, cancelRequested_, fetch);
+              return transfer == fontdownload::TransferResult::OK;
+            },
+            [&](const char* staging) { return fontInstaller_.validateCpfontFile(staging); }, &backupCleanupPending);
+        if (installed != webdav::InstallResult::OK && transfer == fontdownload::TransferResult::OK)
+          transfer = fontdownload::TransferResult::IoError;
+        if (backupCleanupPending) LOG_ERR("FONT", "Committed font %s; backup retained", destPath);
+      }
+    }
+    {
       RenderLock lock(*this);
-      state_ = ERROR;
-      errorMessage_ = "Failed to create font directory";
-      return;
+      if (batchRunning_) batchDownloadedBytes_ += streamedBytes_;
+      familyDownloadedBytes_ += streamedBytes_;
+      fileProgress_ = 0;
     }
-
-    auto downloadResult = HttpDownloader::HTTP_ERROR;
-    bool backupCleanupPending = false;
-    const auto installResult = webdav::installVerifiedFile(
-        Storage, destPath,
-        [&](const char* staging) {
-          downloadResult = HttpDownloader::downloadToFile(
-              downloadUrl_, staging,
-              [this](size_t downloaded, size_t total) {
-                mappedInput.update();
-                if (mappedInput.isPressed(MappedInputManager::Button::Back) ||
-                    mappedInput.wasPressed(MappedInputManager::Button::Back)) {
-                  cancelRequested_ = true;
-                }
-                // This update() consumes the one-shot home event before the central
-                // ActivityManager dispatch can see it, so honor it here: abort the
-                // download, then exit to home once the abort unwinds.
-                if (mappedInput.wasLongPressed(MappedInputManager::Button::Back, 1000) ||
-                    mappedInput.wasHomeGesture()) {
-                  cancelRequested_ = true;
-                  goHomeRequested_ = true;
-                }
-                const unsigned long now = millis();
-                RenderLock lock(RenderLock::TryTake{});
-                if (!lock.acquired() || !progressRenderGate_.requestDue(downloaded, total, now)) return;
-                fileProgress_ = downloaded;
-                if (total > 0) fileTotal_ = total;
-                lock.unlock();
-                requestUpdate(true);
-              },
-              &cancelRequested_, "", "");
-          return downloadResult == HttpDownloader::OK;
-        },
-        [&](const char* staging) {
-          uint32_t actualCrc = 0;
-          if (!computeFileCrc32(staging, actualCrc) || actualCrc != file.crc32) {
-            LOG_ERR("FONT", "CRC32 validation failed: %s got=%08x expected=%08x", str(file.name), actualCrc,
-                    file.crc32);
-            return false;
-          }
-          return fontInstaller_.validateCpfontFile(staging);
-        }, &backupCleanupPending);
-    if (backupCleanupPending) {
-      LOG_ERR("FONT", "Install %s: backup %s.davbak retained after committed replacement", destPath, destPath);
-    }
-
-    if (installResult != webdav::InstallResult::OK) {
-      // Completed files remain usable; a retry can replace them independently.
+    if (transfer != fontdownload::TransferResult::OK) {
       family.installed = wasInstalled;
       family.hasUpdate = wasInstalled;
-      if (downloadResult == HttpDownloader::ABORTED) {
+      if (transfer == fontdownload::TransferResult::Aborted) {
         if (goHomeRequested_) {
           onGoHome();
           return;
@@ -790,11 +983,34 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
         returnToFamilyList(fontdownload::ReleaseButton::Back);
         return;
       }
-      LOG_ERR("FONT", "Font install failed: %s download=%d stage=%d", str(file.name), downloadResult,
-              static_cast<int>(installResult));
+      LOG_ERR("FONT", "Font download failed name=%s result=%d", str(file.name), static_cast<int>(transfer));
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = std::string("Download failed: ") + str(file.name);
+      switch (transfer) {
+        case fontdownload::TransferResult::NoSpace: {
+          char message[64];
+          const auto mb = static_cast<unsigned>((fontdownload::requiredPackSpace(file.size) + 1024 * 1024 - 1) /
+                                                (1024 * 1024));
+          std::snprintf(message, sizeof(message), tr(STR_FONT_PACK_NO_SPACE), mb);
+          failureReason_ = tr(STR_FONT_PACK_NO_SPACE);
+          requiredMb_ = mb;
+          errorMessage_ = message;
+          break;
+        }
+        case fontdownload::TransferResult::ChecksumError:
+          failureReason_ = tr(STR_FONT_PACK_CHECKSUM_ERROR);
+          break;
+        case fontdownload::TransferResult::NetworkError:
+          if (!failureReason_) failureReason_ = tr(STR_FONT_PACK_TRANSFER_ERROR);
+          break;
+        case fontdownload::TransferResult::InstallError:
+          if (!failureReason_) failureReason_ = tr(STR_FONT_PACK_INSTALL_ERROR);
+          break;
+        default:
+          failureReason_ = tr(STR_FONT_PACK_IO_ERROR);
+          break;
+      }
+      if (transfer != fontdownload::TransferResult::NoSpace) errorMessage_ = failureReason_;
       return;
     }
     LOG_DBG("FONT", "Downloaded %s (size=%u crc32=%08x)", str(file.name), file.size, file.crc32);
@@ -802,13 +1018,14 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
     currentFileIndex_++;
   }
 
-  sdFontSystem.markRegistryDirty();
-  family.installed = true;
-  family.hasUpdate = false;
-
+  waitForDownloadPaint();
   {
     RenderLock lock(*this);
-    state_ = COMPLETE;
+    sdFontSystem.markRegistryDirty();
+    family.installed = true;
+    family.hasUpdate = false;
+    installingPack_ = false;
+    state_ = batchRunning_ ? DOWNLOADING : COMPLETE;
   }
 }
 
@@ -821,8 +1038,12 @@ void FontDownloadActivity::promptDeleteSelectedFamily() {
   std::string heading = tr(STR_DELETE);
   const auto& family = families_[pendingDeleteFamilyIndex];
   std::string body = str(family.name);
-  startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, body),
-                         [this](const ActivityResult& result) { onDeleteConfirmationResult(result); });
+  startActivityForResult(
+      std::make_unique<ConfirmationActivity>(
+          renderer, mappedInput, heading, body,
+          ConfirmationContent{tr(STR_ALERT_FONT_QUESTION), body + " " + tr(STR_ALERT_FONT_MESSAGE_SUFFIX),
+                              tr(STR_ALERT_FONT_ACTION_SHORT), tr(STR_ALERT_FONT_ACTION_LONG), "", true}),
+      [this](const ActivityResult& result) { onDeleteConfirmationResult(result); });
 }
 
 void FontDownloadActivity::onDeleteConfirmationResult(const ActivityResult& result) {
@@ -841,7 +1062,7 @@ void FontDownloadActivity::onDeleteConfirmationResult(const ActivityResult& resu
   if (fontInstaller_.deleteFamily(str(family.name)) != FontInstaller::Error::OK) {
     RenderLock lock(*this);
     state_ = ERROR;
-    errorMessage_ = "Failed to delete font";
+    errorMessage_ = tr(STR_FONT_DELETE_FAILED);
   } else {
     sdFontSystem.markRegistryDirty();
     family.installed = false;
@@ -899,12 +1120,19 @@ void FontDownloadActivity::activateSelected() {
 void FontDownloadActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   // Content below the GUI.drawHeader band, above the button hints.
-  screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
-                                                static_cast<int16_t>(metrics.buttonHintsHeight), 0});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  if (x3settings::beginScreen(screen, renderer)) {
+    tabBandDrawn = true;
+  } else {
+    screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
+                                                  static_cast<int16_t>(metrics.buttonHintsHeight), 0});
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   if (state_ == FAMILY_LIST && filteredIndices_.empty()) {
-    screen.centeredText(tr(STR_NO_FONTS_AVAILABLE), screen.theme().bodyText);
+    if (tenorchrome::x3ScreenLayoutEnabled())
+      tenorchrome::drawInfoInRect(renderer, tr(STR_NO_FONTS_AVAILABLE), tenorchrome::x3ScreenLayout(renderer).bodyRect);
+    else screen.centeredText(I18N.get(shell::uglyParts() ? StrId::STR_UGLY_FONT_EMPTY : StrId::STR_NO_FONTS_AVAILABLE),
+                              screen.theme().bodyText);
     return;
   }
 
@@ -919,7 +1147,7 @@ void FontDownloadActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
   props.valueInset = 8;               // air between the status and the row edge
-  syncListViewport(screen, props, /*hasSubtitle=*/state_ == FAMILY_LIST);
+  syncListViewport(screen, props);
   screen.list(props);
 }
 
@@ -998,6 +1226,17 @@ bool FontDownloadActivity::handleCustomInput() {
     return false;
   }
 
+  if (tenorchrome::x3ScreenLayoutEnabled() && !(state_ == COMPLETE && batchResult_) && infoPages_ > 1 &&
+      (mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+       mappedInput.wasPressed(MappedInputManager::Button::Down))) {
+    RenderLock lock(*this);
+    infoPage_ = std::clamp(infoPage_ + (mappedInput.wasPressed(MappedInputManager::Button::Down) ? 1 : -1),
+                            0, infoPages_ - 1);
+    terminalStateSince_ = millis();
+    requestUpdate();
+    return true;
+  }
+
   if (state_ == COMPLETE || state_ == ERROR) {
     if (!terminalIdleTimerStarted_) {
       terminalStateSince_ = millis();
@@ -1009,6 +1248,30 @@ bool FontDownloadActivity::handleCustomInput() {
   }
 
   if (state_ == COMPLETE) {
+    if (batchResult_ && batchFailureCount_ > 1) {
+      int swipeDistance = 0;
+      unsigned long swipeDuration = 0;
+      const bool swiped = mappedInput.wasVerticalSwipe(swipeDistance, swipeDuration);
+      const bool previous = mappedInput.wasReleased(MappedInputManager::Button::Up) ||
+                            mappedInput.wasReleased(MappedInputManager::Button::Left) ||
+                            (swiped && swipeDistance > 0);
+      const bool next = mappedInput.wasReleased(MappedInputManager::Button::Down) ||
+                        mappedInput.wasReleased(MappedInputManager::Button::Right) ||
+                        (swiped && swipeDistance < 0);
+      if (previous || next) {
+        const int direction = previous ? -1 : 1;
+        int index = resultFailureIndex_ + direction;
+        while (index >= 0 && index < static_cast<int>(families_.size()) && !families_[index].failureReason)
+          index += direction;
+        if (index >= 0 && index < static_cast<int>(families_.size())) {
+          resultFailureIndex_ = index;
+          infoPage_ = 0;
+        }
+        terminalStateSince_ = millis();
+        requestUpdate();
+        return true;
+      }
+    }
     int x = 0;
     int y = 0;
     const bool backPressed = mappedInput.wasPressed(MappedInputManager::Button::Back);
@@ -1087,7 +1350,7 @@ void FontDownloadActivity::returnToFamilyList(const fontdownload::ReleaseButton 
 
 // --- Rendering ---
 
-std::string FontDownloadActivity::formatSize(size_t bytes) {
+std::string FontDownloadActivity::formatSize(uint64_t bytes) {
   char buf[32];
   if (bytes >= 1024 * 1024) {
     snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
@@ -1099,23 +1362,111 @@ std::string FontDownloadActivity::formatSize(size_t bytes) {
   return buf;
 }
 
+// The waits of this screen as notes. The two lists wait for the shared ugly list.
+bool FontDownloadActivity::renderUglyNote() const {
+  if (state_ == DOWNLOADING || (state_ == COMPLETE && batchResult_)) return false;
+  char line[160];
+  std::string detail;
+  int percent = -1;
+  ugly::Hints hints;
+  hints.back = true;
+  switch (state_) {
+    case LOADING_MANIFEST:
+      snprintf(line, sizeof(line), "%s", tr(STR_UGLY_FONT_LOADING));
+      hints.back = false;
+      break;
+    case DOWNLOADING:
+      if (installingPack_) {
+        snprintf(line, sizeof(line), "%s", tr(STR_FONT_PACK_INSTALLING));
+        hints.back = false;
+      } else {
+        snprintf(line, sizeof(line), tr(STR_UGLY_FONT_DOWNLOADING), str(families_[downloadingFamilyIndex_].name),
+                 static_cast<int>(currentFileIndex_ + 1), static_cast<int>(currentFileTotal_));
+        detail = formatSize(fileProgress_) + " / " + formatSize(fileTotal_);
+      }
+      if (!installingPack_ && fileTotal_ > 0) {
+        percent = static_cast<int>(static_cast<uint64_t>(fileProgress_) * 100 / fileTotal_);
+      }
+      break;
+    case COMPLETE:
+      snprintf(line, sizeof(line), "%s", tr(STR_UGLY_FONT_DONE));
+      break;
+    case ERROR:
+      snprintf(line, sizeof(line), "%s", tr(STR_UGLY_FONT_FAILED));
+      detail = errorMessage_;
+      hints.confirm = true;
+      break;
+    default:
+      return false;
+  }
+  ugly::notePage(renderer, mappedInput, tr(STR_FONT_BROWSER), line, detail.empty() ? nullptr : detail.c_str(), percent,
+                 hints);
+  return true;
+}
+
+const char* FontDownloadActivity::headerSubtitle() {
+  if (state_ != FAMILY_LIST || !hasGroupScreen()) return nullptr;
+  const int scriptGroupIndex = groupNav_.selected - 1;
+  return scriptGroupIndex >= 0 && scriptGroupIndex < static_cast<int>(scriptGroupLabels_.size())
+             ? str(scriptGroupLabels_[scriptGroupIndex])
+             : tr(STR_ALL_FONTS);
+}
+
+void FontDownloadActivity::drawChrome() {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    std::string title = tr(STR_FONT_BROWSER);
+    if (headerSubtitle() && *headerSubtitle()) title += std::string(" / ") + headerSubtitle();
+    x3settings::drawPath(renderer, title.c_str());
+    return;
+  }
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.headerHeight},
+                 tr(STR_FONT_BROWSER), headerSubtitle());
+}
+
+void FontDownloadActivity::drawListHints() {
+  if (state_ == GROUP_LIST) {
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_OPEN), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    return;
+  }
+  const bool hasVisibleFamilies = !filteredIndices_.empty();
+  const char* confirmLabel = !hasVisibleFamilies            ? ""
+                             : isSelectedFamilyDeletable()  ? tr(STR_DELETE)
+                             : isUpdateAllRow(nav.selected) ? tr(STR_UPDATE)
+                                                            : tr(STR_DOWNLOAD);
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, hasVisibleFamilies ? tr(STR_DIR_UP) : "",
+                                            hasVisibleFamilies ? tr(STR_DIR_DOWN) : "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+}
+
 void FontDownloadActivity::render(RenderLock&&) {
-  progressRenderGate_.renderStarted();
+  if (state_ == DOWNLOADING || (state_ == COMPLETE && batchResult_)) {
+    const auto paintDelay = progressRenderGate_.paintDelay(millis());
+    if (paintDelay) delay(paintDelay);
+    progressRenderGate_.paintStarted(millis());
+  } else {
+    progressRenderGate_.renderStarted();
+  }
+  if (shell::uglyParts() && renderUglyNote()) return;
+  if (tenorchrome::x3ScreenLayoutEnabled() && state_ != GROUP_LIST && state_ != FAMILY_LIST) {
+    renderX3State();
+    return;
+  }
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
+  // The two lists by hand: the layout keeps its words and the shared skin writes them.
+  if ((state_ == GROUP_LIST || state_ == FAMILY_LIST) && renderUglyList()) {
+    renderer.displayBuffer();
+    return;
+  }
+
   renderer.clearScreen();
 
-  const char* headerSubtitle = nullptr;
-  if (state_ == FAMILY_LIST && hasGroupScreen()) {
-    const int scriptGroupIndex = groupNav_.selected - 1;
-    headerSubtitle = scriptGroupIndex >= 0 && scriptGroupIndex < static_cast<int>(scriptGroupLabels_.size())
-                         ? str(scriptGroupLabels_[scriptGroupIndex])
-                         : tr(STR_ALL_FONTS);
-  }
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_FONT_BROWSER),
-                 headerSubtitle);
+  const char* headerSubtitle = this->headerSubtitle();
+  drawChrome();
 
   const auto lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
   const auto contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
@@ -1125,8 +1476,9 @@ void FontDownloadActivity::render(RenderLock&&) {
     renderSettledList(activeNav(), [&] {
       if (!firstPass) {
         renderer.clearScreen();
-        GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_FONT_BROWSER),
-                       headerSubtitle);
+        if (tenorchrome::x3ScreenLayoutEnabled()) drawChrome();
+        else GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_FONT_BROWSER),
+                              headerSubtitle);
       }
       firstPass = false;
       renderUi();
@@ -1137,46 +1489,69 @@ void FontDownloadActivity::render(RenderLock&&) {
     renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_LOADING_FONT_LIST));
   } else if (state_ == GROUP_LIST) {
     renderFontList();
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_OPEN), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    drawListHints();
   } else if (state_ == FAMILY_LIST) {
     renderFontList();
-
-    const bool hasVisibleFamilies = !filteredIndices_.empty();
-    const char* confirmLabel = !hasVisibleFamilies            ? ""
-                               : isSelectedFamilyDeletable()  ? tr(STR_DELETE)
-                               : isUpdateAllRow(nav.selected) ? tr(STR_UPDATE)
-                                                              : tr(STR_DOWNLOAD);
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, hasVisibleFamilies ? tr(STR_DIR_UP) : "",
-                                              hasVisibleFamilies ? tr(STR_DIR_DOWN) : "");
-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    drawListHints();
   } else if (state_ == DOWNLOADING) {
     const auto& family = families_[downloadingFamilyIndex_];
-
-    std::string statusText = std::string(tr(STR_DOWNLOADING)) + " " + str(family.name) + " (" +
-                             std::to_string(currentFileIndex_ + 1) + "/" + std::to_string(currentFileTotal_) + ")";
-    renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight, statusText.c_str());
-
-    float progress = 0;
-    if (fileTotal_ > 0) {
-      progress = static_cast<float>(fileProgress_) / static_cast<float>(fileTotal_);
-    }
-
-    int barY = centerY + metrics.verticalSpacing;
-    if (fileTotal_ > 0) {
-      GUI.drawProgressBar(
-          renderer,
-          Rect{metrics.contentSidePadding, barY, pageWidth - metrics.contentSidePadding * 2, metrics.progressBarHeight},
-          static_cast<int>(progress * 100), 100);
+    const auto familyBytes = uint64_t{familyDownloadedBytes_} + fileProgress_;
+    const auto totalBytes = batchRunning_ ? batchTotalBytes_ : family.totalSize;
+    const auto downloadedBytes = batchRunning_ ? batchDownloadedBytes_ + fileProgress_ : familyBytes;
+    const unsigned currentPercent = family.totalSize ? static_cast<unsigned>(familyBytes * 100 / family.totalSize) : 0;
+    const unsigned totalPercent = totalBytes ? static_cast<unsigned>(downloadedBytes * 100 / totalBytes) : 0;
+    const int startY = centerY - 3 * lineHeight;
+    const int width = pageWidth - metrics.contentSidePadding * 2;
+    const auto name = renderer.truncatedText(UI_10_FONT_ID, str(family.name), width);
+    renderer.drawCenteredText(UI_10_FONT_ID, startY, name.c_str());
+    char status[128];
+    if (installingPack_) {
+      std::snprintf(status, sizeof(status), "%s", tr(STR_FONT_PACK_INSTALLING));
     } else {
-      renderer.drawCenteredText(UI_10_FONT_ID, barY, formatSize(fileProgress_).c_str());
+      std::snprintf(status, sizeof(status), tr(STR_FONT_BATCH_DOWNLOADING),
+                    formatSize(familyBytes).c_str(), formatSize(family.totalSize).c_str());
     }
-
-    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
+    renderer.drawCenteredText(UI_10_FONT_ID, startY + lineHeight + metrics.verticalSpacing, status);
+    const int barY = startY + 2 * lineHeight + 2 * metrics.verticalSpacing;
+    GUI.drawProgressBar(renderer, Rect{metrics.contentSidePadding, barY, width, metrics.progressBarHeight},
+                        std::min(currentPercent, 100u), 100);
+    std::snprintf(status, sizeof(status), tr(STR_FONT_BATCH_TOTAL), batchRunning_ ? batchFamilyIndex_ : 1u,
+                  batchRunning_ ? batchFamilyCount_ : 1u, totalPercent);
+    const int totalY = barY + metrics.progressBarHeight + 2 * metrics.verticalSpacing;
+    renderer.drawCenteredText(UI_10_FONT_ID, totalY, status);
+    GUI.drawProgressBar(renderer,
+                        Rect{metrics.contentSidePadding, totalY + lineHeight + metrics.verticalSpacing,
+                             width, metrics.progressBarHeight}, std::min(totalPercent, 100u), 100);
+    const auto sizeText = formatSize(downloadedBytes) + " / " + formatSize(totalBytes);
+    renderer.drawCenteredText(UI_10_FONT_ID, totalY + lineHeight + metrics.progressBarHeight +
+                                               2 * metrics.verticalSpacing, sizeText.c_str());
+    const auto labels = mappedInput.mapLabels(installingPack_ ? "" : tr(STR_CANCEL), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state_ == COMPLETE) {
-    renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_FONT_INSTALLED), true, EpdFontFamily::BOLD);
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+    if (batchResult_) {
+      char summary[96];
+      std::snprintf(summary, sizeof(summary), tr(STR_FONT_BATCH_DONE), batchSuccessCount_, batchFamilyCount_);
+      renderer.drawCenteredText(UI_10_FONT_ID, centerY - 2 * lineHeight, summary, true, EpdFontFamily::BOLD);
+      if (batchFailureCount_ && resultFailureIndex_ < static_cast<int>(families_.size())) {
+        const auto& failed = families_[resultFailureIndex_];
+        unsigned ordinal = 0;
+        for (int index = 0; index <= resultFailureIndex_; ++index)
+          if (families_[index].failureReason) ++ordinal;
+        std::snprintf(summary, sizeof(summary), tr(STR_FONT_BATCH_FAILED), ordinal, batchFailureCount_);
+        renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight, summary);
+        const int width = pageWidth - metrics.contentSidePadding * 2;
+        const auto name = renderer.truncatedText(UI_10_FONT_ID, str(failed.name), width);
+        renderer.drawCenteredText(UI_10_FONT_ID, centerY, name.c_str());
+        if (failed.requiredMb) std::snprintf(summary, sizeof(summary), failed.failureReason, failed.requiredMb);
+        else std::snprintf(summary, sizeof(summary), "%s", failed.failureReason);
+        const auto reason = renderer.truncatedText(UI_10_FONT_ID, summary, width);
+        renderer.drawCenteredText(UI_10_FONT_ID, centerY + lineHeight + metrics.verticalSpacing, reason.c_str());
+      }
+    } else {
+      renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_FONT_INSTALLED), true, EpdFontFamily::BOLD);
+    }
+    const bool pages = batchResult_ && batchFailureCount_ > 1;
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", pages ? tr(STR_DIR_UP) : "", pages ? tr(STR_DIR_DOWN) : "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state_ == ERROR) {
     renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight, tr(STR_FONT_INSTALL_FAILED), true,
@@ -1188,5 +1563,84 @@ void FontDownloadActivity::render(RenderLock&&) {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 
+  renderer.displayBuffer();
+}
+
+std::string FontDownloadActivity::x3InfoText() const {
+  if (state_ == LOADING_MANIFEST) return tr(STR_LOADING_FONT_LIST);
+  if (state_ == ERROR) return std::string(tr(STR_FONT_INSTALL_FAILED)) + "\n" + errorMessage_;
+  char summary[96];
+  if (state_ == COMPLETE) {
+    if (!batchResult_) return tr(STR_FONT_INSTALLED);
+    std::snprintf(summary, sizeof(summary), tr(STR_FONT_BATCH_DONE), batchSuccessCount_, batchFamilyCount_);
+    std::string text = summary;
+    if (batchFailureCount_ && resultFailureIndex_ < static_cast<int>(families_.size())) {
+      const auto& failed = families_[resultFailureIndex_];
+      unsigned ordinal = 0;
+      for (int index = 0; index <= resultFailureIndex_; ++index)
+        if (families_[index].failureReason) ++ordinal;
+      std::snprintf(summary, sizeof(summary), tr(STR_FONT_BATCH_FAILED), ordinal, batchFailureCount_);
+      text += std::string("\n") + summary + "\n" + str(failed.name);
+      if (failed.requiredMb) std::snprintf(summary, sizeof(summary), failed.failureReason, failed.requiredMb);
+      else std::snprintf(summary, sizeof(summary), "%s", failed.failureReason);
+      text += std::string("\n") + summary;
+    }
+    return text;
+  }
+  const auto& family = families_[downloadingFamilyIndex_];
+  const auto familyBytes = uint64_t{familyDownloadedBytes_} + fileProgress_;
+  const auto totalBytes = batchRunning_ ? batchTotalBytes_ : family.totalSize;
+  const auto downloadedBytes = batchRunning_ ? batchDownloadedBytes_ + fileProgress_ : familyBytes;
+  const unsigned totalPercent = totalBytes ? static_cast<unsigned>(downloadedBytes * 100 / totalBytes) : 0;
+  std::string text = str(family.name);
+  if (installingPack_) text += std::string("\n") + tr(STR_FONT_PACK_INSTALLING);
+  std::snprintf(summary, sizeof(summary), tr(STR_FONT_BATCH_DOWNLOADING),
+                formatSize(familyBytes).c_str(), formatSize(family.totalSize).c_str());
+  text += std::string("\n") + summary;
+  std::snprintf(summary, sizeof(summary), tr(STR_FONT_BATCH_TOTAL), batchRunning_ ? batchFamilyIndex_ : 1u,
+                batchRunning_ ? batchFamilyCount_ : 1u, totalPercent);
+  text += std::string("\n") + summary + "\n" + formatSize(downloadedBytes) + " / " + formatSize(totalBytes);
+  return text;
+}
+
+void FontDownloadActivity::renderX3State() {
+  renderer.clearScreen();
+  const auto layout = tenorchrome::x3ScreenLayout(renderer);
+  auto body = layout.bodyRect;
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
+  body.height -= lineHeight + 8;
+  if (state_ == ERROR) body.height -= lineHeight + 8;
+  if (state_ == DOWNLOADING && fileTotal_ > 0) body.height -= metrics.progressBarHeight + 8;
+  const std::string text = x3InfoText();
+  infoPages_ = x3settings::infoPageCount(renderer, text.c_str(), body);
+  infoPage_ = std::clamp(infoPage_, 0, infoPages_ - 1);
+  x3settings::drawInfoPage(renderer, text.c_str(), body, infoPage_);
+  if (state_ == DOWNLOADING && fileTotal_ > 0) {
+    const auto& family = families_[downloadingFamilyIndex_];
+    const auto bytes = uint64_t{familyDownloadedBytes_} + fileProgress_;
+    const unsigned percent = family.totalSize ? static_cast<unsigned>(bytes * 100 / family.totalSize) : 0;
+    GUI.drawProgressBar(renderer, Rect{metrics.contentSidePadding, body.bottom() + 8,
+                                       renderer.getScreenWidth() - 2 * metrics.contentSidePadding, metrics.progressBarHeight},
+                         std::min(percent, 100u), 100);
+  }
+  auto row = layout.bodyRect;
+  row.y = row.bottom() - lineHeight;
+  row.height = lineHeight;
+  if (state_ == ERROR) {
+    tenorchrome::drawInfoInRect(renderer, tr(STR_RETRY), row, 1);
+    row.y -= lineHeight + 8;
+  }
+  if (infoPages_ > 1) {
+    const std::string position = std::to_string(infoPage_ + 1) + "/" + std::to_string(infoPages_);
+    tenorchrome::drawInfoInRect(renderer, position.c_str(), row, 1);
+  }
+  drawChrome();
+  const bool pages = infoPages_ > 1 || (state_ == COMPLETE && batchResult_ && batchFailureCount_ > 1);
+  const auto labels = mappedInput.mapLabels(state_ == LOADING_MANIFEST ? ""
+                                             : state_ == DOWNLOADING ? (installingPack_ ? "" : tr(STR_CANCEL)) : tr(STR_BACK),
+                                             state_ == ERROR ? tr(STR_SELECT) : "",
+                                             pages ? tr(STR_DIR_UP) : "", pages ? tr(STR_DIR_DOWN) : "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }

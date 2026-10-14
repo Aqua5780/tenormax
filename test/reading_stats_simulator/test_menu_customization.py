@@ -35,7 +35,7 @@ def same(a,b,box):
 def pin():
  # Sleep is stable settings tab ID 7 and follows Display in the default order.
  # Its first row is sleepScreen, so one tab step reaches the row directly.
- script=('1000:UP;1500:RIGHT;2000:CONFIRM;3000:DOWN;4200:CONFIRM:900;'
+ script=('1000:UP;2000:CONFIRM;3000:DOWN;4200:CONFIRM:900;'
          '5700:BACK;6500:UP;7200:UP;8000:CONFIRM;9800:QUIT')
  sd=t.run('pin-e2e',script,[(9200,'popup')])
  assert saved(sd,'menu-customization.json')['pins']==['settings/sleepScreen']
@@ -76,11 +76,13 @@ def route(name,key,expected,settings=None,press='',shots=()):
  assert expected in (t.o/(name+'.log')).read_text(), name
  return sd
 def status():
- sd=route('status','status/statusBarClock','Entering activity: StatusBarSettings',{'statusBarClock':1})
- assert saved(sd,'settings.json')['statusBarClock']==2
+ sd=route('status','status/statusBarClock','Entering activity: StatusBarSettings',{'statusBarClock':1},
+          press='3000:RIGHT;3600:CONFIRM;')
+ assert saved(sd,'settings.json')['readerStatusLeft']==2
 
 def clock():
- sd=route('clock','clock/clockFormat','Entering activity: DongHoSettings',{'clockFormat':0})
+ # The clock screen is ClockSettings since 1.6.5 (#3562); the pinned format row still opens it and toggles.
+ sd=route('clock','clock/clockFormat','Entering activity: ClockSettings',{'clockFormat':0})
  assert saved(sd,'settings.json')['clockFormat']==1
 
 def kosync():
@@ -90,14 +92,15 @@ def font():
  assert saved(sd,'settings.json')['fontSize']==18
 
 def text():
- sd=route('text','text/readerInkWeight','Entering activity: TextSettings',{'readerInkWeight':0})
+ sd=route('text','text/readerInkWeight','Entering activity: TextSettings',{'readerInkWeight':0},
+          press='3000:RIGHT;3600:CONFIRM;')
  assert saved(sd,'settings.json')['readerInkWeight']==1  # requested level persists even when its pack is unavailable
 
 def opds():
  route('opds','opds/opdsDownloadFolder','Entering activity:')
  assert 'OpdsServerList' in (t.o/'opds.log').read_text()
 def groups():
- sd=t.run('groups','1000:UP;1500:RIGHT;2000:CONFIRM;2700:DOWN:1300;4500:BACK;5400:QUIT',[(4250,'display'),(5000,'home')])
+ sd=t.run('groups','1000:UP;2000:CONFIRM;2700:DOWN:1300;4500:BACK;5400:QUIT',[(4250,'display'),(5000,'home')])
  x=saved(sd,'menu-customization.json');assert x['tabs']['settings']==[7,0,1,2,8,3,4,5,6];assert x['tabs']['home']==[0,1,4,2,3]
 
 def homeback():
@@ -116,7 +119,7 @@ def normalize():
  x=saved(sd,'menu-customization.json');assert x['pins']==['text/fontSize','future/missing'];assert x['tabs']['home']==[4,1,0,2,3];assert x['tabs']['settings']==[6,0,1,2,3,4,5,7,8]
 def writefail():
  sd=t.o/'sd-writefail';d=sd/'.crosspoint/menu-customization.tmp';d.mkdir(parents=True,exist_ok=True);(d/'block').write_text('test')
- sd=t.run('writefail','1000:UP;1500:RIGHT;2000:CONFIRM;2700:CONFIRM:900;4300:QUIT',[(4000,'failed')])
+ sd=t.run('writefail','1000:UP;2000:CONFIRM;2700:CONFIRM:900;4300:QUIT',[(4000,'failed')])
  assert not (sd/'.crosspoint/menu-customization.json').exists()
  assert saved(sd,'settings.json')['sleepScreen']==8
 

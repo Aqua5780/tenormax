@@ -1,5 +1,7 @@
 #include "CalibreConnectActivity.h"
 
+#include "activities/X3ActivityLayout.h"
+
 #include <ESPmDNS.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
@@ -11,8 +13,11 @@
 #include "CrossPointSettings.h"
 #include "UIFontTiers.h"
 #include "WifiSelectionActivity.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyNote.h"
 #include "util/TaskWatchdog.h"
 
 namespace {
@@ -125,6 +130,13 @@ void CalibreConnectActivity::stopWebServer() {
 }
 
 void CalibreConnectActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() &&
+      x3Info.turn(mappedInput.wasReleased(MappedInputManager::Button::Up) ? -1 :
+                  mappedInput.wasReleased(MappedInputManager::Button::Down) ? 1 : 0)) {
+    requestUpdate();
+    return;
+  }
+
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     exitRequested = true;
   }
@@ -197,7 +209,84 @@ void CalibreConnectActivity::loop() {
   }
 }
 
+// The same page by hand: the steps written in pen, the network and the address in the UI font, a received file
+// with a pen-hatched bar. Starting and failing are note pages.
+void CalibreConnectActivity::renderUgly() const {
+  [[maybe_unused]] const uint32_t started = millis();
+  ugly::Hints hints;
+  hints.back = true;
+  if (state != CalibreConnectState::SERVER_RUNNING) {
+    const bool failed = state == CalibreConnectState::ERROR;
+    ugly::notePage(renderer, mappedInput, tr(STR_CALIBRE_WIRELESS),
+                   failed ? tr(STR_UGLY_CALIBRE_FAILED) : tr(STR_UGLY_CALIBRE_STARTING), nullptr, -1, hints);
+    return;
+  }
+  using ugly::Size;
+  constexpr int X = ugly::NOTE_X;
+  const int room = renderer.getScreenWidth() - X - 30;
+  ugly::notePaper(renderer, tr(STR_CALIBRE_WIRELESS));
+  const std::string where = connectedSSID + "   " + tr(STR_IP_ADDRESS_PREFIX) + connectedIP;
+  renderer.drawText(UI_10_FONT_ID, X, 100, renderer.truncatedText(UI_10_FONT_ID, where.c_str(), room).c_str());
+  int y = 170;
+  for (const StrId step : {StrId::STR_CALIBRE_INSTRUCTION_1, StrId::STR_CALIBRE_INSTRUCTION_2,
+                           StrId::STR_CALIBRE_INSTRUCTION_3, StrId::STR_CALIBRE_INSTRUCTION_4})
+    y += ugly::paragraph(renderer, Size::S22, X, y, room, 30, I18N.get(step)) * 30 + 6;
+  y += 30;
+  if (lastProgressTotal > 0 && lastProgressReceived <= lastProgressTotal) {
+    ugly::text(renderer, Size::S30, X, y, tr(STR_UGLY_CALIBRE_RECEIVING));
+    renderer.drawText(UI_10_FONT_ID, X, y + 12,
+                      renderer.truncatedText(UI_10_FONT_ID, currentUploadName.c_str(), room).c_str());
+    ugly::noteBar(renderer, y + 48,
+                  static_cast<int>(static_cast<uint64_t>(lastProgressReceived) * 100 / lastProgressTotal));
+    y += 48 + ugly::NOTE_BAR_H + 40;
+  } else {
+    ugly::paragraph(renderer, Size::S30, X, y, room, 40, tr(STR_UGLY_CALIBRE_WAITING));
+    y += 90;
+  }
+  if (lastCompleteAt > 0 && (millis() - lastCompleteAt) < 6000) {
+    const std::string msg = std::string(tr(STR_CALIBRE_RECEIVED)) + lastCompleteName;
+    renderer.drawText(UI_10_FONT_ID, X, y, renderer.truncatedText(UI_10_FONT_ID, msg.c_str(), room).c_str());
+  }
+  ugly::statusBar(renderer, mappedInput, hints);
+  renderer.displayBuffer();
+#ifdef UGLY_FRAME_LOG
+  LOG_INF("UGLY", "Calibre frame receiving=%d total=%lums heap=%u", lastProgressTotal > 0 ? 1 : 0,
+          static_cast<unsigned long>(millis() - started), ESP.getFreeHeap());
+#endif
+}
+
 void CalibreConnectActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* status = state == CalibreConnectState::SERVER_STARTING ? tr(STR_CALIBRE_STARTING) :
+        state == CalibreConnectState::ERROR ? tr(STR_CONNECTION_FAILED) : tr(STR_CALIBRE_STATUS);
+    const std::string address = std::string(tr(STR_IP_ADDRESS_PREFIX)) + connectedIP;
+    char progress[48] = {};
+    if (lastProgressTotal > 0) snprintf(progress, sizeof(progress), "%lu / %lu B",
+        static_cast<unsigned long>(lastProgressReceived), static_cast<unsigned long>(lastProgressTotal));
+    const bool completed = lastCompleteAt > 0 && millis() - lastCompleteAt < 6000;
+    const std::string instructions = std::string(tr(STR_CALIBRE_SETUP)) + "\n" + tr(STR_CALIBRE_INSTRUCTION_1) + "\n" +
+        tr(STR_CALIBRE_INSTRUCTION_2) + "\n" + tr(STR_CALIBRE_INSTRUCTION_3) + "\n" + tr(STR_CALIBRE_INSTRUCTION_4);
+    const char* tip = nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip, 8));
+    renderer.clearScreen();
+    x3Info.draw(renderer, layout.bodyRect, {status, connectedSSID.c_str(), address.c_str(),
+        state == CalibreConnectState::SERVER_RUNNING ? instructions.c_str() : nullptr,
+        lastProgressTotal > 0 ? tr(STR_CALIBRE_RECEIVING) : nullptr,
+        lastProgressTotal > 0 ? currentUploadName.c_str() : nullptr, progress,
+        completed ? tr(STR_CALIBRE_RECEIVED) : nullptr, completed ? lastCompleteName.c_str() : nullptr});
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect, 8);
+    x3activity::drawBar(renderer, layout.barRect, tr(STR_CALIBRE_WIRELESS), navigationPrefix.c_str());
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+    renderer.displayBuffer();
+    return;
+  }
+
+  if (shell::uglyParts() && state != CalibreConnectState::WIFI_SELECTION) {
+    renderUgly();
+    return;
+  }
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -213,10 +302,24 @@ void CalibreConnectActivity::render(RenderLock&&) {
   } else if (state == CalibreConnectState::ERROR) {
     renderer.drawCenteredText(UI_12_FONT_ID, top, tr(STR_CONNECTION_FAILED), true, EpdFontFamily::BOLD);
   } else if (state == CalibreConnectState::SERVER_RUNNING) {
-    GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                      connectedSSID.c_str(), (std::string(tr(STR_IP_ADDRESS_PREFIX)) + connectedIP).c_str());
-
-    int y = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing * 4;
+    const std::string address = std::string(tr(STR_IP_ADDRESS_PREFIX)) + connectedIP;
+    int y;
+    if (tenorchrome::roundFrames()) {
+      // A touch screen keeps only the status strip at the top: the network and the address are the first two lines
+      // of the content, each cut with an ellipsis rather than run past the margins.
+      const int room = pageWidth - metrics.contentSidePadding * 2;
+      y = tenorchrome::contentTop() + tenorchrome::INFO_TOP_GAP + metrics.verticalSpacing;
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
+                        renderer.truncatedText(UI_10_FONT_ID, connectedSSID.c_str(), room, EpdFontFamily::REGULAR).c_str());
+      y += height;
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
+                        renderer.truncatedText(UI_10_FONT_ID, address.c_str(), room, EpdFontFamily::REGULAR).c_str());
+      y += height + metrics.verticalSpacing * 4;
+    } else {
+      GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
+                        connectedSSID.c_str(), address.c_str());
+      y = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing * 4;
+    }
     const auto heightText12 = renderer.getTextHeight(UI_12_FONT_ID);
     renderer.drawText(UI_12_FONT_ID, metrics.contentSidePadding, y, tr(STR_CALIBRE_SETUP), true, EpdFontFamily::BOLD);
     y += heightText12 + metrics.verticalSpacing * 2;
@@ -252,7 +355,7 @@ void CalibreConnectActivity::render(RenderLock&&) {
       renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding, y, msg.c_str());
     }
 
-    const auto labels = mappedInput.mapLabels(tr(STR_EXIT), "", "", "");
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
   renderer.displayBuffer();

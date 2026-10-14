@@ -3,14 +3,20 @@
 #include "BuildStageProbe.h"
 
 #include <Arduino.h>
+#include <FontCacheManager.h>
+#include <GfxRenderer.h>
 #include <HalMemory.h>
+#include <HeapFloor.h>
 #include <HalStorage.h>
 
 #include <algorithm>
+#include <array>
 #include <Logging.h>
 #include <Memory.h>
 #include <RecoverableFile.h>
 #include <Serialization.h>
+
+#include <algorithm>
 
 #include "Epub/css/CssParser.h"
 #include "Page.h"
@@ -59,7 +65,12 @@ namespace {
 // v50 header would be read as a different setting; those caches are discarded.
 // v53: Discard caches whose older builders could silently omit failed lines.
 // v54: Rebuild pages whose CSS cascade could be skipped under low heap.
-constexpr uint8_t SECTION_FILE_VERSION = 54;
+// v55: Ordered lists number their items, list-style-type: none suppresses markers,
+//      <ul>/<ol> containers contribute their own margins/padding to child insets;
+//      Hangul words wrap at spaces (with hyphenation on they may also split at a
+//      line end) and justification no longer stretches between syllables.
+// v56: Preserve paragraph continuity and top spacing across soft flushes.
+constexpr uint8_t SECTION_FILE_VERSION = 56;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects
@@ -82,6 +93,35 @@ constexpr uint32_t HEADER_SIZE =
     sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
     sizeof(uint8_t) + sizeof(bool) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) +
     sizeof(uint32_t);
+// startBuild() keeps the SD font caches at or above this heap (see there).
+constexpr size_t BUILD_START_KEEP_FONT_CACHE_FREE = 64 * 1024;
+constexpr size_t BUILD_START_KEEP_FONT_CACHE_LARGEST = 32 * 1024;
+constexpr size_t PARKED_ANCHOR_RESERVE = 4;
+constexpr size_t DD_MAX_PREFIXES = 8;
+
+bool ddPrefixHeapAvailable(const size_t bytes, [[maybe_unused]] const char* stage) {
+  if (heapfloor::leaves(bytes, bytes, ESP.getFreeHeap(), ESP.getMaxAllocHeap())) return true;
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("SCT", "DD_REPLAY_REFUSE stage=%s bytes=%u free=%u largest=%u", stage, static_cast<unsigned>(bytes),
+          static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+#endif
+  return false;
+}
+
+using ParkedAnchor = std::pair<std::string, uint16_t>;
+
+void transferParkedAnchors(std::vector<ParkedAnchor>& parked, std::vector<ParkedAnchor>&& anchors) {
+  if (parked.capacity() < anchors.size()) {
+    parked = std::move(anchors);
+    return;
+  }
+  parked.clear();
+  for (auto& anchor : anchors) parked.emplace_back(std::move(anchor));
+}
+
+void releaseParkedAnchorStorage(std::vector<ParkedAnchor>& anchors) {
+  std::vector<ParkedAnchor>().swap(anchors);
+}
 }  // namespace
 
 // Out-of-line so the unique_ptr<ChapterHtmlSlimParser> in BuildContext can be
@@ -344,6 +384,10 @@ bool Section::loadBuildCss(BuildContext* ctx) {
       if (cacheResult == CssParser::CacheLoadResult::Invalid) {
         LOG_ERR("SCT", "Failed to load CSS from cache free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
                 static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        if (ctx->cssParser->hasCache() || ctx->cssParser->cacheNeedsRebuild()) {
+          ctx->cssParser->deleteCache();
+          return false;
+        }
       }
     }
   } else {
@@ -393,12 +437,16 @@ std::unique_ptr<ChapterHtmlSlimParser> Section::makeBuildParser(BuildContext* ct
   LOG_DBG("SCT", "EPUB_BUILD stage=parser_before free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
           static_cast<unsigned>(ESP.getMaxAllocHeap()));
 #endif
-  return makeUniqueNoThrow<ChapterHtmlSlimParser>(
+  auto parser = makeUniqueNoThrow<ChapterHtmlSlimParser>(
       epub, ctxPtr->parsePath, renderer, spec.fontId, spec.lineCompression, spec.extraParagraphSpacing,
       spec.paragraphAlignment, spec.viewportWidth, spec.viewportHeight, spec.hyphenationEnabled, spec.dropCapMode,
       [this, ctxPtr](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex,
                      const uint32_t visibleTextOffset) {
         if (ctxPtr->failed) return;
+        if (ctxPtr->previewSink) {
+          ctxPtr->previewSink(std::move(page), visibleTextOffset);
+          return;
+        }
         // The serialized page count is uint16_t. Refuse overflow explicitly.
         if (builtPageCount_ == UINT16_MAX) {
           ctxPtr->failed = true;
@@ -428,15 +476,207 @@ std::unique_ptr<ChapterHtmlSlimParser> Section::makeBuildParser(BuildContext* ct
         ++builtPageCount_;
         pageCount = std::max(pageCount, builtPageCount_);
         ctxPtr->lastVisibleTextOffset = visibleTextOffset;
+        if (ctxPtr->ddOn) ddRecord(*ctxPtr);
       },
       spec.embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, spec.imageRendering, ctxPtr->tocAnchors, popupFn,
       ctxPtr->cssParser, spec.paragraphIndent, spec.letterSpacing, spec.wordSpacing);
+  if (parser && ctxPtr->ddOn) {
+    parser->resumePointFn = [this, ctxPtr](const ChapterHtmlSlimParser::ResumePoint& point, const std::string& prefix,
+                                     const uint16_t prologBytes) {
+      auto& prefixes = ctxPtr->ddPrefixes;
+      size_t id = prefixes.size();
+      for (size_t i = prefixes.size(); i-- > 0;) {
+        if (prefixes[i] == prefix) {
+          id = i;
+          break;
+        }
+      }
+      if (prologBytes > ChapterHtmlSlimParser::MAX_CHECKPOINT_PREFIX ||
+          prefix.size() > ChapterHtmlSlimParser::MAX_CHECKPOINT_PREFIX - prologBytes) {
+        ctxPtr->ddLastValid = false;
+        return;
+      }
+      if (id == prefixes.size()) {
+        if (prefixes.size() == DD_MAX_PREFIXES) {
+          ctxPtr->ddLastValid = false;
+          return;
+        }
+        const size_t tableBytes = prefixes.capacity() < DD_MAX_PREFIXES ? DD_MAX_PREFIXES * sizeof(std::string) : 0;
+        if (!ddPrefixHeapAvailable(prefix.size() + 1 + tableBytes, "record")) {
+          ctxPtr->ddLastValid = false;
+          buildStarved_ = true;
+          ctxPtr->parser->requestCheckpoint();
+          return;
+        }
+        if (tableBytes) prefixes.reserve(DD_MAX_PREFIXES);
+        prefixes.push_back(prefix);
+      }
+      ctxPtr->ddProlog = prologBytes;
+      ctxPtr->ddLast = DdRecord{point.offset, point.visible, static_cast<uint16_t>(point.imageCounter),
+                                static_cast<uint8_t>(id), 0};
+      ctxPtr->ddLastValid = point.imageCounter >= 0 && point.imageCounter <= UINT16_MAX;
+    };
+  }
+  return parser;
+}
+
+namespace {
+// "DD01", tied to the layout engine's version: a parser that judges resume points differently starts over.
+constexpr uint32_t DD_MAGIC = 0x31304444u ^ SECTION_FILE_VERSION;
+constexpr size_t DD_HEADER = 16;           // magic, html size, count, prolog bytes, prefix count, complete
+}  // namespace
+
+std::string Section::ddPath() const {
+  return epub->getCachePath() + "/sections/" + std::to_string(spineIndex) + ".dd";
+}
+
+bool Section::ddComplete(const uint32_t htmlSize) const {
+  HalFile f;
+  if (!Storage.openFileForRead("SCT", ddPath(), f)) return false;
+  uint32_t magic = 0, size = 0, count = 0;
+  uint16_t prolog = 0;
+  uint8_t prefixes = 0, complete = 0;
+  return serialization::readPod(f, magic) && serialization::readPod(f, size) && serialization::readPod(f, count) &&
+         serialization::readPod(f, prolog) && serialization::readPod(f, prefixes) &&
+         serialization::readPod(f, complete) && magic == DD_MAGIC && size == htmlSize && complete == 1 &&
+         prolog <= ChapterHtmlSlimParser::MAX_CHECKPOINT_PREFIX && prolog <= htmlSize && count > 0 &&
+         prefixes > 0 && prefixes <= DD_MAX_PREFIXES &&
+         DD_HEADER + static_cast<uint64_t>(count) * sizeof(DdRecord) + 2u * prefixes <= f.size();
+}
+
+bool Section::ddOpen(BuildContext& ctx, const bool seed) {
+  HalFile html;
+  if (!Storage.openFileForRead("SCT", ctx.parsePath, html)) return false;
+  const uint32_t htmlSize = html.size();
+  html.close();
+  if (htmlSize == 0 || ddComplete(htmlSize)) return false;
+  const std::string tmp = ddPath() + ".part";
+  ctx.ddOn = Storage.openFileForWrite("SCT", tmp, ctx.dd) &&
+             ctx.dd.write(std::array<uint8_t, DD_HEADER>{}.data(), DD_HEADER) == DD_HEADER;
+  if (!ctx.ddOn) {
+    if (ctx.dd) ctx.dd.close();
+    Storage.remove(tmp.c_str());
+    return false;
+  }
+  HalFile old;
+  uint32_t magic = 0, size = 0, count = 0;
+  uint16_t prolog = 0;
+  uint8_t prefixes = 0, complete = 0;
+  if (!seed || !Storage.openFileForRead("SCT", ddPath(), old) || !serialization::readPod(old, magic) ||
+      !serialization::readPod(old, size) || !serialization::readPod(old, count) ||
+      !serialization::readPod(old, prolog) || !serialization::readPod(old, prefixes) ||
+      !serialization::readPod(old, complete) || magic != DD_MAGIC || size != htmlSize || count == 0 ||
+      DD_HEADER + static_cast<uint64_t>(count) * sizeof(DdRecord) > old.size() || prolog > htmlSize ||
+      prolog > ChapterHtmlSlimParser::MAX_CHECKPOINT_PREFIX || prefixes > DD_MAX_PREFIXES)
+    return true;
+  DdRecord block[16];
+  for (uint32_t i = 0; i < count;) {
+    const uint32_t n = std::min<uint32_t>(16, count - i);
+    const size_t bytes = n * sizeof(DdRecord);
+    if (old.read(block, bytes) != static_cast<int>(bytes) || ctx.dd.write(block, bytes) != bytes) {
+      ddClose(ctx, false, false);
+      return false;
+    }
+    ctx.ddLastWritten = block[n - 1].offset;
+    i += n;
+  }
+  ctx.ddCount = count;
+  ctx.ddProlog = prolog;
+  for (uint8_t i = 0; i < prefixes; ++i) {
+    uint16_t length = 0;
+    std::string prefix;
+    if (!serialization::readPod(old, length) || old.position() > old.size() ||
+        length > old.size() - old.position() || length > ChapterHtmlSlimParser::MAX_CHECKPOINT_PREFIX - prolog)
+      break;
+    const size_t tableBytes = ctx.ddPrefixes.capacity() < DD_MAX_PREFIXES ? DD_MAX_PREFIXES * sizeof(std::string) : 0;
+    if (!ddPrefixHeapAvailable(static_cast<size_t>(length) + 1 + tableBytes, "seed")) {
+      buildStarved_ = true;
+      break;
+    }
+    if (tableBytes) ctx.ddPrefixes.reserve(DD_MAX_PREFIXES);
+    prefix.resize(length);
+    if (old.read(prefix.data(), length) != static_cast<int>(length)) break;
+    ctx.ddPrefixes.push_back(std::move(prefix));
+  }
+  if (ctx.ddPrefixes.size() != prefixes) {  // records pointing at a prefix that is not there
+    ddClose(ctx, false, false);
+    return false;
+  }
+  return true;
+}
+
+// A page has just finished: the next one starts after the last point the parser reported.
+void Section::ddRecord(BuildContext& ctx) {
+  if (!ctx.ddLastValid || ctx.ddLast.offset <= ctx.ddLastWritten) return;
+  if (ctx.ddPendingCount == BuildContext::DD_PENDING_MAX && !ddFlush(ctx)) {
+    ddClose(ctx, false, false);
+    return;
+  }
+  ctx.ddPending[ctx.ddPendingCount++] = ctx.ddLast;
+  ctx.ddLastWritten = ctx.ddLast.offset;
+}
+
+bool Section::ddFlush(BuildContext& ctx) {
+  if (ctx.ddPendingCount == 0) return true;
+  const size_t bytes = ctx.ddPendingCount * sizeof(DdRecord);
+  if (!ctx.dd.seek(DD_HEADER + ctx.ddCount * sizeof(DdRecord)) || ctx.dd.write(ctx.ddPending, bytes) != bytes)
+    return false;
+  ctx.ddCount += ctx.ddPendingCount;
+  ctx.ddPendingCount = 0;
+  return true;
+}
+
+// keep: write the prefixes and the header, and put the file in place (tmp, then rename).
+void Section::ddClose(BuildContext& ctx, const bool keep, const bool complete) {
+  if (!ctx.ddOn) return;
+  ctx.ddOn = false;
+  const std::string tmp = ddPath() + ".part";
+  bool ok = keep && ddFlush(ctx) && ctx.ddCount > 0;
+  if (ok && !complete) {  // a build that stopped early keeps a file that reaches further
+    HalFile old;
+    uint32_t magic = 0, size = 0, count = 0;
+    if (Storage.openFileForRead("SCT", ddPath(), old) && serialization::readPod(old, magic) &&
+        serialization::readPod(old, size) && serialization::readPod(old, count) && magic == DD_MAGIC &&
+        size == ctx.totalBytes && count >= ctx.ddCount)
+      ok = false;
+  }
+  for (size_t i = 0; ok && i < ctx.ddPrefixes.size(); ++i) {
+    const auto& prefix = ctx.ddPrefixes[i];
+    ok = serialization::writePod(ctx.dd, static_cast<uint16_t>(prefix.size())) &&
+         ctx.dd.write(prefix.data(), prefix.size()) == prefix.size();
+  }
+  ok = ok && ctx.dd.seek(0) && serialization::writePod(ctx.dd, DD_MAGIC) &&
+       serialization::writePod(ctx.dd, ctx.totalBytes) && serialization::writePod(ctx.dd, ctx.ddCount) &&
+       serialization::writePod(ctx.dd, ctx.ddProlog) &&
+       serialization::writePod(ctx.dd, static_cast<uint8_t>(ctx.ddPrefixes.size())) &&
+       serialization::writePod(ctx.dd, static_cast<uint8_t>(complete ? 1 : 0)) && ctx.dd.sync();
+  ok = ctx.dd.close() && ok;
+  if (ok) {
+    Storage.remove(ddPath().c_str());
+    ok = Storage.rename(tmp.c_str(), ddPath().c_str());
+  }
+  if (!ok) Storage.remove(tmp.c_str());
+  std::vector<std::string>().swap(ctx.ddPrefixes);
 }
 
 bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void()>& popupFn) {
   if (build_) {
     LOG_ERR("SCT", "startBuild called while a build is already active");
     return false;
+  }
+  buildStarved_ = false;
+  // Reclaim rebuildable font caches before CSS and layout allocations when the heap is short of
+  // what a build needs to start: SD font glyph and advance caches grown by paging can leave the
+  // layout's first allocations no contiguous block. Only below the bar the reader's background
+  // builds must clear to start (64 KB free, 32 KB largest), so a background start beside a
+  // healthy heap keeps the caches the next page turn draws from.
+  if (ESP.getFreeHeap() < BUILD_START_KEEP_FONT_CACHE_FREE ||
+      ESP.getMaxAllocHeap() < BUILD_START_KEEP_FONT_CACHE_LARGEST) {
+    if (auto* fontCache = renderer.getFontCacheManager()) {
+      fontCache->releaseSdFontCaches();
+      LOG_DBG("SCT", "Build start: released SD font caches, free=%u largest=%u",
+              static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    }
   }
   buildComplete_ = false;
   builtPageCount_ = 0;
@@ -558,6 +798,13 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
     return false;
   }
+  ctx->parkedAnchors.reserve(PARKED_ANCHOR_RESERVE);
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("SCT", "PARKED_ANCHORS reserve data=%08x bytes=%u capacity=%u",
+          static_cast<unsigned>(reinterpret_cast<uintptr_t>(ctx->parkedAnchors.data())),
+          static_cast<unsigned>(ctx->parkedAnchors.capacity() * sizeof(ctx->parkedAnchors[0])),
+          static_cast<unsigned>(ctx->parkedAnchors.capacity()));
+#endif
   if (!Storage.openFileForWrite("SCT", lutTmpPath(), ctx->lut)) {
     file.close();
     Storage.remove(binTmpPath().c_str());
@@ -578,7 +825,11 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
   ctx->imageBasePath = epub->getCachePath() + (preview_ ? "/preview_img_" : "/img_") + std::to_string(spineIndex) + "_";
 
   ctx->spec = spec;
-  if (!loadBuildCss(ctx.get())) {
+  // Resume points: a build from the chapter top writes them; one resumed from a partial carries the
+  // points already on the card on (the next-chapter look-ahead leaves a 3-page partial behind).
+  if (!preview_) ddOpen(*ctx, partial_);
+  if (buildStarved_ || !loadBuildCss(ctx.get())) {
+    ddClose(*ctx, false, false);
     ctx->lut.close();
     Storage.remove(lutTmpPath().c_str());
     file.close();
@@ -592,6 +843,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     LOG_ERR("SCT", "OOM: ChapterHtmlSlimParser free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
             static_cast<unsigned>(ESP.getMaxAllocHeap()));
     if (ctx->cssParser) ctx->cssParser->clear();
+    ddClose(*ctx, false, false);
     ctx->lut.close();
     Storage.remove(lutTmpPath().c_str());
     file.close();
@@ -621,10 +873,21 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
 #endif
       LOG_INF("SCT", "Resumed checkpoint: %u pages, HTML byte %u", builtPageCount_,
               static_cast<unsigned>(build_->parser->parseBytesConsumed()));
+    } else if (!stepHeapAvailable()) {
+      // Short of heap, not damaged (X3 with the radio up): laid out again from the top, the chapter
+      // sat behind the indexing notice for every page up to the watermark. The start is refused as
+      // starved; the reader frees heap and starts again from the checkpoint.
+      LOG_ERR("SCT", "Checkpoint restore starved of heap free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+              static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      abandonBuild();
+      buildStarved_ = true;
+      return false;
     } else {
       // A legacy or damaged checkpoint keeps the readable partial and starts a
       // fresh parser. Recreate both staging files after any failed prefix copy.
       build_->parser.reset();
+      ddClose(*build_, false, false);
+      ddOpen(*build_, false);  // laid out again from the top: its own points, from the first
       file.close();
       build_->lut.close();
       builtPageCount_ = 0;
@@ -684,7 +947,7 @@ bool Section::restorePartialBuild() {
   if (!reader.seek(HEADER_SIZE)) return false;
   {
     constexpr size_t COPY_BUFFER_BYTES = 4096;
-    auto bulkBuffer = makeUniqueNoThrow<uint8_t[]>(COPY_BUFFER_BYTES);
+    auto bulkBuffer = heapfloor::array<uint8_t[]>(COPY_BUFFER_BYTES, "section-copy");
     uint8_t* const copyBuffer = bulkBuffer ? bulkBuffer.get() : buffer;
     const size_t capacity = bulkBuffer ? COPY_BUFFER_BYTES : sizeof(buffer);
 #ifdef TENOR_UI_ACCEPTANCE
@@ -743,6 +1006,9 @@ bool Section::restorePartialBuild() {
 }
 
 bool Section::stepHeapAvailable() {
+#ifdef TENOR_PRESS_PROBE
+  if (buildprobe::starveAfterSteps != 0 && --buildprobe::starveAfterSteps == 0) return false;
+#endif
   return ESP.getFreeHeap() >= BUILD_STEP_MIN_FREE_HEAP && ESP.getMaxAllocHeap() >= BUILD_STEP_MIN_MAX_ALLOC;
 }
 
@@ -785,7 +1051,13 @@ bool Section::parkAtLastCheckpoint() {
   auto anchors = build.parser->takeAnchors();
   if (anchors.size() < build.checkpointAnchors) return false;
   anchors.resize(build.checkpointAnchors);
-  build.parkedAnchors = std::move(anchors);
+  transferParkedAnchors(build.parkedAnchors, std::move(anchors));
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("SCT", "PARKED_ANCHORS parked data=%08x bytes=%u size=%u capacity=%u",
+          static_cast<unsigned>(reinterpret_cast<uintptr_t>(build.parkedAnchors.data())),
+          static_cast<unsigned>(build.parkedAnchors.capacity() * sizeof(build.parkedAnchors[0])),
+          static_cast<unsigned>(build.parkedAnchors.size()), static_cast<unsigned>(build.parkedAnchors.capacity()));
+#endif
   build.bytesConsumed = build.checkpointBytes;
   build.parser.reset();
   if (build.cssParser) build.cssParser->clear();
@@ -827,7 +1099,14 @@ bool Section::parkBuild() {
     return false;
   }
   build_->bytesConsumed = build_->parser->parseBytesConsumed();
-  build_->parkedAnchors = build_->parser->takeAnchors();
+  auto anchors = build_->parser->takeAnchors();
+  transferParkedAnchors(build_->parkedAnchors, std::move(anchors));
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("SCT", "PARKED_ANCHORS parked data=%08x bytes=%u size=%u capacity=%u",
+          static_cast<unsigned>(reinterpret_cast<uintptr_t>(build_->parkedAnchors.data())),
+          static_cast<unsigned>(build_->parkedAnchors.capacity() * sizeof(build_->parkedAnchors[0])),
+          static_cast<unsigned>(build_->parkedAnchors.size()), static_cast<unsigned>(build_->parkedAnchors.capacity()));
+#endif
   build_->checkpointOnDisk = true;
   build_->checkpointInPartialAt = 0;
   build_->checkpointPages = builtPageCount_;
@@ -858,9 +1137,13 @@ bool Section::resumeParkedBuild() {
     checkpoint.close();
     return false;
   }
-  // The checkpoint restores anchors too. Release the parked map before allocating
-  // the parser so the two copies never overlap in the render heap.
-  std::vector<std::pair<std::string, uint16_t>>().swap(build_->parkedAnchors);
+  // The checkpoint restores anchors too. Clear the parked elements before allocating
+  // the parser, while keeping the reserved storage for the next park cycle.
+  // Large parked tables release their buffer so the parser owns one copy.
+  build_->parkedAnchors.clear();
+  if (build_->parkedAnchors.capacity() > PARKED_ANCHOR_RESERVE) {
+    releaseParkedAnchorStorage(build_->parkedAnchors);
+  }
   bool restored = loadBuildCss(build_.get());
   if (restored) {
     build_->parser = makeBuildParser(build_.get(), build_->spec);
@@ -869,6 +1152,10 @@ bool Section::resumeParkedBuild() {
   }
   const bool closed = checkpoint.close();
   if (!restored || !closed) {
+    // Read while the parser still holds its heap: a restore that failed short of heap (the radio up
+    // beside the book) is a starved build, parked as it was. Dropped, the chapter was laid out again
+    // from its first page behind the indexing notice.
+    buildStarved_ = !restored && !stepHeapAvailable();
     build_->parser.reset();
     if (build_->cssParser) build_->cssParser->clear();
     return false;
@@ -881,9 +1168,26 @@ bool Section::resumeParkedBuild() {
   return true;
 }
 
+#ifdef TENOR_SECTION_HOST_TEST
+const void* Section::parkedAnchorsDataForTest() const {
+  return build_ ? static_cast<const void*>(build_->parkedAnchors.data()) : nullptr;
+}
+
+size_t Section::parkedAnchorsCapacityForTest() const {
+  return build_ ? build_->parkedAnchors.capacity() : 0;
+}
+#endif
+
 bool Section::buildSomeMore(const int maxPages) {
   BUILD_PROBE_SCOPE(Tick);
+  buildStarved_ = false;
   if (!build_ || !resumeParkedBuild()) {
+    if (buildStarved_) {
+      LOG_ERR("SCT", "Resume starved of heap free=%u largest=%u; staying parked at %u pages",
+              static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()),
+              static_cast<unsigned>(builtPageCount_));
+      return false;
+    }
     LOG_ERR("SCT", "Unable to resume section build");
     if (build_) abandonBuild();
     return false;
@@ -914,6 +1218,11 @@ bool Section::buildSomeMore(const int maxPages) {
       return false;
     }
     const auto status = build_->parser->parseStep();
+    if (buildStarved_) {  // A DD prefix could not leave enough heap during this step.
+      build_->bytesConsumed = build_->parser->parseBytesConsumed();
+      parkBuild();
+      return false;
+    }
     if (status == ChapterHtmlSlimParser::ParseStatus::Error || build_->failed) {
       LOG_ERR("SCT", "Parse error during incremental build free=%u largest=%u",
               static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
@@ -944,6 +1253,126 @@ bool Section::buildSomeMore(const int maxPages) {
       return true;
     }
   }
+}
+
+std::unique_ptr<Page> Section::previewPage(const ReaderRenderSpec& spec, const uint32_t pageStart) {
+  const auto reject = [&](const char* reason) -> std::unique_ptr<Page> {
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("SCT", "PREVIEW_SKIP reason=%s spine=%d target=%u free=%u largest=%u", reason, spineIndex,
+            static_cast<unsigned>(pageStart), static_cast<unsigned>(ESP.getFreeHeap()),
+            static_cast<unsigned>(ESP.getMaxAllocHeap()));
+#else
+    (void)reason;
+#endif
+    return nullptr;
+  };
+  if (build_) return reject("build_active");
+  if (!stepHeapAvailable()) return reject("heap_gate");
+  const uint32_t started = millis();
+  const std::string htmlPath = epub->getCachePath() + "/html/" + std::to_string(spineIndex) + ".html";
+  // The nearest resume point at or before the page start, and the ancestors to replay there.
+  std::string replay;
+  ChapterHtmlSlimParser::ResumePoint point{0, 0, 0};
+  // The first page starts at byte zero even when this chapter has no resume index yet.
+  if (pageStart != 0) {
+    HalFile html, dd;
+    if (!Storage.openFileForRead("SCT", htmlPath, html)) return reject("html_open");
+    if (!Storage.openFileForRead("SCT", ddPath(), dd)) return reject("dd_open");
+    uint32_t magic = 0, size = 0, count = 0;
+    uint16_t prolog = 0;
+    uint8_t prefixCount = 0, complete = 0;
+    if (!serialization::readPod(dd, magic) || !serialization::readPod(dd, size) || !serialization::readPod(dd, count) ||
+        !serialization::readPod(dd, prolog) || !serialization::readPod(dd, prefixCount) ||
+        !serialization::readPod(dd, complete) || magic != DD_MAGIC || size != html.size() || count == 0 ||
+        prolog > html.size() || prolog > ChapterHtmlSlimParser::MAX_CHECKPOINT_PREFIX ||
+        prefixCount == 0 || prefixCount > DD_MAX_PREFIXES)
+      return reject("dd_header");
+    const uint64_t prefixOffset = DD_HEADER + static_cast<uint64_t>(count) * sizeof(DdRecord);
+    if (prefixOffset > dd.size()) return reject("dd_bounds");
+    DdRecord block[16];
+    DdRecord best{};
+    bool found = false;
+    for (uint32_t i = 0; i < count;) {
+      const uint32_t n = std::min<uint32_t>(16, count - i);
+      if (dd.read(block, n * sizeof(DdRecord)) != static_cast<int>(n * sizeof(DdRecord))) return reject("dd_read");
+      uint32_t j = 0;
+      for (; j < n && block[j].visible <= pageStart; ++j) {
+        best = block[j];
+        found = true;
+      }
+      if (j < n) break;
+      i += n;
+    }
+    // Too far from the nearest point, the preview would cost what laying the chapter out costs.
+    constexpr uint32_t PREVIEW_MAX_CHARS = 6000;
+    if (pageStart - (found ? best.visible : 0) > PREVIEW_MAX_CHARS) return reject("distance");
+    if (found) {
+      if (best.prefix >= prefixCount || !dd.seek(static_cast<uint32_t>(prefixOffset))) return reject("dd_prefix");
+      for (uint8_t i = 0; i <= best.prefix; ++i) {
+        uint16_t length = 0;
+        if (!serialization::readPod(dd, length) || dd.position() > dd.size() ||
+            length > dd.size() - dd.position() ||
+            static_cast<size_t>(prolog) + length > ChapterHtmlSlimParser::MAX_CHECKPOINT_PREFIX)
+          return reject("dd_prefix_length");
+        if (i != best.prefix) {
+          if (!dd.seek(dd.position() + length)) return reject("dd_prefix_read");
+          continue;
+        }
+        const size_t replayBytes = static_cast<size_t>(prolog) + length;
+        if (!ddPrefixHeapAvailable(replayBytes + 1, "preview")) return reject("dd_prefix_heap");
+        replay.resize(replayBytes);
+        if (html.read(replay.data(), prolog) != static_cast<int>(prolog)) return reject("html_prolog");
+        if (dd.read(replay.data() + prolog, length) != static_cast<int>(length)) return reject("dd_prefix_read");
+      }
+      point = ChapterHtmlSlimParser::ResumePoint{best.offset, best.visible, best.imageCounter};
+    }
+  }
+
+  auto ctx = makeUniqueNoThrow<BuildContext>();
+  if (!ctx) return reject("context_alloc");
+  ctx->spec = spec;
+  ctx->parsePath = htmlPath;
+  const auto localPath = epub->getSpineItem(spineIndex).href;
+  const size_t lastSlash = localPath.find_last_of('/');
+  ctx->contentBase = (lastSlash != std::string::npos) ? localPath.substr(0, lastSlash + 1) : "";
+  ctx->imageBasePath = epub->getCachePath() + (preview_ ? "/preview_img_" : "/img_") + std::to_string(spineIndex) + "_";
+  // No page breaks at TOC anchors in a preview: reading the TOC costs more than the page.
+  ctx->tocAnchors = std::make_shared<const std::vector<uint32_t>>();
+  std::unique_ptr<Page> result;
+  ctx->previewSink = [&result](std::unique_ptr<Page> page, const uint32_t visible) {
+    if (result || !page) return;
+    page->visibleTextOffset = visible;
+    result = std::move(page);
+  };
+  if (!loadBuildCss(ctx.get())) return reject("css_load");
+  ctx->parser = makeBuildParser(ctx.get(), spec);
+  auto& parser = ctx->parser;
+  bool ok = parser && parser->beginParse();
+  if (ok && !replay.empty()) {
+    ok = parser->restoreResumePoint(replay, point, pageStart);
+  } else if (ok) {
+    parser->startPageAt(pageStart);
+  }
+  constexpr uint32_t PREVIEW_MAX_MS = 800;
+  while (ok && !result) {
+    if (!stepHeapAvailable() || millis() - started > PREVIEW_MAX_MS) {
+      ok = false;
+      break;
+    }
+    const auto status = parser->parseStep();
+    if (status == ChapterHtmlSlimParser::ParseStatus::Error) ok = false;
+    if (status == ChapterHtmlSlimParser::ParseStatus::Done) {
+      ok = parser->finishParse();
+      break;
+    }
+  }
+  if (parser) parser->abortParse();
+  if (ctx->cssParser) ctx->cssParser->clear();
+  LOG_INF("SCT", "PREVIEW_PAGE ok=%u from=%u to=%u ms=%lu free=%u largest=%u", ok && result ? 1u : 0u,
+          static_cast<unsigned>(point.visible), static_cast<unsigned>(pageStart),
+          static_cast<unsigned long>(millis() - started), static_cast<unsigned>(ESP.getFreeHeap()),
+          static_cast<unsigned>(ESP.getMaxAllocHeap()));
+  return ok ? std::move(result) : nullptr;
 }
 
 bool Section::hasHtmlCache() const {
@@ -1135,6 +1564,7 @@ bool Section::commitBuildFile(const uint8_t version, const uint32_t bytesConsume
 bool Section::finalizeBuild() {
   // Flush the trailing page (emits the last page via the completePageFn into the LUT).
   if (!build_->parser->finishParse() || build_->failed) {
+    LOG_ERR("SCT", "Parse finalize failed; abandoning section build");
     abandonBuild();
     return false;
   }
@@ -1149,6 +1579,7 @@ bool Section::finalizeBuild() {
   }
 
   const bool committed = commitBuildFile(SECTION_FILE_VERSION, 0, 0);
+  ddClose(*build_, committed, true);
   if (build_->cssParser) build_->cssParser->clear();
   build_->lut.close();
   Storage.remove(lutTmpPath().c_str());
@@ -1205,6 +1636,7 @@ void Section::suspendBuild() {
 
   if (build_->parser) build_->parser->abortParse();
   if (build_->cssParser) build_->cssParser->clear();
+  ddClose(*build_, committed, false);
   if (!committed && file) {
     // Explicit close() required before remove (member variable, O_RDWR handle).
     file.close();
@@ -1230,6 +1662,7 @@ void Section::abandonBuild() {
   if (!build_) return;
   if (build_->parser) build_->parser->abortParse();
   if (build_->cssParser) build_->cssParser->clear();
+  ddClose(*build_, true, false);  // the points found so far hold whatever happens to the layout
   if (file) {
     // Explicit close() required before remove (member variable, O_RDWR handle).
     file.close();
@@ -1635,18 +2068,27 @@ std::optional<uint16_t> Section::getPageForVisibleTextOffset(const uint32_t offs
     return std::nullopt;
   }
 
-  if (!f.seek(visibleLutOffset)) return std::nullopt;
+  if (!f.seek(visibleLutOffset)) {
+    LOG_ERR("SCT", "Failed to seek visible-text LUT");
+    return std::nullopt;
+  }
   uint16_t result = 0;
   uint32_t lastPageStart = 0;
-  for (uint16_t page = 0; page < count; page++) {
-    uint32_t pageStart;
-    if (!serialization::readPod(f, pageStart)) return std::nullopt;
-    lastPageStart = pageStart;
-    if (preferFirstAtOffset && pageStart == offset) {
-      return page;
+  constexpr uint32_t BATCH_PAGE_COUNT = 32;
+  uint32_t starts[BATCH_PAGE_COUNT];  // 128-byte stack buffer; offsets stay in file order for ties.
+  for (uint32_t base = 0; base < count; base += BATCH_PAGE_COUNT) {
+    const uint32_t batch = std::min<uint32_t>(BATCH_PAGE_COUNT, count - base);
+    const size_t bytes = batch * sizeof(uint32_t);
+    if (f.read(starts, bytes) != static_cast<int>(bytes)) {
+      LOG_ERR("SCT", "Failed to read visible-text LUT batch");
+      return std::nullopt;
     }
-    if (pageStart > offset) break;
-    result = page;
+    for (uint32_t i = 0; i < batch; ++i) {
+      lastPageStart = starts[i];
+      if (lastPageStart > offset) return result;
+      result = static_cast<uint16_t>(base + i);
+      if (preferFirstAtOffset && lastPageStart == offset) return result;
+    }
   }
   if (partial && offset > lastPageStart) {
     return std::nullopt;

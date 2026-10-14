@@ -1,13 +1,21 @@
 #include "Activity.h"
 
+#include <BoardConfig.h>
+
+#include "reader/FirstPaint.h"
+
 #include <algorithm>
 
 #include "ActivityManager.h"
 #include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "shells/ugly/UglyMarkSeed.h"
 
-void Activity::onEnter() { LOG_DBG("ACT", "Entering activity: %s", name.c_str()); }
+void Activity::onEnter() {
+  uglyIconFrame.enter(ugly::markSeed());
+  LOG_DBG("ACT", "Entering activity: %s", name.c_str());
+}
 
 void Activity::onExit() { LOG_DBG("ACT", "Exiting activity: %s", name.c_str()); }
 
@@ -17,7 +25,9 @@ void Activity::requestUpdateAndWait() { activityManager.requestUpdateAndWait(); 
 
 void Activity::onGoHome(HomeMenuItem item) { activityManager.goHome(item); }
 
-void Activity::onSelectBook(const std::string& path) { activityManager.goToReader(path); }
+void Activity::onSelectBook(const std::string& path) {
+  activityManager.goToReader(path, fastFirstPaint(BoardConfig::isX4Pro(), ReaderOpen::FromMenu));
+}
 
 void Activity::startActivityForResult(std::unique_ptr<Activity>&& activity, ActivityResultHandler resultHandler) {
   if (!activity) {

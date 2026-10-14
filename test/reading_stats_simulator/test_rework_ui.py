@@ -109,7 +109,7 @@ class ReworkUiTest(unittest.TestCase):
 
     def test_s1_nhay_di_nhay_ve_con_cho_cu(self):
         # Display row 3 is Side arrows. Visiting Reader and returning keeps it focused.
-        script = ('1000:UP;1600:RIGHT;2200:CONFIRM;'
+        script = ('1000:UP;2200:CONFIRM;'
                   '3000:RIGHT;3500:RIGHT;4000:CONFIRM;'
                   '4700:DOWN;5300:UP;5900:CONFIRM;7000:QUIT')
         self.settings['tenorSideArrows'] = 1
@@ -120,7 +120,7 @@ class ReworkUiTest(unittest.TestCase):
     def test_s1_activating_another_group_resets_previous_cursor(self):
         # After activating Reader/Text settings, Display returns to row 1.
         # LEFT wraps to the last Display row, Night mode.
-        script = ('1000:UP;1600:RIGHT;2200:CONFIRM;'
+        script = ('1000:UP;2200:CONFIRM;'
                   '3000:RIGHT;3500:RIGHT;4200:DOWN;4700:DOWN;5300:CONFIRM;6700:BACK;'
                   '8100:UP;8600:UP;9200:LEFT;9800:CONFIRM;11200:QUIT')
         self.settings['screenInverted'] = 0
@@ -144,13 +144,13 @@ class ReworkUiTest(unittest.TestCase):
         self.assertNotIn('Entering activity: CrossPointWebServer', log)
 
     def test_file_transfer_from_home_settings(self):
-        # Home Settings focuses Gửi file immediately. No intermediate Settings screen.
+        # Home Settings opens on Display; RIGHT x5 reaches File transfer.
         #
         # Moc cu la 'NetworkModeSelection'. Tu v1.0.6 may KHONG cam ung khong mo man
         # chon che do nua, no vao thang diem phat hoac mang da luu, nen moc do khong
         # con ton tai tren ban gia lap X3. Moc moi la chinh man Gui file. Duong di
         # moi duoc phu rieng o test_file_transfer_no_password.py.
-        log = self.run_sim('1000:UP;1800:CONFIRM;3000:BACK;4500:QUIT')
+        log = self.run_sim('1000:UP;1200:RIGHT;1400:RIGHT;1600:RIGHT;1800:RIGHT;2000:RIGHT;2500:CONFIRM;4000:BACK;5500:QUIT')
         self.assertIn('Entering activity: CrossPointWebServer', log)
         self.assertNotIn('Entering activity: Settings', log)
         self.assertEqual(log.count('Entering activity: Home'), 2, log)
@@ -163,10 +163,10 @@ class ReworkUiTest(unittest.TestCase):
 
     # --- H5: thanh trang thai theo dung nguong 4, dong ho tach ra man rieng trong He thong ------
     def test_h5_clock_corners_change_directly_in_display(self):
-        # Display row 6 cycles corner positions in place. UI text size was
-        # inserted at row 2 in v1.0.8.
-        script = ('1000:UP;1600:RIGHT;2200:CONFIRM;'
-                  '3000:RIGHT;3500:RIGHT;4000:RIGHT;4500:RIGHT;5000:RIGHT;5600:CONFIRM;7000:QUIT')
+        # Display row 5 cycles corner positions in place (UI text size, status bar mode,
+        # side arrows and button labels come before it).
+        script = ('1000:UP;2200:CONFIRM;'
+                  '3000:RIGHT;3500:RIGHT;4000:RIGHT;4500:RIGHT;5600:CONFIRM;7000:QUIT')
         self.settings['statusBarClock'] = 2
         (self.store / 'settings.json').write_text(json.dumps(truoc_tenor(self.settings)))
         log = self.run_sim(script)
@@ -180,7 +180,8 @@ class ReworkUiTest(unittest.TestCase):
                   '3000:RIGHT;3300:RIGHT;3600:RIGHT;3900:RIGHT;4200:RIGHT;4500:RIGHT;4900:CONFIRM;'
                   '5600:CONFIRM;7600:QUIT')
         log = self.run_sim(script)
-        self.assertEqual(log.count('Entering activity: DongHoSettings'), 1, log)
+        # The clock screen is ClockSettings since CrossPoint 1.6.5 (#3562).
+        self.assertEqual(log.count('Entering activity: ClockSettings'), 1, log)
 
     # --- H2: chinh nhanh co chu va font ngay trong menu doc, va giu nut lat trang doi co ------
     def test_h2_j1_co_chu_7_nhip_bang_popup_tai_co(self):

@@ -1,4 +1,5 @@
 #pragma once
+#include "shells/ugly/UglyMarkSeed.h"
 #include <FreeInkUIGfxRenderer.h>
 #include <GfxRenderer.h>
 
@@ -9,6 +10,9 @@
 
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+#include "TelexComposer.h"
+#endif
 
 enum class InputType { Text, Password, Url };
 
@@ -30,6 +34,8 @@ inline bool idleTimeoutDue(const uint32_t now, const uint32_t timeoutMs, const b
 // editing, and the URL snippet layouts.
 class KeyboardEntryActivity : public Activity {
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Keyboard; }
+  std::string x3NavigationLabel() const override { return title; }
   explicit KeyboardEntryActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                  std::string title = "Enter Text", std::string initialText = "",
                                  const size_t maxLength = 0, InputType inputType = InputType::Text,
@@ -45,8 +51,10 @@ class KeyboardEntryActivity : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
+  bool preventAutoSleep() override { return true; }
 
  private:
+  mutable ugly::MarkState mark_;
   std::string title;
   std::string text;
   size_t maxLength;
@@ -62,14 +70,17 @@ class KeyboardEntryActivity : public Activity {
   // layouts (with the always-visible number row); the URL layers are
   // app-defined tables in the .cpp.
   freeink::ui::KeyboardLayoutId layoutId = freeink::ui::KeyboardLayoutId::QwertyEn;
-  // Asks the SDK for a layout variant with the language key. Only the Latin
-  // layouts honour it; the Cyrillic and Hebrew tables carry the key either way.
+  // Asks the SDK for a layout variant with the language key.
   // Resolved once in onEnter(): the set cannot change while a keyboard is on
   // screen, and currentLayout() runs on every loop pass.
   bool showLangKey = false;
   bool shifted = false;
   bool symbols = false;
   bool urlPanel = false;  // URL snippet panel replaces the letter layer
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  bool telexEnabled = false;
+  telex::State telexState;
+#endif
 
   // Key hit rects registered by the keyboard component during render(); loop()
   // routes touch snapshots against them. The 5-row EN layout registers 41 keys,
@@ -148,6 +159,7 @@ class KeyboardEntryActivity : public Activity {
   const freeink::ui::KeyboardLayout& currentLayout() const;
   const freeink::ui::KeyboardKey* selectedKey() const;
   int selectedLogicalIndex() const;
+  uint32_t selectionMarkSeed() const;
   void clampSelection();
   void moveSelectionRow(int delta);
   // Column the user last picked on purpose, and the row width it was picked in.
@@ -178,6 +190,7 @@ class KeyboardEntryActivity : public Activity {
   static size_t utf8Next(const std::string& s, size_t pos);
 
   freeink::ui::Rect keyboardRect() const;
+  std::string x3TipText() const;
   int inputTop() const;
   int inputWindowStart(std::string& displayText, int maxWidth) const;
 

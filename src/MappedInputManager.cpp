@@ -8,17 +8,124 @@
 #include <algorithm>
 #include <cstdlib>
 
+#if FREEINK_DEVICE_X4PRO && defined(TENOR_PRESS_PROBE)
+#include <Logging.h>
+
+#include <cstdio>
+#endif
+
 #include "CrossPointSettings.h"
+#include "components/HeaderBackTapTarget.h"
 #include "components/UITheme.h"
 
 namespace fui = freeink::ui;
 
-void MappedInputManager::update() const {
+void MappedInputManager::update(const bool deferHomeButtonAction) const {
   gpio.update();
+  homeAction = HomeButtonAction::Ignore;
+  if (gpio.hasHomeKey()) {
+    homeAction = homeButtonInput.update(millis(), gpio.wasHomeKeyTapped(), gpio.wasHomeKeyLongPressed(),
+                                        wasSwipe() != SwipeDir::None, gpio.wasHomeKeyPressed(),
+                                        static_cast<HomeButtonAction>(SETTINGS.homeButtonTapAction),
+                                        static_cast<HomeButtonAction>(SETTINGS.homeButtonDoubleTapAction),
+                                        static_cast<HomeButtonAction>(SETTINGS.homeButtonLongPressAction));
+  }
+  if (deferHomeButtonAction) {
+    // Keep the first action observed during a synchronous transfer. Home must
+    // still be visible now so the transfer can cancel and unwind promptly.
+    if (homeAction != HomeButtonAction::Ignore && deferredHomeAction == HomeButtonAction::Ignore) {
+      deferredHomeAction = homeAction;
+    }
+  } else if (deferredHomeAction != HomeButtonAction::Ignore) {
+    homeAction = deferredHomeAction;
+    deferredHomeAction = HomeButtonAction::Ignore;
+  }
   for (uint8_t value = 0; value <= static_cast<uint8_t>(Button::ScreenDown); ++value) {
     if (!isPressed(static_cast<Button>(value))) longPressFiredButtons &= ~(1u << value);
   }
+  // A tap on the bar's "<" in this frame is Back, unless it follows the last one too closely.
+  footBackTap = false;
+  int tapX = 0;
+  int tapY = 0;
+  if (wasScreenTapped(tapX, tapY) && HeaderBackTapTarget::footContains(tapX, tapY)) {
+    const unsigned long now = millis();
+    if (!lastFootBackMs || now - lastFootBackMs >= HeaderBackTapTarget::FOOT_BACK_GUARD_MS) {
+      footBackTap = true;
+      lastFootBackMs = now | 1;
+    }
+  }
+#if FREEINK_DEVICE_X4PRO
+  stepScribble();
+#endif
 }
+
+#if FREEINK_DEVICE_X4PRO
+#ifdef TENOR_PRESS_PROBE
+namespace {
+bool strokeLogOn = false;
+char strokeLabel[16] = "";
+unsigned long strokeLiftAt = 0;
+// The log goes to a file on the card: a capped count of strokes a switch-on, and at most
+// STROKE_LOG_POINTS points a line (about 1 KB), every k-th one when the stroke has more.
+constexpr int STROKE_LOG_MAX = 40, STROKE_LOG_POINTS = 64;
+int strokesLogged = 0;
+}  // namespace
+
+void MappedInputManager::setStrokeLog(const bool on, const char* label) const {
+  strokeLogOn = on;
+  strokesLogged = 0;
+  snprintf(strokeLabel, sizeof(strokeLabel), "%s", label && *label ? label : "-");
+}
+#endif
+
+void MappedInputManager::stepScribble() const {
+  scribbleFrame = {};
+  if (!gpio.hasTouch()) return;
+  int x = 0;
+  int y = 0;
+  const bool down = isScreenTouchHeld(x, y);
+  uint8_t contacts = 0;
+  int cx = 0, cy = 0;
+  if (down && touchContactsAt(contacts, cx, cy) && contacts >= 2) scribbler.spoil();
+  scribbleFrame = scribbler.step(down, x, y, millis());
+#ifdef TENOR_PRESS_PROBE
+  if (!strokeLogOn || strokesLogged >= STROKE_LOG_MAX) return;
+  if (const scribble::Stroke* s = scribbler.endedStroke()) {
+    // One line a stroke, read back by test/scribble/log_to_samples.py: n= is checked against the
+    // points that arrive, so a line cut short is dropped there.
+    const int every = (s->n + STROKE_LOG_POINTS - 1) / STROKE_LOG_POINTS;
+    const int shown = (s->n + every - 1) / every;
+    logSerial.printf("STROKE lbl=%s n=%d gap=%lu pts=", strokeLabel, shown, s->t0 - strokeLiftAt);
+    for (int i = 0, prev = 0; i < s->n; i += every) {
+      logSerial.printf("%d,%d,%u;", s->p[i].x, s->p[i].y, i ? static_cast<unsigned>(s->p[i].t - s->p[prev].t) : 0u);
+      prev = i;
+    }
+    logSerial.printf("\n");
+    strokeLiftAt = millis();
+    ++strokesLogged;
+  }
+  if (scribbleFrame.kind != scribble::Kind::None) {
+    const auto& r = scribbleFrame;
+    logSerial.printf("SCRIBBLE lbl=%s kind=%s strokes=%u at=%d,%d box=%d,%d,%d,%d\n", strokeLabel,
+                     scribble::kindName(r.kind), static_cast<unsigned>(r.strokes), r.x, r.y, r.box.x0, r.box.y0,
+                     r.box.x1, r.box.y1);
+  }
+#endif
+}
+
+bool MappedInputManager::wasStrike(int16_t& x, int16_t& y) const {
+  if (scribbleFrame.kind != scribble::Kind::Strike) return false;
+  x = scribbleFrame.x;
+  y = scribbleFrame.y;
+  return true;
+}
+
+bool MappedInputManager::wasScribble(scribble::Result& out) const {
+  if (scribbleFrame.kind == scribble::Kind::None) return false;
+  out = scribbleFrame;
+  return true;
+}
+#endif
 
 bool MappedInputManager::isNavDirectionSwapped() const {
   // Touch boards always follow the rendered orientation; button-only boards keep the user toggle.
@@ -94,6 +201,8 @@ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint
           return (gpio.*fn)(isNavDirectionSwapped() ? HalGPIO::BTN_DOWN : HalGPIO::BTN_UP);
         case CrossPointSettings::NEXT_PREV:
           return (gpio.*fn)(isNavDirectionSwapped() ? HalGPIO::BTN_UP : HalGPIO::BTN_DOWN);
+        case CrossPointSettings::PREV_PREV:
+          return (gpio.*fn)(HalGPIO::BTN_UP) || (gpio.*fn)(HalGPIO::BTN_DOWN);
         case CrossPointSettings::NEXT_NEXT:
         case CrossPointSettings::SIDE_BUTTONS_DISABLED:
         default:
@@ -110,6 +219,7 @@ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint
           // Both edge buttons turn forward: readers who hold the device either
           // way keep one thumb on "next" without thinking about which side.
           return (gpio.*fn)(HalGPIO::BTN_UP) || (gpio.*fn)(HalGPIO::BTN_DOWN);
+        case CrossPointSettings::PREV_PREV:
         case CrossPointSettings::SIDE_BUTTONS_DISABLED:
         default:
           return false;
@@ -171,6 +281,15 @@ bool MappedInputManager::wasScreenLongPress(int& x, int& y) const {
   if (!gpio.wasTouchLongPress(nx, ny)) return false;
   // Consuming the long-press implies acting on it: suppress the rest of the
   // contact so the finger lift can't also tap whatever the action opened.
+  gpio.suppressTouchContact();
+  renderer.tapToLogical(nx, ny, x, y);
+  return true;
+}
+
+bool MappedInputManager::wasScreenHold(int& x, int& y, const unsigned long thresholdMs) const {
+  float nx = 0.0f, ny = 0.0f;
+  unsigned long heldMs = 0;
+  if (!gpio.isTouchTapCandidate(nx, ny, heldMs) || heldMs < thresholdMs) return false;
   gpio.suppressTouchContact();
   renderer.tapToLogical(nx, ny, x, y);
   return true;
@@ -262,6 +381,49 @@ MappedInputManager::SwipeDir MappedInputManager::wasSwipe() const {
   }
 }
 
+bool MappedInputManager::touchContactsAt(uint8_t& count, int& x, int& y) const {
+  float nx = 0, ny = 0;
+  if (!gpio.touchContactsAt(count, nx, ny)) return false;
+  renderer.tapToLogical(nx, ny, x, y);
+  return true;
+}
+
+bool MappedInputManager::popMultiTouchSwipe(uint8_t& contacts, int& dx, int& dy, unsigned long* durationMs) const {
+  float nxs = 0, nys = 0, nxe = 0, nye = 0;
+  unsigned long ms = 0;
+  if (!gpio.popMultiTouchSwipe(contacts, nxs, nys, nxe, nye, ms)) return false;
+  if (durationMs) *durationMs = ms;
+  ++touchContactGeneration_;
+  int sx = 0, sy = 0, ex = 0, ey = 0;
+  renderer.tapToLogical(nxs, nys, sx, sy);
+  renderer.tapToLogical(nxe, nye, ex, ey);
+  dx = ex - sx;
+  dy = ey - sy;
+  gpio.suppressTouchContact();
+  return true;
+}
+
+bool MappedInputManager::wasVerticalSwipe(int& dy, unsigned long& heldMs) const {
+  int startX = 0;
+  int startY = 0;
+  return wasVerticalSwipe(dy, heldMs, startX, startY);
+}
+
+bool MappedInputManager::wasVerticalSwipe(int& dy, unsigned long& heldMs, int& startX, int& startY) const {
+  int sx = 0;
+  int sy = 0;
+  int ex = 0;
+  int ey = 0;
+  if (!decodeSwipe(sx, sy, ex, ey)) return false;
+  const auto dir = fui::swipeDirection(sx, sy, ex, ey);
+  if (dir != fui::SwipeDir::Up && dir != fui::SwipeDir::Down) return false;
+  dy = ey - sy;
+  startX = sx;
+  startY = sy;
+  heldMs = gpio.lastTouchHeldMs();
+  return true;
+}
+
 // Edge classification (which swipe counts as an edge gesture) lives in the
 // SDK; only the MEANING of each edge - back, menu, home, light panel, and the
 // home-key remap - is decided here.
@@ -277,6 +439,16 @@ bool MappedInputManager::wasEdgeSwipe(const freeink::ui::ScreenEdge edge) const 
 }
 
 bool MappedInputManager::wasBackGesture() const {
+  // Tap on the header back button (rect recorded by BaseTheme::drawHeader;
+  // empty on screens without one). Folded into Button::Back alongside the
+  // swipe so every activity's existing Back handling picks it up.
+  int tapX = 0;
+  int tapY = 0;
+  if (wasScreenTapped(tapX, tapY) && HeaderBackTapTarget::headerContains(tapX, tapY)) {
+    rememberTouchHeldTime();
+    return true;
+  }
+  if (wasScreenTapped(tapX, tapY) && HeaderBackTapTarget::footContains(tapX, tapY)) return footBackTap;
   // Back = left-to-right swipe starting near the left edge. Edge-anchored so that
   // mid-screen horizontal swipes stay available to activities that consume
   // SwipeDir::Left/Right (e.g. percent selection, image viewer).
@@ -289,13 +461,15 @@ bool MappedInputManager::wasBottomEdgeUpSwipe() const { return wasEdgeSwipe(fui:
 
 bool MappedInputManager::wasMenuGesture() const { return wasTopEdgeDownSwipe(); }
 
-bool MappedInputManager::wasReaderMenuSwipeUp() const { return gpio.hasHomeKey() && wasBottomEdgeUpSwipe(); }
-
-bool MappedInputManager::wasHomeGesture() const {
-  return gpio.hasHomeKey() ? gpio.wasHomeKeyTapped() : wasBottomEdgeUpSwipe();
+bool MappedInputManager::wasReaderMenuSwipeUp() const {
+  return !BoardConfig::isX4Pro() && gpio.hasHomeKey() && wasBottomEdgeUpSwipe();
 }
 
-bool MappedInputManager::wasHomeKeyHold() const { return gpio.hasHomeKey() && gpio.wasHomeKeyLongPressed(); }
+bool MappedInputManager::wasBottomHomeGesture() const { return BoardConfig::isX4Pro() && wasBottomEdgeUpSwipe(); }
+
+bool MappedInputManager::wasHomeGesture() const {
+  return wasBottomHomeGesture() || (gpio.hasHomeKey() ? homeAction == HomeButtonAction::Home : wasBottomEdgeUpSwipe());
+}
 
 bool MappedInputManager::wasLightPanelGesture() const {
   // On lightless boards the same edge remains available to the reader menu.
@@ -306,13 +480,15 @@ bool MappedInputManager::wasLightPanelGesture() const {
 bool MappedInputManager::wasPowerConfirmClick() const {
   if (!gpio.hasTouch() || SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::PWR_CONFIRM) return false;
   // Wait out the X4 Pro's frontlight double-click window before treating its
-  // first release as Confirm. Other touch boards can use the release directly.
-  if (BoardConfig::isX4Pro()) return powerConfirmClickFrame;
+  // first release as Confirm. With the shortcut disabled, and on other touch
+  // boards, the release counts directly.
+  if (BoardConfig::isX4Pro() && SETTINGS.doubleClickPwrLight) return powerConfirmClickFrame;
   return gpio.wasReleased(HalGPIO::BTN_POWER) && gpio.getPowerButtonHeldTime() <= SETTINGS.getPowerButtonDuration();
 }
 #endif
 
 bool MappedInputManager::wasPressed(const Button button) const {
+  if (button == Button::Confirm && homeAction == HomeButtonAction::Confirm) return true;
   if (button == Button::Back && wasBackGesture()) return true;
 #if FREEINK_CAP_TOUCH
   if (button == Button::Confirm && wasPowerConfirmClick()) return true;
@@ -321,6 +497,7 @@ bool MappedInputManager::wasPressed(const Button button) const {
 }
 
 bool MappedInputManager::wasReleased(const Button button) const {
+  if (button == Button::Confirm && homeAction == HomeButtonAction::Confirm) return true;
   if (button == Button::Back && wasBackGesture()) return true;
 #if FREEINK_CAP_TOUCH
   if (button == Button::Confirm && wasPowerConfirmClick()) return true;
@@ -360,6 +537,8 @@ bool MappedInputManager::wasAnyPressed() const { return gpio.wasAnyPressed(); }
 bool MappedInputManager::wasAnyReleased() const { return gpio.wasAnyReleased(); }
 
 unsigned long MappedInputManager::getHeldTime() const {
+  // A mapped action has its own meaning, independent of the contact duration.
+  if (homeAction != HomeButtonAction::Ignore) return 0;
   if (!gpio.wasAnyPressed() && !gpio.wasAnyReleased() && touchHeldOverrideValid &&
       millis() - touchHeldOverrideAt <= TOUCH_HELD_OVERRIDE_WINDOW_MS) {
     return touchHeldOverrideMs;

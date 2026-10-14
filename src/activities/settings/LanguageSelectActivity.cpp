@@ -1,4 +1,5 @@
 #include "LanguageSelectActivity.h"
+#include "activities/settings/X3SettingsLayout.h"
 
 #include <GfxRenderer.h>
 #include <I18n.h>
@@ -9,6 +10,7 @@
 #include "CrossPointSettings.h"
 #include "I18nKeys.h"
 #include "MappedInputManager.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
 
@@ -35,7 +37,11 @@ void LanguageSelectActivity::onEnter() {
     fui::ListItem item;
     item.label = I18N.getLanguageName(static_cast<Language>(SORTED_LANGUAGE_INDICES[i]));
     if (SORTED_LANGUAGE_INDICES[i] == currentLang) {
-      item.value = tr(STR_SELECTED);
+      // Touch: the language in use is the chosen row (bold, a tick), no word.
+      if (tenorchrome::kTouchShell)
+        item.chosen = true;
+      else
+        item.value = tr(STR_SELECTED);
     }
     item.actionValue = static_cast<int16_t>(i);
     rowItems[i] = item;
@@ -67,11 +73,15 @@ void LanguageSelectActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
   // Content: the safe area minus the header band GUI.drawHeader paints.
-  screen.setContentMarginFromScreen(fui::Insets{
-      static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-      static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-      static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)), static_cast<int16_t>(safe.x)});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  if (x3settings::beginScreen(screen, renderer)) {
+    tabBandDrawn = true;
+  } else {
+    screen.setContentMarginFromScreen(fui::Insets{
+        static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
+        static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
+        static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)), static_cast<int16_t>(safe.x)});
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   // rowItems was built once in onEnter() and is reused here on every repaint.
   fui::ListProps props;

@@ -1,4 +1,5 @@
 #pragma once
+#include "shells/ugly/UglyMarkSeed.h"
 #include <array>
 #include <memory>
 #include <string>
@@ -6,7 +7,9 @@
 
 #include "QuoteStore.h"
 #include "activities/Activity.h"
+#include "components/OptionPopup.h"
 #include "components/QuoteListLayout.h"
+#include "components/TenorMenuChrome.h"
 #include "util/ButtonNavigator.h"
 
 // Saved quotes, two levels deep. Opened from Home it lists the books that have quotes
@@ -22,6 +25,8 @@ class Epub;
 
 class QuotesActivity final : public Activity {
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::More; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_QUOTES); }
   // `bookPath` empty opens the list of books; a path opens that book's quotes directly.
   // `insideReader` is true when the reader opened this screen for its own book: only then
   // does editing offer to reselect the quote on the page (finishing with QuoteEditResult).
@@ -36,8 +41,11 @@ class QuotesActivity final : public Activity {
   void onEnter() override;
   void loop() override;
   void render(RenderLock&&) override;
+  tenorchrome::X3ScreenLayout screenLayout() const;
+  void drawX3Content() const;
 
  private:
+  mutable ugly::MarkState mark_;
   // What the list shows. The first three belong to the top level and are cycled from its
   // top row; the last three belong to one book.
   enum class Order : uint8_t { Books, AllNewest, AllOldest, BookNewest, BookOldest, BookPage };
@@ -77,6 +85,14 @@ class QuotesActivity final : public Activity {
   void logPage() const;
   void sortByPlace();
   void cycleOrder();
+  void setOrder(Order next);
+  // Touch: a tap on a row opens it, a hold on a quote offers Edit and Delete, a swipe turns pages, the bar's pill
+  // picks the view. True when the pass was taken.
+  bool touchInput();
+  // The row of the page under y, as an index into `ids` or `books`, or -1.
+  int itemAt(int y) const;
+  void showViewMenu();
+  void showQuoteActions(int item);
   void moveCursor(int direction);
   void flipPages(int pages);
   void activate();
@@ -113,4 +129,10 @@ class QuotesActivity final : public Activity {
   // A quote was deleted or edited below this screen, so whoever opened it reloads too.
   bool storeChanged = false;
   ButtonNavigator cursorNavigator;
+  // Touch: the view picked from the bar and the actions of a held quote.
+  OptionPopup viewMenu;
+  OptionPopup rowMenu;
+  // Touch: where the rows of the page were drawn, for the tap that picks one (rowTops[i] to rowTops[i + 1]).
+  mutable std::array<int16_t, MAX_BOOK_ROWS + 1> rowTops{};
+  mutable int shownRows = 0;
 };

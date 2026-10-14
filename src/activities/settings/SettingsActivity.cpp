@@ -1,33 +1,50 @@
 #include "SettingsActivity.h"
+#include "activities/settings/X3SettingsLayout.h"
+#include "components/icons/readerToolbarTabIcons.h"
+#include "components/icons/tenorReaderTabIcons.h"
 
 #include <BoardConfig.h>
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
+#include <LibraryBuilder.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <WiFi.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 
+#include "ReadingStatsStore.h"
+#include "shells/ugly/UglyInk.h"
+#include "shells/ugly/UglyQuip.h"
+
+#include "AboutActivity.h"
 #include "BlePageTurnerActivity.h"
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
+#include "ClockSettingsActivity.h"
 #include "CrossPointSettings.h"
-#include "DongHoSettingsActivity.h"
+#include "MenuTiltInput.h"
 #include "FontDownloadActivity.h"
+#include "HomeButtonSettingsActivity.h"
+#include "InfoUpdateActivity.h"
 #include "KOReaderSettingsActivity.h"
 #include "KeyboardLayoutsActivity.h"
 #include "activities/util/KeyboardLayoutSet.h"
 #include "LanguageSelectActivity.h"
 #include "MappedInputManager.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyShell.h"
 #include "OpdsServerListActivity.h"
 #include "OtaUpdateActivity.h"
 #include "PanelChip.h"
 #include "SdCardFontSystem.h"
 #include "SdFirmwareUpdateActivity.h"
 #include "SettingsList.h"
+#include "SilentRestart.h"
 #include "StatusBarSettingsActivity.h"
 #include "TextSettingsActivity.h"
 #include "UIFontTiers.h"
@@ -46,7 +63,7 @@ namespace fui = freeink::ui;
 
 SettingsActivity::SettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const int theBanDau,
                                    const bool fromHomeGroup)
-    : UiTabListActivity("Settings", renderer, mappedInput),
+    : UiTabListActivity("Settings", renderer, mappedInput, /*wantsTouchLongPress=*/tenorchrome::kTouchShell),
       fromHomeGroup(fromHomeGroup),
       theBanDau(theBanDau >= 0 && theBanDau < settingstabs::TAB_COUNT ? theBanDau : 0) {}
 
@@ -76,7 +93,25 @@ std::vector<SettingInfo>& SettingsActivity::danhSachCuaThe(const settingstabs::T
 
 int SettingsActivity::tabCount() const { return deviceSettingsTabCount(); }
 
-void SettingsActivity::rebuildSettingsLists() {
+bool SettingsActivity::listedAsRow(const SettingInfo& setting) {
+  if (settingHiddenInShell(setting)) return false;
+  if (home_button::isSetting(setting.valuePtr)) return false;
+  if (setting.valuePtr == &CrossPointSettings::uiUglyLevel) return ugly::logic::levelRowShown(SETTINGS.uiShell);
+  return !(BoardConfig::hasHomeKey() && setting.nameId == StrId::STR_LONG_PRESS_MENU);
+}
+
+bool SettingsActivity::applyUiTextSize(GfxRenderer& renderer, const uint8_t size) {
+  if (!applyUiFontSize(renderer, size)) return false;
+  SETTINGS.uiTextSize = size;
+  UITheme::getInstance().reload();
+  return true;
+}
+
+void SettingsActivity::rebuildSettingsLists(const bool lockHeld) {
+  std::optional<RenderLock> lock;
+  if (!lockHeld) lock.emplace(*this);
+  form_.invalidate();
+  formPaintReady_.store(false);
   displaySettings.clear();
   readerSettings.clear();
   controlsSettings.clear();
@@ -110,16 +145,25 @@ void SettingsActivity::rebuildSettingsLists() {
       {StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache},
       {StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates},
       {StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate},
+      {StrId::STR_ABOUT, SettingAction::About},
   };
+  // Home button settings are edited via the HomeButton action row's sub-screen
+  // (below), not as individual rows in the flat Controls list (#3516).
+  // longPressMenuFunction (legacy long-press-Confirm cycling) is superseded by
+  // the Home button's own long-press action on home-key boards. The row count
+  // below and the list build apply the same rule, so every tab reserves exactly.
+
   const auto& catalog = getBaseSettingsList();
   std::array<size_t, settingstabs::TAB_COUNT> rowCounts{};
   for (const auto& setting : catalog) {
     const int tab = deviceSettingsTab(setting);
-    if (tab >= 0) ++rowCounts[tab];
+    if (tab >= 0 && listedAsRow(setting)) ++rowCounts[tab];
   }
-  for (const auto& row : DONG_HANH_DONG) ++rowCounts[static_cast<int>(settingstabs::nhaCua(row.viec))];
+  for (const auto& row : DONG_HANH_DONG)
+    if (!infoupdate::holds(row.viec)) ++rowCounts[static_cast<int>(settingstabs::nhaCua(row.viec))];
   if (!BoardConfig::hasTouch()) ++rowCounts[static_cast<int>(settingstabs::Tab::CONTROLS)];
   if (keyboard_layouts::COUNT > 1) ++rowCounts[static_cast<int>(settingstabs::Tab::KEYBOARD)];
+  if (BoardConfig::hasHomeKey()) ++rowCounts[static_cast<int>(settingstabs::Tab::CONTROLS)];
   ++rowCounts[static_cast<int>(settingstabs::Tab::SYSTEM)];
   ++rowCounts[static_cast<int>(settingstabs::Tab::DEVICE)];
   rowCounts[static_cast<int>(settingstabs::Tab::READER)] += 3 + (!dictionaries.empty() ? 1 : 0);
@@ -129,14 +173,13 @@ void SettingsActivity::rebuildSettingsLists() {
   for (const auto& setting : catalog) {
     const int tab = deviceSettingsTab(setting);
     if (tab < 0) continue;
-    if (SETTINGS.uiTheme == CrossPointSettings::TENOR_UI &&
-        setting.valuePtr == &CrossPointSettings::statusBarClock) {
+    if (setting.valuePtr == &CrossPointSettings::statusBarClock) {
       const auto afterLabels = std::find_if(displaySettings.begin(), displaySettings.end(), [](const SettingInfo& row) {
         return row.valuePtr == &CrossPointSettings::tenorButtonSymbols;
       });
       displaySettings.insert(afterLabels == displaySettings.end() ? afterLabels : afterLabels + 1,
                              buildTenorClockPlacementSetting(setting));
-    } else {
+    } else if (listedAsRow(setting)) {
       danhSachCuaThe(static_cast<settingstabs::Tab>(tab)).push_back(setting);
     }
   }
@@ -149,6 +192,7 @@ void SettingsActivity::rebuildSettingsLists() {
                             SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
   }
   for (const auto& dong : DONG_HANH_DONG) {
+    if (infoupdate::holds(dong.viec)) continue;  // X4 Pro: on the About & updates screen
     danhSachCuaThe(settingstabs::nhaCua(dong.viec)).push_back(SettingInfo::Action(dong.nhan, dong.viec));
   }
   // One layout leaves nothing to pick, so the row would be a dead press.
@@ -156,34 +200,44 @@ void SettingsActivity::rebuildSettingsLists() {
     keyboardSettings.insert(keyboardSettings.begin(),
                             SettingInfo::Action(StrId::STR_KEYBOARD_LAYOUTS, SettingAction::KeyboardLayouts));
   }
-  // Clock precedes file-management preferences.
+  // Home button shortcuts (#3516): a physical Home key only.
+  if (BoardConfig::hasHomeKey()) {
+    controlsSettings.insert(controlsSettings.begin(),
+                            SettingInfo::Action(StrId::STR_HOME_BUTTON, SettingAction::HomeButton));
+  }
+  // Clock precedes file-management preferences. It stays on boards without an
+  // RTC: the time comes from NTP there, and the zone and format still apply.
   const auto files = std::find_if(systemSettings.begin(), systemSettings.end(), [](const SettingInfo& row) {
     return row.valuePtr == &CrossPointSettings::showHiddenFiles;
   });
-  systemSettings.insert(files, SettingInfo::Action(StrId::STR_CLOCK, SettingAction::Clock));
+  systemSettings.insert(files, SettingInfo::Action(StrId::STR_CLOCK, SettingAction::ClockSettings));
   readerSettings.insert(readerSettings.begin(),
                         SettingInfo::Action(StrId::STR_TEXT_SETTINGS, SettingAction::TextSettings));
   readerSettings.insert(readerSettings.begin() + 1,
                         SettingInfo::Action(StrId::STR_MANAGE_FONTS, SettingAction::DownloadFonts));
   readerSettings.push_back(SettingInfo::Action(StrId::STR_CUSTOMISE_STATUS_BAR, SettingAction::CustomiseStatusBar));
   // Read only, last on Device: the panel chip, for a photo sent with an ink report.
-  SettingInfo chip = SettingInfo::Action(StrId::STR_DISPLAY_CHIP, SettingAction::None);
-  chip.stringGetter = [] { return panelchip::current(); };
-  deviceSettings.push_back(std::move(chip));
+  if (!infoupdate::holds(SettingAction::None, /*chip=*/true)) {
+    SettingInfo chip = SettingInfo::Action(StrId::STR_DISPLAY_CHIP, SettingAction::None);
+    chip.stringGetter = [] { return panelchip::current(); };
+    deviceSettings.push_back(std::move(chip));
+  }
 
   // A theme or conditional row can shorten an inactive category as well.
   for (size_t tab = 0; tab < tabNavs.size(); ++tab) {
     const int count = static_cast<int>(danhSachCuaThe(static_cast<settingstabs::Tab>(tab)).size());
     auto& cursor = tabNavs[tab];
-    cursor.selected = count == 0 ? 0 : std::clamp(cursor.selected, mappedInput.hasTouch() ? 0 : 1, count);
+    cursor.selected = count == 0 ? 0 : std::clamp(cursor.selected.load(), mappedInput.hasTouch() ? 0 : 1, count);
     cursor.followOnBuild = true;
   }
   currentSettings = &danhSachCuaThe(static_cast<settingstabs::Tab>(selectedCategoryIndex));
   settingsCount = static_cast<int>(currentSettings->size());
   rebuildRowItems();
+  if (shell::isUgly()) bindForm();
 }
 
 void SettingsActivity::onEnter() {
+  RenderLock lock(*this);
   navigationPrefix = tr(STR_SETTINGS_TITLE);
   UiTabListActivity::onEnter();
 
@@ -194,7 +248,8 @@ void SettingsActivity::onEnter() {
   quickResumeTimeoutAutoEnabled = false;
   syncQuickResumeTimeoutForSleepScreen(/*sleepScreenChanged=*/true, /*quickResumeTimeoutChanged=*/false);
 
-  rebuildSettingsLists();
+  if (shell::isUgly()) ugly::ensureFonts(renderer);
+  rebuildSettingsLists(true);
   dapXuongNhom();
 }
 
@@ -202,9 +257,16 @@ void SettingsActivity::restoreNavigation(const MenuNavigationState& state) {
   MenuNavigationState restored = state;
   if (fromHomeGroup) restored.tab = theBanDau;
   UiTabListActivity::restoreNavigation(restored);
+  if (shell::isUgly()) {
+    RenderLock lock(*this);
+    focusForm(std::clamp(ringPos() - 1, 0, std::max(0, settingsCount - 1)));
+  }
 }
 
 void SettingsActivity::onPause() {
+  form_.invalidate();
+  formPaintReady_.store(false);
+  formCount_ = 0;
   if (!releaseListsForFontDownload_) return;
   // ActivityManager holds RenderLock and has already saved navigation. The
   // download child owns its data, so these descriptors and rows can be rebuilt
@@ -228,11 +290,19 @@ void SettingsActivity::onPause() {
 }
 
 void SettingsActivity::onResume() {
-  if (!releaseListsForFontDownload_) return;
-  // The manager still owns RenderLock here, before the result handler can
-  // request a repaint. Keep the remembered tab and each tab's cursor.
-  rebuildSettingsLists();
-  releaseListsForFontDownload_ = false;
+  // ActivityManager owns RenderLock here.
+  if (releaseListsForFontDownload_) {
+    rebuildSettingsLists(true);
+    releaseListsForFontDownload_ = false;
+  } else if (shell::isUgly()) {
+    bindForm();
+  }
+}
+
+bool SettingsActivity::handleHomeGesture() {
+  if (!shell::isUgly()) return false;
+  queueForm({FormEvent::Type::Key, ugly::QuestionSheet::Key::Home});
+  return true;
 }
 
 void SettingsActivity::selectCategory(const int categoryIndex) {
@@ -247,6 +317,7 @@ void SettingsActivity::selectCategory(const int categoryIndex) {
   // remember/forget rule for every tab screen; see rowTab there.
   dapXuongNhom();
   rebuildRowItems();
+  if (shell::isUgly()) bindForm();
 }
 
 // Rebuilds rowValues_/rowItems_ (label + actionValue) for *currentSettings.
@@ -262,6 +333,7 @@ void SettingsActivity::rebuildRowItems() {
     fui::ListItem item;
     item.label = I18N.get(settings[i].nameId);
     item.actionValue = static_cast<int16_t>(i);
+    item.opensNext = settingOpensNext(settings[i]);
     rowItems_.push_back(item);
   }
 }
@@ -275,8 +347,30 @@ void SettingsActivity::onTabAction(const int index) {
 }
 
 void SettingsActivity::activateIndex(const int index) {
+  if (shell::isUgly()) {
+    if (!currentSettings || index < 0 || index >= settingsCount) return;
+    ugly::QuestionSheet::Intent intent;
+    {
+      RenderLock lock(*this);
+      focusForm(index);
+      const bool paperWasOpen = form_.paperOpen();
+      const auto row = formRow(this, index);
+      if (row.count > 0 && (row.kind == ugly::QuestionSheet::Kind::Toggle ||
+                           (row.kind == ugly::QuestionSheet::Kind::Choice && row.count <= 6))) {
+        intent = {ugly::QuestionSheet::IntentKind::Commit, row.id, index, (row.selected + 1) % row.count, true};
+      } else {
+        intent = form_.input(ugly::QuestionSheet::Key::Confirm);
+      }
+      if (paperWasOpen != form_.paperOpen()) ++formSurface_;
+      formPaintReady_.store(false);
+    }
+    applyFormIntent(intent);
+    return;
+  }
   if (optionPopup.isActive()) return;
-  (void)index;  // toggleCurrentSetting reads the ring position
+  // toggleCurrentSetting reads the ring position; a tap on the touch shell leaves the ring alone
+  // (no cursor row), so it names the row it landed on here.
+  if (tenorchrome::kTouchShell) activeNav().selected = index + 1;
   // Most rows repaint a different surface (popup, sub-activity, new value);
   // a lingering tap flash would gray an unrelated element.
   app.clearTapFlash();
@@ -299,29 +393,238 @@ void SettingsActivity::onExit() {
 bool SettingsActivity::applyUiSettingChange(uint8_t CrossPointSettings::* valuePtr, const uint8_t newValue) {
   if (valuePtr == &CrossPointSettings::uiTextSize) {
     RenderLock lock(*this);
-    if (!applyUiFontSize(renderer, newValue)) {
+    if (!applyUiTextSize(renderer, newValue)) {
       LOG_ERR("SETTINGS", "Applying UI text size failed");
       return false;
     }
-    SETTINGS.uiTextSize = newValue;
-    UITheme::getInstance().reload();
     resetUi();
     return true;
   }
-  // Theme changes take effect immediately, on this screen - reload the theme
-  // and re-derive the app's tokens so the very next repaint is in the new look.
-  if (valuePtr != &CrossPointSettings::uiTheme) {
-    return true;
-  }
-  UITheme::getInstance().reload();
-  // Re-derive the shared tokens for the new look; the gate stays closed until
-  // the repaint that rebuilds the interaction table in the new layout.
-  resetUi();
   return true;
 }
 
+uint8_t SettingsActivity::formValue(const SettingInfo& setting, const int option) {
+  return static_cast<uint8_t>(setting.type == SettingType::VALUE
+                                  ? setting.valueRange.min + option * setting.valueRange.step
+                                  : option);
+}
+
+ugly::QuestionSheet::Row SettingsActivity::formRow(void* context, const int index) {
+  using Kind = ugly::QuestionSheet::Kind;
+  auto& self = *static_cast<SettingsActivity*>(context);
+  if (!self.currentSettings || index < 0 || index >= self.settingsCount) return {};
+  const auto& setting = (*self.currentSettings)[index];
+  ugly::QuestionSheet::Row row;
+  row.id = static_cast<uint32_t>(setting.nameId) + 1;
+  row.question = I18N.get(setting.nameId);
+  const int value = setting.valuePtr ? SETTINGS.*setting.valuePtr : setting.valueGetter ? setting.valueGetter() : 0;
+  if (setting.type == SettingType::TOGGLE && (setting.valuePtr || setting.valueSetter)) {
+    row.kind = Kind::Toggle;
+    row.count = 2;
+    row.selected = value;
+  } else if (setting.type == SettingType::ENUM && (setting.valuePtr || setting.valueSetter)) {
+    row.count = static_cast<int>(setting.enumStringValues.empty() ? setting.enumLabels().size()
+                                                                 : setting.enumStringValues.size());
+    row.kind = settingsChoiceStyle(setting, true) == SettingsChoiceStyle::Page ? Kind::Paper : Kind::Choice;
+    row.selected = value;
+  } else if (setting.type == SettingType::VALUE && setting.valueRange.step) {
+    row.count = (setting.valueRange.max - setting.valueRange.min) / setting.valueRange.step + 1;
+    row.kind = row.count <= 6 ? Kind::Choice : row.count <= 11 ? Kind::Ruler : Kind::Paper;
+    row.selected = (value - setting.valueRange.min) / setting.valueRange.step;
+  } else {
+    row.kind = setting.type == SettingType::ACTION && setting.action != SettingAction::None ? Kind::Action : Kind::ReadOnly;
+  }
+  return row;
+}
+
+void SettingsActivity::formLabel(void* context, const int row, const int option, char* out, const size_t size) {
+  if (!size) return;
+  out[0] = 0;
+  auto& self = *static_cast<SettingsActivity*>(context);
+  if (!self.currentSettings || row < 0 || row >= self.settingsCount) return;
+  const auto& setting = (*self.currentSettings)[row];
+  const char* label = "";
+  if (setting.type == SettingType::TOGGLE) {
+    label = setting.valuePtr == &CrossPointSettings::keyboardAxisSwapped
+                ? (option ? tr(STR_KEYBOARD_MOVE_VERTICAL) : tr(STR_KEYBOARD_MOVE_HORIZONTAL))
+                : (option ? tr(STR_STATE_ON) : tr(STR_STATE_OFF));
+  } else if (setting.type == SettingType::ENUM) {
+    if (!setting.enumStringValues.empty() && option >= 0 && option < static_cast<int>(setting.enumStringValues.size()))
+      label = setting.enumStringValues[option].c_str();
+    else if (option >= 0 && option < static_cast<int>(setting.enumLabels().size())) label = I18N.get(setting.enumLabels()[option]);
+  } else if (setting.type == SettingType::VALUE) {
+    const unsigned value = formValue(setting, option);
+    if (setting.nameId == StrId::STR_TIME_TO_SLEEP) {
+      if (value >= CrossPointSettings::SLEEP_TIMEOUT_NEVER_MINUTES) label = tr(STR_SLEEP_NEVER);
+      else { snprintf(out, size, tr(STR_SLEEP_TIMER_VALUE_FORMAT), value); return; }
+    } else { snprintf(out, size, "%u", value); return; }
+  } else if (setting.stringGetter) {
+    // Read-only catalog services return their current label; no SD discovery.
+    const std::string value = setting.stringGetter();
+    snprintf(out, size, "%s", value.c_str());
+    return;
+  }
+  snprintf(out, size, "%s", label);
+}
+
+void SettingsActivity::focusForm(const int row) {
+  if (row < 0 || row >= settingsCount) return;
+  const int previousSheet = form_.sheet();
+  for (int n = 0; form_.question() != row && n < settingsCount; ++n)
+    form_.input(ugly::QuestionSheet::Key::NextQuestion);
+  if (previousSheet != form_.sheet()) ++formSurface_;
+  activeNav().selected = row + 1;
+}
+
+void SettingsActivity::bindForm() {
+  ++formSurface_;
+  ugly::QuestionSheet::View view;
+  view.context = this;
+  view.count = settingsCount;
+  view.subject = tabLabel(selectedCategoryIndex);
+  view.date = ReadingStatsStore::currentDay();
+  view.code = selectedCategoryIndex + 1;
+  view.row = formRow;
+  view.label = formLabel;
+  form_.bind(renderer, view, mappedInput.hasTouch());
+  focusForm(std::clamp(ringPos() - 1, 0, std::max(0, settingsCount - 1)));
+  formPaintReady_.store(false);
+}
+
+void SettingsActivity::prepareFormQuip(const int row, const int candidate) {
+  if (!currentSettings || row < 0 || row >= settingsCount) return;
+  const auto& setting = (*currentSettings)[row];
+  const int value = formValue(setting, std::max(0, candidate));
+  auto line = ugly::quip(ugly::Quip::SetValue, ugly::valueKey(setting, value), 0, value);
+  RenderLock lock(*this);
+  form_.setQuip(row, std::move(line));
+}
+
+void SettingsActivity::applyFormIntent(const ugly::QuestionSheet::Intent& intent) {
+  using Intent = ugly::QuestionSheet::IntentKind;
+  if (intent.kind == Intent::Back) {
+    formCount_ = 0;
+    if (!saveSettings(false)) { requestUpdate(); return; }
+    if (fromHomeGroup) finish();
+    else onGoHome();
+    return;
+  }
+  if (intent.row >= 0 && currentSettings && intent.row < settingsCount &&
+      intent.id == formRow(this, intent.row).id) {
+    if (intent.kind == Intent::Commit) {
+      const int previous = formRow(this, intent.row).selected;
+      if (applySettingValue(intent.row, formValue((*currentSettings)[intent.row], intent.candidate))) {
+        RenderLock lock(*this);
+        // RAM is authoritative for the pencil mark; saveFailed separately
+        // reports persistence failure and Back stays here until retry succeeds.
+        form_.didCommit(intent.row, previous);
+      }
+    } else if (intent.kind == Intent::Activate) {
+      formCount_ = 0;
+      toggleCurrentSetting();
+      // A failed service allocation leaves this same form available.
+      formPaintReady_.store(true);
+      return;
+    }
+    if (intent.repaint) prepareFormQuip(intent.row, intent.candidate);
+  }
+  if (intent.repaint) requestUpdate();
+}
+
+void SettingsActivity::queueForm(FormEvent event) {
+  if (event.type == FormEvent::Type::Tap || event.type == FormEvent::Type::Hold || event.type == FormEvent::Type::Strike)
+    event.surface = formVisibleSurface_.load();
+  if (formCount_ < formQueue_.size()) formQueue_[(formHead_ + formCount_++) % formQueue_.size()] = event;
+  else LOG_ERR("UGLY", "Settings form queue full");
+}
+
+void SettingsActivity::pollTilt() {
+  if (!shell::isUgly()) {
+    UiTabListActivity::pollTilt();
+    return;
+  }
+  menutilt::pollTabs(static_cast<uint8_t>(renderer.getOrientation()), false);
+  const auto tilt = menutilt::pollRows(settingsCount > 0);
+  using Key = ugly::QuestionSheet::Key;
+  if (tilt.previous) queueForm({FormEvent::Type::Key, Key::PreviousQuestion});
+  else if (tilt.next) queueForm({FormEvent::Type::Key, Key::NextQuestion});
+}
+
 bool SettingsActivity::handleCustomInput() {
-  return optionPopup.handleInput(mappedInput, [this] { requestUpdate(); });
+  if (!shell::isUgly()) return optionPopup.handleInput(mappedInput, [this] { requestUpdate(); });
+  using Button = MappedInputManager::Button;
+  using Key = ugly::QuestionSheet::Key;
+  const auto key = [this](Key value) { queueForm({FormEvent::Type::Key, value}); };
+  if (mappedInput.wasLongPressed(Button::Left, 700)) key(Key::PreviousSheet);
+  else if (mappedInput.wasReleased(Button::Left)) key(Key::PreviousQuestion);
+  if (mappedInput.wasLongPressed(Button::Right, 700)) key(Key::NextSheet);
+  else if (mappedInput.wasReleased(Button::Right)) key(Key::NextQuestion);
+  if (mappedInput.wasReleased(Button::Up)) key(Key::PreviousOption);
+  if (mappedInput.wasReleased(Button::Down)) key(Key::NextOption);
+  if (mappedInput.wasLongPressed(Button::Confirm, 700)) queueForm({FormEvent::Type::Pin});
+  else if (mappedInput.wasReleased(Button::Confirm)) key(Key::Confirm);
+  const bool back = mappedInput.wasReleased(Button::Back);
+  const bool home = mappedInput.wasHomeGesture();
+  if (back) key(Key::Back);
+  if (home) key(Key::Home);
+  int x = 0, y = 0;
+  if (mappedInput.wasScreenLongPress(x, y)) queueForm({FormEvent::Type::Hold, Key::Confirm, static_cast<int16_t>(x), static_cast<int16_t>(y)});
+  else if (mappedInput.wasScreenTapped(x, y)) queueForm({FormEvent::Type::Tap, Key::Confirm, static_cast<int16_t>(x), static_cast<int16_t>(y)});
+#if FREEINK_DEVICE_X4PRO
+  int16_t sx = 0, sy = 0;
+  if (mappedInput.wasStrike(sx, sy)) queueForm({FormEvent::Type::Strike, Key::Confirm, sx, sy});  // back to its default
+#endif
+  const auto swipe = mappedInput.wasSwipe();
+  if (!back && !home) {
+    if (swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Up) key(Key::NextSheet);
+    else if (swipe == MappedInputManager::SwipeDir::Right || swipe == MappedInputManager::SwipeDir::Down) key(Key::PreviousSheet);
+  }
+  if (!formCount_ || !formPaintReady_.load()) return true;
+  ugly::QuestionSheet::Intent intent;
+  int pinRow = -1, strikeRow = -1;
+  {
+    RenderLock lock(RenderLock::TryTake{});
+    if (!lock.acquired() || !formPaintReady_.load()) return true;
+    const auto event = formQueue_[formHead_];
+    formHead_ = static_cast<uint8_t>((formHead_ + 1) % formQueue_.size());
+    --formCount_;
+    // A finger event belongs to the surface that was visible when sampled.
+    // A tap queued before a paper opened cannot choose a row on that paper.
+    if ((event.type == FormEvent::Type::Tap || event.type == FormEvent::Type::Hold || event.type == FormEvent::Type::Strike) &&
+        event.surface != formSurface_)
+      return true;
+    const bool paperWasOpen = form_.paperOpen();
+    const int previousSheet = form_.sheet();
+    const int previousPaperFirst = form_.paperFirst();
+    if (event.type == FormEvent::Type::Key) intent = form_.input(event.key);
+    else if (event.type == FormEvent::Type::Tap) intent = form_.tap(event.x, event.y);
+    else if (event.type == FormEvent::Type::Strike) strikeRow = form_.paperOpen() ? -1 : form_.questionAt(event.x, event.y);
+    else if (!form_.paperOpen()) pinRow = event.type == FormEvent::Type::Hold ? form_.questionAt(event.x, event.y) : form_.question();
+    if (paperWasOpen != form_.paperOpen() || previousSheet != form_.sheet() ||
+        (form_.paperOpen() && previousPaperFirst != form_.paperFirst())) ++formSurface_;
+    activeNav().selected = form_.question() + 1;
+    if (intent.repaint || pinRow >= 0 || strikeRow >= 0) formPaintReady_.store(false);
+  }
+  if (strikeRow >= 0) {
+    const auto valuePtr = (*currentSettings)[strikeRow].valuePtr;
+    const int previous = formRow(this, strikeRow).selected;
+    if (valuePtr && applySettingValue(strikeRow, CrossPointSettings::defaultOf(valuePtr))) {
+      RenderLock lock(*this);
+      form_.didCommit(strikeRow, previous);
+    }
+    requestUpdate();
+  } else if (pinRow >= 0 && !favoriteKey(pinRow).empty()) {
+    const bool wasPinned = rowIsPinned(pinRow);
+    formPinFailed_.store(!toggleFavorite(pinRow));
+    auto line = ugly::quip(wasPinned ? ugly::Quip::Unpin : ugly::Quip::Pin);
+    { RenderLock lock(*this); form_.setQuip(pinRow, std::move(line)); }
+    requestUpdate();
+  } else {
+    // An inert hold must leave the input-to-paint handshake open.
+    if (pinRow >= 0) formPaintReady_.store(true);
+    applyFormIntent(intent);
+  }
+  return true;
 }
 
 void SettingsActivity::stepTab(const int direction) {
@@ -336,7 +639,7 @@ void SettingsActivity::stepTab(const int direction) {
 
 void SettingsActivity::dapXuongNhom() {
   auto& n = activeNav();
-  n.selected = settingsCount <= 0 ? 0 : std::clamp(n.selected, mappedInput.hasTouch() ? 0 : 1, settingsCount);
+  n.selected = settingsCount <= 0 ? 0 : std::clamp(n.selected.load(), mappedInput.hasTouch() ? 0 : 1, settingsCount);
   n.followOnBuild = true;
 }
 
@@ -363,11 +666,11 @@ void SettingsActivity::navigateButtons() {
   tabNavigator.onRelease({MappedInputManager::Button::Up}, [this] { queueNavIntent(NavIntent::TabPrev); });
 }
 
-bool SettingsActivity::saveSettings() {
+bool SettingsActivity::saveSettings(const bool repaint) {
   const bool saved = SETTINGS.saveToFile();
   saveFailed.store(!saved);
   if (!saved) LOG_ERR("SETTINGS", "Saving settings failed");
-  requestUpdate();
+  if (repaint) requestUpdate();
   return saved;
 }
 
@@ -393,103 +696,100 @@ bool SettingsActivity::handleButtons() {
   return false;
 }
 
-void SettingsActivity::toggleCurrentSetting() {
-  int selectedSetting = ringPos() - 1;
-  if (selectedSetting < 0 || selectedSetting >= settingsCount) {
-    return;
+bool SettingsActivity::applySettingValue(const int row, const uint8_t value, const bool shellConfirmed) {
+  if (!currentSettings || row < 0 || row >= settingsCount) return false;
+  const auto& setting = (*currentSettings)[row];
+  const auto valuePtr = setting.valuePtr;
+  if (!valuePtr && !(setting.valueGetter && setting.valueSetter)) return false;
+  if (setting.type == SettingType::TOGGLE && value > 1) return false;
+  if (setting.type == SettingType::ENUM) {
+    const size_t count = setting.enumStringValues.empty() ? setting.enumLabels().size() : setting.enumStringValues.size();
+    if (value >= count) return false;
+  } else if (setting.type == SettingType::VALUE) {
+    const auto range = setting.valueRange;
+    if (!range.step || value < range.min || value > range.max || (value - range.min) % range.step) return false;
+  } else if (setting.type != SettingType::TOGGLE) {
+    return false;
   }
+  const uint8_t current = valuePtr ? SETTINGS.*valuePtr : setting.valueGetter();
+  if (current == value) return true;
+  if (valuePtr == &CrossPointSettings::uiShell && !shellConfirmed) {
+    const bool toCross = value == static_cast<uint8_t>(shell::Kind::Cross);
+    startActivityForResult(ugly::makeSwitchConfirm(renderer, mappedInput, toCross), [this, row, value](const ActivityResult& result) {
+      if (!result.isCancelled) applySettingValue(row, value, true);
+      else {
+        if (shell::isUgly()) prepareFormQuip(row, formRow(this, row).selected);
+        requestUpdate();
+      }
+    });
+    return false;
+  }
+  if (valuePtr == &CrossPointSettings::uiTextSize) {
+    if (!applyUiSettingChange(valuePtr, value)) {
+      if (!shell::isUgly()) requestUpdate();
+      return false;
+    }
+  } else {
+    RenderLock lock(*this);
+    if (valuePtr) SETTINGS.*valuePtr = value;
+    else setting.valueSetter(value);
+    syncQuickResumeTimeoutForSleepScreen(valuePtr == &CrossPointSettings::sleepScreen,
+                                        valuePtr == &CrossPointSettings::quickResumeSleepScreen);
+  }
+  if (valuePtr != &CrossPointSettings::uiTextSize && !applyUiSettingChange(valuePtr, current)) {
+    if (!shell::isUgly()) requestUpdate();
+    return false;
+  }
+  if (valuePtr != &CrossPointSettings::uiShell) saveSettings(!shell::isUgly());
+  noteValue(setting.nameId);
+  // Ordinary value commits keep the form's previous pencil marks. Only a
+  // structural shell change rebuilds the catalog; UI size changes geometry.
+  if (!shell::isUgly() || valuePtr == &CrossPointSettings::uiShell) rebuildSettingsLists();
+  else if (valuePtr == &CrossPointSettings::uiTextSize || valuePtr == &CrossPointSettings::uiUglyLevel) {
+    RenderLock lock(*this);
+    bindForm();
+  }
+  if (valuePtr == &CrossPointSettings::uiShell) shell::changed();
+  return true;
+}
 
-  const auto& setting = (*currentSettings)[selectedSetting];
-  const auto changedValuePtr = setting.valuePtr;
-  bool uiTextSizeApplied = false;
-  const bool sleepScreenChanged = setting.valuePtr == &CrossPointSettings::sleepScreen;
-  const bool quickResumeTimeoutChanged = setting.valuePtr == &CrossPointSettings::quickResumeSleepScreen;
-
+void SettingsActivity::toggleCurrentSetting() {
+  mappedInput.resetHomeButtonInput();
+  const int row = ringPos() - 1;
+  if (!currentSettings || row < 0 || row >= settingsCount) return;
+  const auto& setting = (*currentSettings)[row];
   if (setting.nameId == StrId::STR_TIME_TO_SLEEP) {
     openSleepTimeoutPicker();
     return;
   }
-
-  if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
-    // Toggle the boolean value using the member pointer
-    const bool currentValue = SETTINGS.*(setting.valuePtr);
-    SETTINGS.*(setting.valuePtr) = !currentValue;
-  } else if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
-    const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
-    if (settingstabs::moTrinhChon(static_cast<int>(setting.enumValues.size()))) {
-      const auto valuePtr = setting.valuePtr;
-      optionPopup.show(setting.nameId, setting.enumValues.data(), static_cast<int>(setting.enumValues.size()),
-                       currentValue,
-                       [this, valuePtr, currentValue, sleepScreenChanged, quickResumeTimeoutChanged](int idx) {
-                         if (valuePtr == &CrossPointSettings::uiTextSize) {
-                           if (!applyUiSettingChange(valuePtr, static_cast<uint8_t>(idx))) {
-                             requestUpdate();
-                             return;
-                           }
-                         } else {
-                           SETTINGS.*valuePtr = idx;
-                         }
-                         syncQuickResumeTimeoutForSleepScreen(sleepScreenChanged, quickResumeTimeoutChanged);
-                         if (valuePtr != &CrossPointSettings::uiTextSize &&
-                             !applyUiSettingChange(valuePtr, currentValue)) {
-                           requestUpdate();
-                           return;
-                         }
-                         saveSettings();
-                         rebuildSettingsLists();
-                       });
-      requestUpdate();
-      return;
-    }
-    const uint8_t newValue = (currentValue + 1) % static_cast<uint8_t>(setting.enumValues.size());
-    if (setting.valuePtr == &CrossPointSettings::uiTextSize) {
-      if (!applyUiSettingChange(setting.valuePtr, newValue)) {
-        requestUpdate();
-        return;
-      }
-      uiTextSizeApplied = true;
-    } else {
-      SETTINGS.*(setting.valuePtr) = newValue;
-    }
-  } else if (setting.type == SettingType::ENUM && setting.valueGetter && setting.valueSetter) {
-    const uint8_t totalValues = setting.enumStringValues.empty()
-                                    ? static_cast<uint8_t>(setting.enumValues.size())
-                                    : static_cast<uint8_t>(setting.enumStringValues.size());
-    const uint8_t cur = setting.valueGetter();
-    if (settingstabs::moTrinhChon(totalValues)) {
-      const auto valueSetter = setting.valueSetter;
-      auto onSelect = [this, valueSetter, sleepScreenChanged, quickResumeTimeoutChanged](int idx) {
-        valueSetter(idx);
-        syncQuickResumeTimeoutForSleepScreen(sleepScreenChanged, quickResumeTimeoutChanged);
-        saveSettings();
-        rebuildSettingsLists();
-      };
-      if (!setting.enumStringValues.empty()) {
-        optionPopup.show(setting.nameId, setting.enumStringValues, cur, std::move(onSelect));
-      } else {
-        optionPopup.show(setting.nameId, setting.enumValues.data(), static_cast<int>(setting.enumValues.size()), cur,
-                         std::move(onSelect));
-      }
-      requestUpdate();
-      return;
-    }
-    setting.valueSetter((cur + 1) % totalValues);
-  } else if (setting.type == SettingType::VALUE && setting.valuePtr != nullptr) {
-    const int8_t currentValue = SETTINGS.*(setting.valuePtr);
-    if (currentValue + setting.valueRange.step > setting.valueRange.max) {
-      SETTINGS.*(setting.valuePtr) = setting.valueRange.min;
-    } else {
-      SETTINGS.*(setting.valuePtr) = currentValue + setting.valueRange.step;
-    }
-  } else if (setting.type == SettingType::ACTION) {
+  if (setting.type == SettingType::ACTION) {
     auto resultHandler = [this](const ActivityResult&) { saveSettings(); };
 
     switch (setting.action) {
+      case SettingAction::HomeButton: {
+        // The row only exists with a home key; a build without one leaves this screen out.
+        if (!BoardConfig::hasHomeKey()) return;
+        // Activities must outlive this call and are owned by the activity stack.
+        auto activity = makeUniqueNoThrow<HomeButtonSettingsActivity>(renderer, mappedInput);
+        if (!activity) {
+          LOG_ERR("SET", "OOM: Home button settings");
+          return;
+        }
+        startActivityForResult(std::move(activity), [this](const ActivityResult&) { requestUpdate(); });
+        return;
+      }
       case SettingAction::RemapFrontButtons:
         startActivityForResult(std::make_unique<ButtonRemapActivity>(renderer, mappedInput), resultHandler);
         break;
       case SettingAction::CustomiseStatusBar:
-        startActivityForResult(std::make_unique<StatusBarSettingsActivity>(renderer, mappedInput), resultHandler);
+        startActivityForResult(std::make_unique<StatusBarSettingsActivity>(renderer, mappedInput), [this](const ActivityResult&) { requestUpdate(); });
+        break;
+      case SettingAction::ClockSettings:
+        if (auto activity = makeUniqueNoThrow<ClockSettingsActivity>(renderer, mappedInput)) {
+          startActivityForResult(std::move(activity), resultHandler);
+        } else {
+          LOG_ERR("SETTINGS", "OOM: ClockSettingsActivity");
+        }
         break;
       case SettingAction::KOReaderSync:
         startActivityForResult(std::make_unique<KOReaderSettingsActivity>(renderer, mappedInput), resultHandler);
@@ -519,9 +819,28 @@ void SettingsActivity::toggleCurrentSetting() {
                                  requestUpdate();
                                });
         break;
-      case SettingAction::Network:
-        startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, false), resultHandler);
+      case SettingAction::Network: {
+        auto activity = makeUniqueNoThrow<WifiSelectionActivity>(renderer, mappedInput, false);
+        if (!activity) {
+          LOG_ERR("SETTINGS", "OOM: WifiSelectionActivity");
+          return;
+        }
+        startActivityForResult(std::move(activity), [](const ActivityResult&) {
+          SETTINGS.saveToFile();
+          // Every other WiFi consumer hands the radio to a session it owns;
+          // these rows only save credentials, so nothing here would ever
+          // release the driver's heap. The scan alone brings it up, so tear
+          // down whether or not the user joined a network.
+          if (WiFi.getMode() == WIFI_MODE_NULL) return;
+          WiFi.disconnect(false);
+          delay(30);
+          // Unlike the onExit() teardowns, this runs from the loop task with
+          // no lock held; the restart popup paints straight to the panel.
+          RenderLock lock;
+          silentRestartToSettings();
+        });
         break;
+      }
       case SettingAction::ClearCache:
         startActivityForResult(std::make_unique<ClearCacheActivity>(renderer, mappedInput), resultHandler);
         break;
@@ -547,6 +866,25 @@ void SettingsActivity::toggleCurrentSetting() {
                                });
         break;
       case SettingAction::Language:
+        if (tenorchrome::kTouchShell) {
+          std::vector<std::string> labels;
+          int selected = 0;
+          for (int index = 0; index < getLanguageCount(); ++index) {
+            const auto language = static_cast<Language>(SORTED_LANGUAGE_INDICES[index]);
+            labels.emplace_back(I18N.getLanguageName(language));
+            if (language == I18N.getLanguage()) selected = index;
+          }
+          showSettingsChoices(optionPopup, StrId::STR_LANGUAGE, labels, selected, row, [this](const int selected) {
+            {
+              RenderLock lock(*this);
+              I18N.setLanguage(static_cast<Language>(SORTED_LANGUAGE_INDICES[selected]));
+              SETTINGS.language = SORTED_LANGUAGE_INDICES[selected];
+            }
+            saveSettings();
+            rebuildSettingsLists();
+          });
+          break;
+        }
         // Row labels are translated once in rebuildRowItems() and don't
         // re-run on Pop (see ActivityManager::loop()), so a language switch
         // needs an explicit rebuild here rather than the generic resultHandler.
@@ -563,25 +901,63 @@ void SettingsActivity::toggleCurrentSetting() {
           LOG_ERR("SETTINGS", "OOM: KeyboardLayoutsActivity");
         }
         break;
-      case SettingAction::Clock:
-        startActivityForResult(std::make_unique<DongHoSettingsActivity>(renderer, mappedInput), resultHandler);
+      case SettingAction::About:
+        if (auto activity = makeUniqueNoThrow<AboutActivity>(renderer, mappedInput)) {
+          startActivityForResult(std::move(activity), nullptr);
+        } else {
+          LOG_ERR("SETTINGS", "OOM: AboutActivity");
+        }
         break;
       case SettingAction::None:
         // Do nothing
         break;
     }
-    return;  // Results will be handled in the result handler, so we can return early here
-  } else {
     return;
   }
+  const uint8_t current = setting.valuePtr ? SETTINGS.*setting.valuePtr : setting.valueGetter ? setting.valueGetter() : 0;
+  if (setting.type == SettingType::TOGGLE) {
+    applySettingValue(row, !current);
+  } else if (setting.type == SettingType::ENUM) {
+    const int count = static_cast<int>(setting.enumStringValues.empty() ? setting.enumLabels().size() : setting.enumStringValues.size());
+    if (count <= 0) return;
+    const auto style = settingsChoiceStyle(setting, tenorchrome::kTouchShell);
+    if (style == SettingsChoiceStyle::Popup || style == SettingsChoiceStyle::Page) {
+      auto onSelect = [this, row](const int index) { applySettingValue(row, static_cast<uint8_t>(index)); };
+      if (!setting.enumStringValues.empty()) {
+        showSettingsChoices(optionPopup, setting.nameId, setting.enumStringValues, current, row, std::move(onSelect));
+      } else {
+        const auto labels = setting.enumLabels();
+        showSettingsChoices(optionPopup, setting.nameId, labels.data(), count, current, row, std::move(onSelect));
+      }
+      requestUpdate();
+    } else {
+      applySettingValue(row, static_cast<uint8_t>((current + 1) % count));
+    }
+  } else if (setting.type == SettingType::VALUE && setting.valuePtr) {
+    const auto range = setting.valueRange;
+    applySettingValue(row, current + range.step > range.max ? range.min : current + range.step);
+  }
+}
 
-  syncQuickResumeTimeoutForSleepScreen(sleepScreenChanged, quickResumeTimeoutChanged);
-  if (!uiTextSizeApplied && !applyUiSettingChange(changedValuePtr, 0)) {
-    requestUpdate();
-    return;
-  }
-  saveSettings();
-  rebuildSettingsLists();
+void SettingsActivity::noteValue(const StrId name) {
+  for (const auto& row : *currentSettings)
+    if (row.nameId == name) return shell::valueChanged(row);
+}
+
+SettingsChoiceStyle SettingsActivity::rowChoiceStyle(const int row) const {
+  if (!currentSettings || row < 0 || row >= settingsCount) return SettingsChoiceStyle::None;
+  const auto& setting = (*currentSettings)[row];
+  if (setting.action == SettingAction::Language) return settingsChoiceStyle(getLanguageCount(), tenorchrome::kTouchShell);
+  return settingsChoiceStyle(setting, tenorchrome::kTouchShell);
+}
+
+int SettingsActivity::settingsChoiceCount(const int row) const {
+  if (!currentSettings || row < 0 || row >= settingsCount) return 0;
+  const auto& setting = (*currentSettings)[row];
+  if (setting.action == SettingAction::Language) return getLanguageCount();
+  if (setting.type == SettingType::TOGGLE) return 2;
+  if (setting.type != SettingType::ENUM) return 0;
+  return static_cast<int>(setting.enumStringValues.empty() ? setting.enumLabels().size() : setting.enumStringValues.size());
 }
 
 void SettingsActivity::syncQuickResumeTimeoutForSleepScreen(bool sleepScreenChanged, bool quickResumeTimeoutChanged) {
@@ -615,14 +991,20 @@ void SettingsActivity::openSleepTimeoutPicker() {
           StrId::STR_SLEEP_TIMER_VALUE_FORMAT, false, StrId::STR_SLEEP_NEVER),
       [this](const ActivityResult& result) {
         if (!result.isCancelled) {
-          SETTINGS.sleepTimeoutMinutes = static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
-          saveSettings();
+          for (int row = 0; row < settingsCount; ++row)
+            if ((*currentSettings)[row].nameId == StrId::STR_TIME_TO_SLEEP) {
+              applySettingValue(row, static_cast<uint8_t>(std::get<IntervalResult>(result.data).value));
+              break;
+            }
         }
         requestUpdate();
       });
 }
 
 std::string SettingsActivity::settingValueText(const SettingInfo& setting) {
+  if (setting.action == SettingAction::Language && tenorchrome::kTouchShell)
+    return I18N.getLanguageName(I18N.getLanguage());
+  if (setting.action == SettingAction::HomeButton) return tr(STR_CONFIGURE);
   if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
     if (setting.valuePtr == &CrossPointSettings::keyboardAxisSwapped) {
       return SETTINGS.keyboardAxisSwapped ? tr(STR_KEYBOARD_MOVE_VERTICAL) : tr(STR_KEYBOARD_MOVE_HORIZONTAL);
@@ -633,16 +1015,21 @@ std::string SettingsActivity::settingValueText(const SettingInfo& setting) {
     // Guard like the valueGetter branch below: a corrupt/migrated settings
     // byte must not index past the enum table.
     const uint8_t value = SETTINGS.*(setting.valuePtr);
-    if (value >= setting.enumValues.size()) return "";
-    return I18N.get(setting.enumValues[value]);
+    const auto enumLabels = setting.enumLabels();
+    if (value >= enumLabels.size()) return "";
+    if (setting.valuePtr == &CrossPointSettings::readerInkWeight && sdFontSystem.needsNotoPack()) {
+      return std::string(I18N.get(enumLabels[value])) + " (" + tr(STR_DOWNLOAD) + " Noto)";
+    }
+    return I18N.get(enumLabels[value]);
   }
   if (setting.type == SettingType::ENUM && setting.valueGetter) {
     const uint8_t value = setting.valueGetter();
     if (!setting.enumStringValues.empty() && value < setting.enumStringValues.size()) {
       return setting.enumStringValues[value];
     }
-    if (value < setting.enumValues.size()) {
-      return I18N.get(setting.enumValues[value]);
+    const auto enumLabels = setting.enumLabels();
+    if (value < enumLabels.size()) {
+      return I18N.get(enumLabels[value]);
     }
     return "";
   }
@@ -665,13 +1052,20 @@ std::string SettingsActivity::settingValueText(const SettingInfo& setting) {
 void SettingsActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   // Content below the GUI.drawHeader band, above the button hints.
-  screen.setContentMarginFromScreen(fui::Insets{
-      static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
-      static_cast<int16_t>(metrics.buttonHintsHeight), 0});
+  if (x3settings::beginScreen(screen, renderer,
+                             UiListActivity::favoriteHintText() == tr(STR_MENU_SAVE_FAILED) ? nullptr : favoriteHintText(),
+                             saveFailed.load() ? tr(STR_HABIT_SAVE_FAILED) : nullptr,
+                             favoriteSaveFailed ? tr(STR_MENU_SAVE_FAILED) : nullptr)) {
+    tabBandDrawn = true;
+  } else {
+    screen.setContentMarginFromScreen(fui::Insets{
+        static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
+        static_cast<int16_t>(metrics.buttonHintsHeight), 0});
 
-  // Cac nhom da hien mot lan o man chinh, hien lai lan nua
-  // la trung (T1). Ten nhom di len dau man, hai mui tien dac hai mep bao nut canh nhay nhom.
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+    // Cac nhom da hien mot lan o man chinh, hien lai lan nua
+    // la trung (T1). Ten nhom di len dau man, hai mui tien dac hai mep bao nut canh nhay nhom.
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   // rowItems_ (label/actionValue) was built by rebuildRowItems() when the
   // category was last selected/rebuilt; only the live value text needs
@@ -682,6 +1076,12 @@ void SettingsActivity::buildScreen(UiScreen& screen) {
   for (size_t i = 0; i < settings.size(); i++) {
     rowValues_[i] = settingValueText(settings[i]);
     rowItems_[i].value = rowValues_[i].empty() ? nullptr : rowValues_[i].c_str();
+    rowItems_[i].toggle = rowChoiceStyle(i) == SettingsChoiceStyle::Inline;
+    const auto& setting = settings[i];
+    const uint8_t current = setting.valuePtr ? SETTINGS.*setting.valuePtr : setting.valueGetter ? setting.valueGetter() : 0;
+    const auto labels = setting.enumLabels();
+    rowItems_[i].toggleChecked = rowItems_[i].toggle &&
+        (setting.type == SettingType::ENUM && current < labels.size() ? labels[current] == StrId::STR_STATE_ON : current != 0);
   }
 
   fui::ListProps props;
@@ -689,14 +1089,14 @@ void SettingsActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(rowItems_.size());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
+  if (tenorchrome::kTouchShell) props.inputMask |= fui::InputLongPress;  // hold a row: its menu (Pin)
   props.valueInset = 8;               // air between the value and the row edge
-  // Titles match the value's font size (smallText) so both sides of a row
-  // read as one unit; labels that still don't fit wrap onto a second line.
-  // maxLines=2 also marks the style explicitly set (an all-default smallText
-  // fails textStyleUnset and the list would substitute bodyText back); the
-  // common fits-on-one-line case takes the renderer's fast path anyway.
   props.labelText = uiMenuLabelText(screen.theme());
-  props.labelText.maxLines = 2;
+  props.labelText.maxLines = 2;  // a label that does not fit goes to a second line, as on the X4 Pro
+  props.balanceWrappedLabelWithValue = !tenorchrome::x3ScreenLayoutEnabled();
+  // A row's note (the limited edition under Interface) wraps too, so no settings row cuts its words.
+  props.subtitleText = screen.theme().smallText;
+  props.subtitleText.maxLines = 2;
   syncTabListViewport(screen, props);
   screen.list(props);
 }
@@ -738,7 +1138,7 @@ bool SettingsActivity::selectSettingsSibling(const int direction) {
       case SettingAction::TextSettings:
       case SettingAction::Language:
       case SettingAction::KeyboardLayouts:
-      case SettingAction::Clock:
+      case SettingAction::ClockSettings:
         return true;
       default:
         return false;
@@ -768,23 +1168,50 @@ bool SettingsActivity::openPendingSettingsSibling() {
   return true;
 }
 
+tenorchrome::X3PathIcon SettingsActivity::navigationIcon() const {
+  using tenorchrome::X3PathIcon;
+  static constexpr X3PathIcon icons[] = {
+      X3PathIcon::Display, X3PathIcon::Reading, X3PathIcon::Controls, X3PathIcon::System,
+      X3PathIcon::Device, X3PathIcon::Keyboard, X3PathIcon::More, X3PathIcon::Sleep, X3PathIcon::Motion};
+  static_assert(std::size(icons) == settingstabs::TAB_COUNT);
+  return icons[activeTab()];
+}
+
 void SettingsActivity::render(RenderLock&&) {
+  if (shell::isUgly()) {
+    [[maybe_unused]] const uint32_t started = millis();
+    form_.paint(renderer, mappedInput);
+    if (saveFailed.load()) GUI.drawPopup(renderer, tr(STR_HABIT_SAVE_FAILED));
+    else if (formPinFailed_.load()) GUI.drawPopup(renderer, tr(STR_MENU_SAVE_FAILED));
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    formVisibleSurface_.store(formSurface_);
+    formPaintReady_.store(true);
+#ifdef UGLY_FRAME_LOG
+    LOG_INF("UGLY", "Settings form total=%lums tab=%d rows=%d sheet=%d/%d question=%d candidate=%d paper=%d",
+            static_cast<unsigned long>(millis() - started), selectedCategoryIndex, settingsCount, form_.sheet() + 1,
+            form_.sheetCount(), form_.question(), form_.candidate(), form_.paperOpen());
+#endif
+    return;
+  }
   if (optionPopup.processRender(renderer, mappedInput)) return;
+  if (rowMenu.processRender(renderer, mappedInput)) return;
 
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto& metrics = UITheme::getInstance().getMetrics();
-
-  // Header via GUI.drawHeader (already FreeInkUI-themed) for the battery
-  // indicator; the rest of the screen renders through the app.
-  // Version rides in the header's trailing label slot: the footer position
-  // conflicts with button hints on non-touch devices.
+  // Tenor tab chrome: settled-list debounce, nav header, sibling-tab arrows.
   renderSettledList(activeNav(), [&] {
     renderer.clearScreen();
-    drawNavigationHeader(tabLabel(activeTab()));
+    if (tenorchrome::x3ScreenLayoutEnabled()) {
+      static const freeink::Icon* const icons[] = {
+          &icon_tenor_settings_hien_thi_b_40, &icon_tenor_reader_reading_40, &icon_tenor_settings_dieu_khien_40,
+          &icon_tenor_settings_he_thong_b_40, &icon_tenor_settings_thiet_bi_40, &icon_tenor_settings_ban_phim_40,
+          &icon_reader_tab_more_40, &icon_tenor_settings_trang_khuyet_40, &icon_tenor_settings_cu_chi_40};
+      static_assert(std::size(icons) == settingstabs::TAB_COUNT);
+      x3settings::drawPath(renderer, tabLabel(activeTab()), *icons[activeTab()]);
+    } else drawNavigationHeader(tabLabel(activeTab()));
     renderUi();
   });
 
-  if (tenorchrome::enabled() && tabCount() > 1) {
+  // Touch: no sibling line, the only way back is "<" in the bar at the foot.
+  if (tenorchrome::enabled() && !tenorchrome::kTouchShell && !tenorchrome::x3ScreenLayoutEnabled() && tabCount() > 1) {
     tenorchrome::drawSiblingDestinations(renderer, tabLabel(adjacentTab(-1)), tabLabel(adjacentTab(1)));
   }
 
@@ -800,7 +1227,15 @@ void SettingsActivity::render(RenderLock&&) {
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
-  if (saveFailed.load()) GUI.drawPopup(renderer, tr(STR_HABIT_SAVE_FAILED));
+  if (saveFailed.load()) {
+    if (tenorchrome::x3ScreenLayoutEnabled())
+      tenorchrome::drawInfoInRect(renderer, tr(STR_HABIT_SAVE_FAILED),
+                                  x3settings::infoRect(renderer, tr(STR_HABIT_SAVE_FAILED),
+                                                       UiListActivity::favoriteHintText() == tr(STR_MENU_SAVE_FAILED)
+                                                           ? nullptr : favoriteHintText(),
+                                                       favoriteSaveFailed ? tr(STR_MENU_SAVE_FAILED) : nullptr));
+    else GUI.drawPopup(renderer, tr(STR_HABIT_SAVE_FAILED));
+  }
 
   // Always use standard refresh for settings screen
   renderer.displayBuffer();
@@ -812,16 +1247,14 @@ std::string SettingsActivity::favoriteKey(const int row) const {
   if (item.key) return std::string("settings/") + item.key;
   // Tenor keeps the old action/2 pin pointing at the battery and clock corners
   // (focusFavorite below), so this row cannot be pinned there under that key.
-  if (item.action == SettingAction::CustomiseStatusBar && SETTINGS.uiTheme == CrossPointSettings::TENOR_UI)
+  if (item.action == SettingAction::CustomiseStatusBar)
     return {};
   if (item.action != SettingAction::None) return "action/" + std::to_string(static_cast<int>(item.action));
   return {};
 }
 int SettingsActivity::focusFavorite(const std::string& key) {
   // Existing action pins keep their key after the Tenor-only child is removed.
-  const std::string target = SETTINGS.uiTheme == CrossPointSettings::TENOR_UI && key == "action/2"
-                                 ? "settings/statusBarClock"
-                                 : key;
+  const std::string target = key == "action/2" ? "settings/statusBarClock" : key;
   for (int tab = 0; tab < categoryCount; ++tab) {
     const auto& items = danhSachCuaThe(static_cast<settingstabs::Tab>(tab));
     for (size_t row = 0; row < items.size(); ++row) {
@@ -834,6 +1267,7 @@ int SettingsActivity::focusFavorite(const std::string& key) {
         RenderLock lock(*this);
         activeNav().selected = row + 1;
         activeNav().followOnBuild = true;
+        if (shell::isUgly()) focusForm(static_cast<int>(row));
       }
       return static_cast<int>(row);
     }

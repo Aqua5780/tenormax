@@ -5,7 +5,6 @@
 struct GfxRenderer {};
 
 struct CrossPointSettings {
-  uint8_t uiTheme = 0;
   uint8_t uiTextSize = 0;
   uint8_t other = 0;
 } SETTINGS;
@@ -58,6 +57,7 @@ struct SettingsActivity {
   AtomicFlag saveFailed;
   int resets = 0;
   void resetUi() { ++resets; }
+  static bool applyUiTextSize(GfxRenderer& renderer, uint8_t size);
   bool applyUiSettingChange(uint8_t CrossPointSettings::* valuePtr, uint8_t previousValue);
 };
 
@@ -125,17 +125,6 @@ void sizeFailureSurfacesErrorWithoutReloadingLayout() {
   CHECK(activity.resets == 0);
 }
 
-void themeKeepsExistingReloadPath() {
-  ++scenarios;
-  SettingsActivity activity;
-  resetBoundaries(activity);
-  CHECK(activity.applyUiSettingChange(&CrossPointSettings::uiTheme, 0));
-  CHECK(RenderLock::acquisitions == 0);
-  CHECK(applyCalls == 0);
-  CHECK(UITheme::reloads == 1);
-  CHECK(activity.resets == 1);
-}
-
 void unrelatedSettingDoesNothing() {
   ++scenarios;
   SettingsActivity activity;
@@ -151,7 +140,6 @@ void unrelatedSettingDoesNothing() {
 int main() {
   sizeSuccessAppliesUnderLockAndInvalidates();
   sizeFailureSurfacesErrorWithoutReloadingLayout();
-  themeKeepsExistingReloadPath();
   unrelatedSettingDoesNothing();
   std::printf("%d scenarios, %d failures\n", scenarios, failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;

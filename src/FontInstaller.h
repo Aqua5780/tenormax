@@ -20,7 +20,8 @@ class FontInstaller {
   explicit FontInstaller(SdCardFontRegistry& registry);
 
   /// Maximum family-name length in bytes, excluding the NUL terminator.
-  /// Guarantees the name still fits CrossPointSettings::sdFontFamilyName[32].
+  /// Installer limit keeps a 128-byte full path with the maximum filename.
+  /// SD card discovery can read longer family names from manually copied fonts.
   static constexpr size_t MAX_FAMILY_NAME_LEN = 31;
 
   /// Maximum .cpfont filename or relative-path length in bytes, INCLUDING
@@ -49,10 +50,42 @@ class FontInstaller {
   /// that bound.
   static bool isValidCpfontFilename(const char* name);
 
-  /// Accept a flat filename or exactly weight-1..4/<filename>. The complete
+  /// Accept a flat filename or exactly weight-1..6/<filename>. The complete
   /// relative path shares the 87-byte filename limit and 128-byte full path.
   /// Upload callers continue to use isValidCpfontFilename for flat names.
   static bool isValidCpfontRelativePath(const char* name);
+
+  /// Largest .ttf/.otf the web upload accepts. The reader streams anything above 6 MiB
+  /// from the card, so this is a policy cap that keeps one bad upload from filling it.
+  static constexpr size_t MAX_VECTOR_FONT_BYTES = 24u * 1024u * 1024u;
+
+  /// Validate a .ttf/.otf filename (case-insensitive extension). Basename: ASCII
+  /// alphanumeric, hyphen, underscore, and dots inside it, first byte a letter or digit
+  /// (the registry skips names starting with '_' or '.'), no "..". Same 87-byte bound as
+  /// .cpfont names so the full path still fits 128 bytes.
+  static bool isValidVectorFilename(const char* name);
+
+  /// First 4 bytes of a TrueType (00 01 00 00, "true") or OpenType/CFF ("OTTO") font.
+  static bool isVectorFontMagic(const uint8_t head[4]);
+
+  /// Streaming verdict for one .ttf/.otf upload: header check across any chunking and
+  /// the size cap, with no buffer beyond 4 bytes. Once a verdict fails it stays failed.
+  class VectorUploadCheck {
+   public:
+    enum class Verdict : uint8_t { OK, BAD_MAGIC, TOO_BIG };
+    Verdict feed(const uint8_t* data, size_t len);
+    /// True once the 4 header bytes were seen and accepted.
+    bool complete() const { return failed_ == Verdict::OK && have_ == 4; }
+
+   private:
+    uint8_t head_[4] = {};
+    uint8_t have_ = 0;
+    size_t total_ = 0;
+    Verdict failed_ = Verdict::OK;
+  };
+
+  /// Like buildFontPath for a flat .ttf/.otf name: "<root>/<family>/<filename>".
+  static bool buildVectorFontPath(const char* family, const char* filename, char* outBuf, size_t outBufSize);
 
   /// Ensure /<root>/<family>/ exists, where <root> is /.fonts (preferred) or /fonts.
   /// Re-uses the existing root if the family is already installed; otherwise

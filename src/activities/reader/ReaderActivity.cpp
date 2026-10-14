@@ -1,10 +1,10 @@
 #include "ReaderActivity.h"
 
 #include <FontCacheManager.h>
-
 #include <FsHelpers.h>
 #include <HalClock.h>
 #include <HalStorage.h>
+#include <HeapMark.h>
 #include <I18n.h>
 #include <Memory.h>
 
@@ -17,6 +17,7 @@
 #include "ReadingStatsStore.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
+#include "SettingsList.h"
 #include "TxtReaderActivity.h"
 #include "XtcReaderActivity.h"
 #include "components/TenorMenuChrome.h"
@@ -31,6 +32,9 @@ ReaderActivity::ReaderActivity(const char* name, GfxRenderer& renderer, MappedIn
     const int refreshFrequency = SETTINGS.getRefreshFrequency();
     pagesUntilFullRefresh = refreshFrequency > 1 ? refreshFrequency : 2;
   }
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("READER", "FIRST_PAINT fast_ok=%d pages_until_full=%d", allowFastInitialRefresh ? 1 : 0, pagesUntilFullRefresh);
+#endif
 }
 
 std::unique_ptr<ReaderActivity> ReaderActivity::create(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -60,6 +64,19 @@ void ReaderActivity::disableFastInitialRefresh() { pagesUntilFullRefresh = 0; }
 void ReaderActivity::onEnter() {
   Activity::onEnter();
 
+  // The settings catalog (~15 KB, built at boot) has no use on a page: returned here, at a transition
+  // under the render lock as its release requires. Settings save and load no longer build it
+  // (forEachBaseSetting); a settings sheet or screen builds it again while it is open. X3, 02/10/2026:
+  // +13,760 B free on reader entry, and the radio kept its start above 32,768.
+  {
+    RenderLock lock(*this);
+    releaseBaseSettingsList();
+  }
+
+  // Heap ledger for field crash reports: free vs largest block distinguishes a
+  // leak (free falls) from fragmentation (free stable, largest collapses).
+  LOG_INF("MEM", "reader enter: free=%u max_block=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+
   if (!Storage.exists(bookPath.c_str())) {
     LOG_ERR("READER", "File does not exist: %s", bookPath.c_str());
     finish();
@@ -72,6 +89,9 @@ void ReaderActivity::onEnter() {
   const unsigned long openStarted = millis();
 #endif
   sdFontSystem.ensureLoaded(renderer);
+  // The font list (~4.5 KB in about a hundred small blocks on a 31-family card) is only read by
+  // the font menus, which bring it back from the RTC memo without walking the card.
+  sdFontSystem.releaseCatalog();
   applyInitialOrientation();
 #ifdef TENOR_TURN_TRACE
   const unsigned long fontsDone = millis();
@@ -106,6 +126,9 @@ void ReaderActivity::onEnter() {
 
 void ReaderActivity::commitOpen() {
   if (!openCommitPending) return;
+  // Only a book that put a page on the panel is remembered: one that cannot be laid out (an
+  // index or build error screen) must not come back on wake or head the Recent list.
+  if (!pageRendered.load(std::memory_order_acquire)) return;
   openCommitPending = false;
 #ifdef TENOR_TURN_TRACE
   const unsigned long started = millis();
@@ -115,11 +138,17 @@ void ReaderActivity::commitOpen() {
 #ifdef TENOR_TURN_TRACE
   LOG_INF("READER", "OPEN_COMMIT ms=%lu", millis() - started);
 #endif
+  HEAP_MARK("open_commit");
 }
 
 void ReaderActivity::onExit() {
   Activity::onExit();
   commitOpen();
+  if (openCommitPending) {
+    // No page ever reached the panel: forget the book, so the state saved below does not reopen it.
+    openCommitPending = false;
+    if (APP_STATE.openEpubPath == bookPath) APP_STATE.openEpubPath.clear();
+  }
   pendingExternalTurn = 0;
 #ifdef TENOR_TURN_TRACE
   dropTurnTrace(pendingExternalTurnTrace, "exit");
@@ -148,6 +177,8 @@ void ReaderActivity::onExit() {
       activityManager.deferWrite([] { RECENT_BOOKS.saveExcerpt(); });
     }
   }
+
+  LOG_INF("MEM", "reader exit: free=%u max_block=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
   if (!preview) {
@@ -195,9 +226,9 @@ void ReaderActivity::chotSoLieuDoc() {
 }
 
 void ReaderActivity::onTick() {
-  // The first frame is on the panel: a page, or the end-of-book screen, which sets no pageReady.
-  if (openCommitPending &&
-      (pageReady.load(std::memory_order_acquire) || endOfBookOptionsReady.load(std::memory_order_acquire))) {
+  // The first page is on the panel, or the end-of-book screen (both mark pageRendered; an error
+  // screen does not, and commitOpen() waits for one of them).
+  if (openCommitPending && pageRendered.load(std::memory_order_acquire)) {
     commitOpen();
   }
   // Never stall the input loop on a paint in flight: try-take instead of
@@ -206,11 +237,40 @@ void ReaderActivity::onTick() {
   // sees two consecutive agreeing samples).
   RenderLock lock(RenderLock::TryTake{});
   if (!lock.acquired()) return;
+  // A remote linked, or the link failed, after the status bar showed the note: show it now rather
+  // than on the next turn. Asked once per change; the redraw marks what it drew.
+  if (linkNoteInTitle && bleturner::linkNote() != linkNoteDrawn && pageReady.load(std::memory_order_acquire) &&
+      readingPageVisible()) {
+    linkNoteInTitle = false;
+    redrawLinkNote();
+  }
   updateReadingTime(pageReady.load(std::memory_order_acquire) && readingPageVisible());
   if (millis() - statsSavedMs >= 30000) chotSoLieuDoc();
 }
 
+bool ReaderActivity::linkNoteTitle(std::string& title) const {
+  const auto note = bleturner::linkNote();
+  linkNoteDrawn = note;
+  linkNoteInTitle = true;
+  if (note == bleturner::LinkNote::None) return false;
+  switch (note) {
+    case bleturner::LinkNote::Connected: {
+      const auto peer = bleturner::linked();
+      title = std::string(tr(STR_CONNECTED)) + " " + (peer.name[0] ? peer.name : peer.addr);
+      break;
+    }
+    case bleturner::LinkNote::LowMemory:
+      title = tr(STR_BLE_READER_LOW_RAM);
+      break;
+    default:
+      title = note == bleturner::LinkNote::Connecting ? tr(STR_BLE_LINKING) : tr(STR_BLE_LINK_FAILED);
+      break;
+  }
+  return true;
+}
+
 void ReaderActivity::onPause() {
+  readingPace.suspend();
   pendingExternalTurn = 0;
 #ifdef TENOR_TURN_TRACE
   dropTurnTrace(pendingExternalTurnTrace, "pause");
@@ -234,6 +294,9 @@ void ReaderActivity::onPause() {
 }
 
 void ReaderActivity::onResume() {
+  // Back from a settings screen that built the catalog: returned again. ActivityManager holds the
+  // render lock around onResume, and the screen that borrowed its rows is gone.
+  releaseBaseSettingsList();
   statsLastMs = statsDayPollMs = millis();
   statsDay = READING_STATS.currentDay();
   statsActive = false;
@@ -317,7 +380,7 @@ void ReaderActivity::readingMargins(int& top, int& right, int& bottom, int& left
     top = inkSafeTop + TOP_BREATHING_ROOM;
     right = margin;  // Keep the reader text inset equal on both sides.
     bottom = std::max(margin, preview                            ? static_cast<int>(PREVIEW_FOOTER_HEIGHT)
-                              : SETTINGS.readerStatusBarHidden() ? 0
+                              : readerStatusBarHeight() == 0 ? 0
                                                                  : tenorchrome::readerBottomReserve());
     return;
   }
@@ -328,6 +391,8 @@ void ReaderActivity::readingMargins(int& top, int& right, int& bottom, int& left
 }
 
 uint8_t ReaderActivity::readerStatusBarHeight() const {
+  const auto spec = SETTINGS.statusBarSpec();
+  if (!preview && spec.slotsEnabled && !spec.textLaneVisible(true)) return 0;
   return preview ? PREVIEW_FOOTER_HEIGHT
                  : UITheme::getInstance().getStatusBarHeight(UITheme::StatusBarScope::Reader);
 }
@@ -407,6 +472,7 @@ bool ReaderActivity::pageTurnLocked(const bool isForward) {
   if (currentTurnTrace.id == 0) currentTurnTrace = detectTurnTrace("local", isForward);
 #endif
   if (!latTrangThat(isForward)) {
+    readingPace.suspend();
 #ifdef TENOR_TURN_TRACE
     logTurnTrace("REJECTED", currentTurnTrace, "unchanged");
     currentTurnTrace = {};
@@ -420,6 +486,9 @@ bool ReaderActivity::pageTurnLocked(const bool isForward) {
   logTurnTrace("APPLIED", appliedTurnTrace, "page");
 #endif
   ++trangDaLat;
+  if (!preview) readingPace.turned(millis(), isForward, pacePosition());
+  // A Failed link note has been read: the page this turn paints shows the title again.
+  bleturner::acknowledgeLinkNote();
   return true;
 }
 
@@ -590,6 +659,7 @@ void ReaderActivity::loop() {
 
 void ReaderActivity::render(RenderLock&&) {
   if (isAtEndOfBook()) {
+    readingPace.suspend();
     if (preview) {
       renderer.clearScreen();
       drawPreviewFooter();
@@ -618,10 +688,14 @@ void ReaderActivity::render(RenderLock&&) {
     appliedTurnTrace = {};
 #endif
     onEndOfBookRendered();
+    markPageRendered();
     return;
   }
 
   renderBook();
+  if (!preview && pageRendered.load(std::memory_order_acquire) && readingPageVisible())
+    readingPace.shown(millis(), pacePosition(), paceLayoutKey());
+  else readingPace.suspend();
   pageReady.store(true, std::memory_order_release);
 }
 

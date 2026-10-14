@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "QuoteStore.h"
+#include "components/TenorMenuChrome.h"
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
 
@@ -13,11 +14,17 @@
 // the words), Back leaves the quote as it was.
 class QuoteTrimActivity final : public Activity {
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::More; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_QUOTES_MENU_EDIT); }
   QuoteTrimActivity(GfxRenderer& r, MappedInputManager& input, quotes::QuoteId id)
       : Activity("QuoteTrim", r, input), id(id) {}
   void onEnter() override;
   void loop() override;
   void render(RenderLock&&) override;
+  tenorchrome::X3ScreenLayout screenLayout() const;
+  std::string screenTip() const;
+  std::string screenInfo() const;
+  void drawX3Content() const;
 
  private:
   // A word is a span of quote.text, so the layout holds no copies of the words.
@@ -32,6 +39,10 @@ class QuoteTrimActivity final : public Activity {
   void layoutWords();
   const char* wordText(const Word& word) const;
   void move(int direction);
+  // Touch: the word tapped becomes the nearer end of the kept words (outside them, the end on its side).
+  void setBoundary(int word);
+  // Touch: the word under (x, y) on the lines shown, or -1.
+  int wordAt(int x, int y) const;
   void save();
   void cancel();
   int areaTop() const;

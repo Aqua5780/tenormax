@@ -9,6 +9,11 @@
 #include "SdCardFontSystem.h"
 #include "components/UIScale.h"
 #include "fontIds.h"
+#include <builtinFonts/geist_8_regular.h>
+#include <builtinFonts/geist_10_regular.h>
+#include <builtinFonts/geist_10_bold.h>
+#include <builtinFonts/geist_12_regular.h>
+#include <builtinFonts/geist_12_bold.h>
 #define FREEINK_MCU_C3 1
 #define OMIT_FONTS 1
 #define LOG_INF(...) ((void)0)
@@ -22,7 +27,9 @@ class RenderLock {
   RenderLock() { ++uiTestLockDepth; }
   ~RenderLock() { --uiTestLockDepth; }
 };
-struct { uint8_t uiTextSize = 0; } SETTINGS;
+struct { uint8_t uiTextSize = 0; uint8_t sleepScreen = 0; } SETTINGS;
+struct CrossPointSettings { enum { UGLY = 11 }; };
+namespace shell { inline bool isUgly() { return false; } }
 struct {
   bool begun = false;
   void begin(bool) { begun = true; }
@@ -33,6 +40,7 @@ struct {
 } activityManager;
 struct { bool init() { return true; } } fontDecompressor;
 GfxRenderer renderer;
+namespace ugly { inline void ensureFonts(GfxRenderer&) {} }
 FontCacheManager fontCacheManager;
 SdCardFontSystem sdFontSystem;
 int fallbackRefreshCount = 0;
@@ -40,6 +48,9 @@ int fallbackTier = -1;
 bool sdBegun = false;
 void logHeapMark(const char*) {}
 SdCardFontManager::~SdCardFontManager() = default;
+// Out of line since the vector-font path (#3646); nothing to own without PSRAM.
+SdCardFontSystem::SdCardFontSystem() = default;
+SdCardFontSystem::~SdCardFontSystem() = default;
 void SdCardFontSystem::begin(GfxRenderer&) { assert(uiTestLockDepth > 0); sdBegun = true; }
 void SdCardFontSystem::refreshUiFallbacks(GfxRenderer& target, uint8_t size) {
   assert(uiTestLockDepth > 0);
@@ -48,13 +59,14 @@ void SdCardFontSystem::refreshUiFallbacks(GfxRenderer& target, uint8_t size) {
   ++fallbackRefreshCount;
   fallbackTier = size;
 }
-EpdFontData captionData = [] { EpdFontData data{}; data.advanceY = 21; return data; }();
-EpdFontData subtitleData = [] { EpdFontData data{}; data.advanceY = 26; return data; }();
-EpdFontData bodyData = [] { EpdFontData data{}; data.advanceY = 33; return data; }();
-EpdFont captionFont(&captionData), subtitleFont(&subtitleData), bodyFont(&bodyData);
-EpdFontFamily smallFontFamily(&captionFont), ui10FontFamily(&subtitleFont), ui12FontFamily(&bodyFont);
+// The shipped Geist faces, as main.cpp registers them: the tier heights are read from real font data.
+EpdFont captionFont(&geist_8_regular);
+EpdFont subtitleRegularFont(&geist_10_regular), subtitleBoldFont(&geist_10_bold);
+EpdFont bodyFont(&geist_12_regular), bodyBoldFont(&geist_12_bold);
+EpdFontFamily smallFontFamily(&captionFont), ui10FontFamily(&subtitleRegularFont, &subtitleBoldFont);
+EpdFontFamily ui12FontFamily(&bodyFont, &bodyBoldFont);
 EpdFontFamily notoserif14FontFamily(&bodyFont);
-void setupDisplayAndFonts(bool);
+void setupDisplayAndFonts(bool, bool);
 
 void assertTier(GfxRenderer& target, uint8_t tier) {
   const auto spec = uiTextSizeSpec(tier);
@@ -86,12 +98,12 @@ void testApply() {
   // Missing final alias: earlier aliases must stay untouched and no cache I/O occurs.
   assert(!applyUiFontSize(target,2));
   assert(cache.clearCount == 0 && fallbackRefreshCount == initialRefresh);
-  assert(captionNode->getData() == &captionData);
+  assert(captionNode->getData() == &geist_8_regular);
   target.insertFont(UI_12_FONT_ID,ui12FontFamily);
   target.registerSdCardFont(UI_12_FONT_ID,reader);
   assert(!applyUiFontSize(target,2));
   assert(cache.clearCount == 0 && fallbackRefreshCount == initialRefresh);
-  assert(captionNode->getData() == &captionData);
+  assert(captionNode->getData() == &geist_8_regular);
   target.removeFont(UI_12_FONT_ID);
   target.insertFont(UI_12_FONT_ID,ui12FontFamily);
   for (const uint8_t tier : {0,1,2,0,255}) {
@@ -119,7 +131,7 @@ int main(int argc,char** argv) {
     const int saved = std::atoi(argv[1]); assert(saved >= 0 && saved <= 2);
     SETTINGS.uiTextSize = static_cast<uint8_t>(saved);
     uiTestBootRegistration = true;
-    setupDisplayAndFonts(false);
+    setupDisplayAndFonts(false, true);
     firstPaint(SETTINGS.uiTextSize);
     std::printf("PASS: persisted tier %d applied under lock before first paint\n",saved);
   }

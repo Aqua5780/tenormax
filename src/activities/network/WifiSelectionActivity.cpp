@@ -1,4 +1,8 @@
 #include "WifiSelectionActivity.h"
+#include "activities/X3ActivityLayout.h"
+
+#include "components/PageScrollbar.h"
+#include "components/icons/tenorSignalIcons.h"
 
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
@@ -13,13 +17,20 @@
 
 #include "CrossPointSettings.h"
 #include "DeviceName.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyChrome.h"
+#include "shells/ugly/UglyNote.h"
+#include "shells/ugly/UglySwitch.h"
+#include "components/TenorMenuChrome.h"
 #include "FileTransferState.h"
 #include "MappedInputManager.h"
 #include "WifiCredentialStore.h"
 #include "activities/util/KeyboardEntryActivity.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/TimezoneLookup.h"
+#include "util/Timezones.h"
 
 namespace fui = freeink::ui;
 
@@ -27,20 +38,59 @@ namespace {
 constexpr fui::ActionId ACTION_ROW = 1;
 constexpr fui::ActionId ACTION_SCAN = 2;
 constexpr fui::ActionId ACTION_PROMPT = 3;
+
+int signalLevel(const int32_t rssi) {
+  if (rssi >= -50) return 4;  // Excellent
+  if (rssi >= -60) return 3;  // Good
+  if (rssi >= -70) return 2;  // Fair
+  return 1;                   // Very weak
+}
+
+constexpr fui::BitmapRef mark(const freeink::Icon& icon) {
+  return {icon.bits, icon.w, icon.h, fui::BitmapFormat::Mask1};
+}
+
+// The value slot of a row: the padlock (or nothing) left of the signal mark of `level`.
+const fui::BitmapRef* signalMarks(const int level, const bool locked) {
+  static constexpr fui::BitmapRef none{};
+  static constexpr fui::BitmapRef marks[2][5][2] = {
+      {{none, mark(icon_wifi_signal_0)}, {none, mark(icon_wifi_signal_1)}, {none, mark(icon_wifi_signal_2)},
+       {none, mark(icon_wifi_signal_3)}, {none, mark(icon_wifi_signal_4)}},
+      {{mark(icon_wifi_lock), mark(icon_wifi_signal_0)}, {mark(icon_wifi_lock), mark(icon_wifi_signal_1)},
+       {mark(icon_wifi_lock), mark(icon_wifi_signal_2)}, {mark(icon_wifi_lock), mark(icon_wifi_signal_3)},
+       {mark(icon_wifi_lock), mark(icon_wifi_signal_4)}}};
+  return marks[locked][level];
+}
+
+// The ugly shell keeps its own text marks: "+" saved, "*" encrypted, one bar per signal level.
+std::string uglyStatus(const WifiNetworkInfo& network) {
+  if (network.isHiddenPlaceholder) return std::string();
+  std::string status = network.hasSavedPassword ? "+ " : "";
+  if (network.isSavedOutOfRange) return status + tr(STR_WIFI_NOT_IN_RANGE);
+  if (network.isEncrypted) status += "* ";
+  const int level = signalLevel(network.rssi);
+  return status + std::string(4 - level, ' ') + std::string(level, '|');
+}
 }  // namespace
 
 WifiSelectionActivity::WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                              const bool autoConnect, const bool syncClock,
-                                             const bool savedNetworkOnly)
+                                             const bool savedNetworkOnly, const bool deferManualNetworkList)
     : Activity("WifiSelection", renderer, mappedInput),
       UiAppHost(renderer),
       allowAutoConnect(autoConnect),
       syncClockOnConnect(syncClock),
-      savedNetworkOnly(savedNetworkOnly) {}
+      savedNetworkOnly(savedNetworkOnly),
+      deferManualNetworkList(deferManualNetworkList) {}
 
 void WifiSelectionActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
   auto* self = static_cast<WifiSelectionActivity*>(user);
   if (self->state != WifiSelectionState::NETWORK_LIST) return;
+  // Touch: the row after the networks scans again.
+  if (tenorchrome::kTouchShell && event.value == static_cast<int16_t>(self->networks.size()) && !event.longPress) {
+    onScanEvent(event, user);
+    return;
+  }
   if (event.value < 0 || event.value >= static_cast<int16_t>(self->networks.size())) return;
   self->selectedNetworkIndex = static_cast<size_t>(event.value);
   // Long-press a saved network to forget it (mirrors the Left-button hold in loop()).
@@ -129,7 +179,7 @@ void WifiSelectionActivity::onEnter() {
   // Reset state
   selectedNetworkIndex = 0;
   networks.clear();
-  networkStatuses.clear();
+  uglyNetworkStatuses.clear();
   networkRowItems.clear();
   realNetworkCount = 0;
   state = WifiSelectionState::SCANNING;
@@ -249,8 +299,8 @@ void WifiSelectionActivity::startWifiScan(const bool autoScan) {
   listNav.reset();
   state = WifiSelectionState::SCANNING;
   networks.clear();
+  uglyNetworkStatuses.clear();
   // The cached rows point into the cleared networks' strings; drop them too.
-  networkStatuses.clear();
   networkRowItems.clear();
   requestUpdate();
 
@@ -408,27 +458,36 @@ void WifiSelectionActivity::appendHiddenNetworkEntry() {
   networks.push_back(std::move(placeholder));
 }
 
-// Derives networkStatuses/networkRowItems from `networks`. Called whenever
-// `networks` changes (both branches of processWifiScanResults()) so
-// buildListScreen() reuses the cached rows on every repaint instead of
-// re-deriving a "+ * ||||" status string per network each time.
+// Derives networkRowItems from `networks`. Called whenever `networks` changes
+// (both branches of processWifiScanResults()) so buildListScreen() reuses the
+// cached rows on every repaint. The value slot holds the signal mark, with the
+// padlock to its left on an encrypted network; a saved network out of range
+// says so in words.
 void WifiSelectionActivity::rebuildNetworkRowItems() {
-  networkStatuses.assign(networks.size(), std::string());
+  uglyNetworkStatuses.assign(shell::isUgly() ? networks.size() : 0, std::string());
   networkRowItems.clear();
   networkRowItems.reserve(networks.size());
   for (size_t i = 0; i < networks.size(); i++) {
     const auto& network = networks[i];
-    if (!network.isHiddenPlaceholder) {
-      networkStatuses[i] = std::string(network.hasSavedPassword ? "+ " : "") +
-                           (network.isSavedOutOfRange ? "" : (network.isEncrypted ? "* " : "")) +
-                           (network.isSavedOutOfRange ? tr(STR_WIFI_NOT_IN_RANGE)
-                                                      : getSignalStrengthIndicator(network.rssi));
-    }
     fui::ListItem item;
     item.label = network.isHiddenPlaceholder ? tr(STR_ADD_HIDDEN_NETWORK) : network.ssid.c_str();
-    if (!networkStatuses[i].empty()) item.value = networkStatuses[i].c_str();
+    if (shell::isUgly()) {
+      uglyNetworkStatuses[i] = uglyStatus(network);
+      if (!uglyNetworkStatuses[i].empty()) item.value = uglyNetworkStatuses[i].c_str();
+    } else if (network.isSavedOutOfRange) {
+      item.value = tr(STR_WIFI_NOT_IN_RANGE);
+    } else if (!network.isHiddenPlaceholder) {
+      item.valueIcons = signalMarks(signalLevel(network.rssi), network.isEncrypted);
+    }
     item.actionValue = static_cast<int16_t>(i);
     networkRowItems.push_back(item);
+  }
+  // Touch: "Retry" is the last row of the frame, under the networks (no button left floating mid screen).
+  if (tenorchrome::kTouchShell && !networks.empty()) {
+    fui::ListItem retry;
+    retry.label = tr(STR_RETRY);
+    retry.actionValue = static_cast<int16_t>(networks.size());
+    networkRowItems.push_back(retry);
   }
 }
 
@@ -565,6 +624,9 @@ void WifiSelectionActivity::handleAutoConnectFailure() {
     if (giveUpBeforeAsking()) {
       return;
     }
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("WIFI", "Saved networks failed: the list asks the user t=%lu", millis());
+#endif
     autoConnecting = false;
     state = WifiSelectionState::NETWORK_LIST;
     selectedNetworkIndex = 0;
@@ -578,6 +640,9 @@ void WifiSelectionActivity::handleAutoConnectFailure() {
 
 void WifiSelectionActivity::showNetworkListFromAutoConnect() {
   LOG_DBG("WIFI", "User requested manual network list");
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("WIFI", "Confirm during auto-connect: the list asks the user t=%lu", millis());
+#endif
   if (giveUpBeforeAsking()) {
     return;
   }
@@ -609,7 +674,15 @@ void WifiSelectionActivity::attemptConnection() {
   powerManager.setPowerSaving(false);
   WiFi.mode(WIFI_STA);
   LOG_INF("WIFI", "STA ready");
-  WiFi.disconnect(true, true);  // Abort any in-progress SDK auto-connect and clear NVS-saved SSID
+  // Keep STA initialized for the explicit begin below. Power-cycling it here
+  // can break the next WPA handshake on routers that accepted the scan.
+#ifdef SIMULATOR
+  WiFi.disconnect(false, false);
+#else
+  if (!WiFi.disconnect(false, false, 1000)) {
+    LOG_DBG("WIFI", "Disconnect before join timed out; trying explicit begin");
+  }
+#endif
   delay(100);
   LOG_INF("WIFI", "Previous connection cleared");
 
@@ -622,9 +695,9 @@ void WifiSelectionActivity::attemptConnection() {
   uint8_t mac[6] = {};
   const esp_err_t macResult = esp_read_mac(mac, ESP_MAC_WIFI_STA);
   if (macResult == ESP_OK) {
-    char fallback[sizeof("tenor-cross-") + 12];
-    snprintf(fallback, sizeof(fallback), "tenor-cross-%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4],
-             mac[5]);
+    char fallback[64];
+    snprintf(fallback, sizeof(fallback), "%s-%02X%02X%02X%02X%02X%02X", defaultNetworkName(), mac[0], mac[1], mac[2],
+             mac[3], mac[4], mac[5]);
     char hostname[64];
     deviceNetworkName(hostname, sizeof(hostname), fallback);
     WiFi.setHostname(hostname);
@@ -665,8 +738,11 @@ void WifiSelectionActivity::checkConnectionStatus() {
             WiFi.RSSI());
 #endif
 
-    // A persisted sync flag cannot prove that this boot has valid system time.
-    // Boards without an RTC must sync again after a cold boot.
+    // Sync RTC from NTP on the first successful WiFi connection only. The DS3231
+    // drifts ~2 ppm so one sync is enough; users can force a re-sync from
+    // Settings > System > Clock > Sync clock now. A persisted sync flag cannot
+    // prove that this boot has valid system time, though - boards without an
+    // RTC must sync again after a cold boot.
     if (syncClockOnConnect && (!SETTINGS.clockHasBeenSynced || !halClock.hasValidTime())) {
       LOG_INF("WIFI", "NTP begin");
       if (halClock.syncFromNTP()) {
@@ -682,7 +758,10 @@ void WifiSelectionActivity::checkConnectionStatus() {
       }
       LOG_INF("WIFI", "Timezone begin heap=%u largest=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
       const auto previousOffset = SETTINGS.clockUtcOffsetQ;
-      if (timezone_lookup::updateOffset() && SETTINGS.clockUtcOffsetQ != previousOffset) SETTINGS.saveToFile();
+      if (timezone_lookup::updateOffset() && SETTINGS.clockUtcOffsetQ != previousOffset) {
+        SETTINGS.saveToFile();
+        timezones::applyToClock();
+      }
       LOG_INF("WIFI", "Timezone done");
     }
 
@@ -745,6 +824,13 @@ void WifiSelectionActivity::checkConnectionStatus() {
 }
 
 void WifiSelectionActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() &&
+      x3Info.turn(mappedInput.wasReleased(MappedInputManager::Button::Up) ? -1 :
+                  mappedInput.wasReleased(MappedInputManager::Button::Down) ? 1 : 0)) {
+    requestUpdate();
+    return;
+  }
+
   // Keep the release in this activity: the parent's chooser handles Back on
   // release, while this picker cancels scans/connections on press.
   if (completionWaitingForBackRelease) {
@@ -760,6 +846,7 @@ void WifiSelectionActivity::loop() {
       return;
     }
     if (autoConnecting && mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      if (deferManualNetworkList) return;
       autoConnecting = false;
       manualNetworkListRequested = true;
       requestUpdate();
@@ -777,6 +864,7 @@ void WifiSelectionActivity::loop() {
         return;
       }
       if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+        if (deferManualNetworkList) return;
         showNetworkListFromAutoConnect();
         return;
       }
@@ -979,18 +1067,27 @@ void WifiSelectionActivity::loop() {
     if (!networks.empty()) {
       // Swipes scroll the viewport; the selection stays put and button
       // navigation pulls the view back to it.
-      const auto swipe = mappedInput.wasSwipe();
-      if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down) {
-        const int delta = swipe == MappedInputManager::SwipeDir::Up ? listNav.visibleRows : -listNav.visibleRows;
-        if (listNav.scrollBy(delta, static_cast<int>(networks.size()))) requestUpdate();
-        return;
+      if (tenorchrome::kTouchShell) {
+        // Touch: the one rule for every list (UiAppHost::swipeRows).
+        const int delta = swipeRows(mappedInput, listNav, static_cast<int>(networkRowItems.size()), ACTION_ROW);
+        if (delta != 0) {
+          if (listNav.scrollBy(delta, static_cast<int>(networkRowItems.size()))) requestUpdate();
+          return;
+        }
+      } else {
+        const auto swipe = mappedInput.wasSwipe();
+        if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down) {
+          const int delta = swipe == MappedInputManager::SwipeDir::Up ? listNav.visibleRows : -listNav.visibleRows;
+          if (listNav.scrollBy(delta, static_cast<int>(networks.size()))) requestUpdate();
+          return;
+        }
       }
     }
 
     const auto moveSelection = [this](const int index) {
       selectedNetworkIndex = static_cast<size_t>(index);
       listNav.selected = index;
-      listNav.follow(static_cast<int>(networks.size()));
+      followStep(listNav, static_cast<int>(networks.size()));
       requestUpdate();
     };
     buttonNavigator.onNext(
@@ -1001,25 +1098,57 @@ void WifiSelectionActivity::loop() {
   }
 }
 
-std::string WifiSelectionActivity::getSignalStrengthIndicator(const int32_t rssi) {
-  // Convert RSSI to signal bars representation
-  if (rssi >= -50) {
-    return "||||";  // Excellent
-  }
-  if (rssi >= -60) {
-    return " |||";  // Good
-  }
-  if (rssi >= -70) {
-    return "  ||";  // Fair
-  }
-  return "   |";  // Very weak
-}
-
 void WifiSelectionActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled() && !shell::uglyParts()) {
+    if (state == WifiSelectionState::PASSWORD_ENTRY || state == WifiSelectionState::HIDDEN_SSID_ENTRY) return;
+    const bool list = state == WifiSelectionState::NETWORK_LIST;
+    const bool prompt = state == WifiSelectionState::SAVE_PROMPT || state == WifiSelectionState::FORGET_PROMPT;
+    const char* tip = list && networks.empty() ? tr(STR_PRESS_OK_SCAN) : nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip));
+    char count[64];
+    snprintf(count, sizeof(count), tr(STR_NETWORKS_FOUND), realNetworkCount);
+    renderer.clearScreen();
+    if (list || prompt) {
+      x3Info.pages = 1;
+      const int height = renderer.getLineHeight(SMALL_FONT_ID);
+      x3activity::InfoPages heading;
+      heading.draw(renderer, {0, layout.bodyRect.y, layout.bodyRect.width, height * 3}, {count, cachedMacAddress.c_str()});
+      if (list && networks.empty()) {
+        tenorchrome::drawInfoInRect(renderer, tr(STR_NO_NETWORKS),
+            {0, layout.bodyRect.y + height * 3, layout.bodyRect.width, height * 3}, 3);
+      } else {
+        renderUi();
+      }
+    } else {
+      const char* status = state == WifiSelectionState::CONNECTED ? tr(STR_CONNECTED) :
+          state == WifiSelectionState::CONNECTION_FAILED ? tr(STR_CONNECTION_FAILED) :
+          state == WifiSelectionState::SCANNING ? (autoConnecting ? tr(STR_FINDING_SAVED_WIFI) : tr(STR_SCANNING)) :
+          autoConnecting ? tr(STR_CONNECTING_SAVED_WIFI) : tr(STR_CONNECTING);
+      const std::string address = state == WifiSelectionState::CONNECTED ? std::string(tr(STR_IP_ADDRESS_PREFIX)) + WiFi.localIP().toString().c_str() : "";
+      x3Info.draw(renderer, layout.bodyRect, {count, cachedMacAddress.c_str(), status, selectedSSID.c_str(),
+          address.c_str(), state == WifiSelectionState::CONNECTION_FAILED ? connectionError.c_str() : nullptr});
+    }
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect);
+    x3activity::drawBar(renderer, layout.barRect, tr(STR_WIFI_NETWORKS), navigationPrefix.c_str());
+    const bool saved = list && !networks.empty() && networks[selectedNetworkIndex].hasSavedPassword;
+    const auto labels = mappedInput.mapLabels(autoConnecting ? tr(STR_CANCEL) : tr(STR_BACK),
+        list ? tr(STR_CONNECT) : prompt ? tr(STR_SELECT) : autoConnecting && !deferManualNetworkList ? tr(STR_SHOW_NETWORKS) : "",
+        prompt ? tr(STR_DIR_LEFT) : saved ? tr(STR_FORGET_BUTTON) : "",
+        prompt ? tr(STR_DIR_RIGHT) : list ? tr(STR_RETRY) : "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    renderer.displayBuffer();
+    return;
+  }
+
   // Don't render if we're in a keyboard-entry state - we're just transitioning
   // from the keyboard subactivity back to the main activity
   if (state == WifiSelectionState::PASSWORD_ENTRY || state == WifiSelectionState::HIDDEN_SSID_ENTRY) {
     return;
+  }
+  if (shell::uglyParts()) {
+    if (renderUglyNote()) return;
+    if (state == WifiSelectionState::NETWORK_LIST) return renderUglyList();
+    if (state == WifiSelectionState::SAVE_PROMPT || state == WifiSelectionState::FORGET_PROMPT) return renderUglyPrompt();
   }
 
   renderer.clearScreen();
@@ -1035,10 +1164,17 @@ void WifiSelectionActivity::render(RenderLock&&) {
   snprintf(countStr, sizeof(countStr), tr(STR_NETWORKS_FOUND), realNetworkCount);
   GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight},
                  tr(STR_WIFI_NETWORKS), countStr);
-  GUI.drawSubHeader(
-      renderer,
-      Rect{screen.x, screen.y + metrics.topPadding + metrics.headerHeight, screen.width, metrics.tabBarHeight},
-      cachedMacAddress.c_str());
+  if (tenorchrome::roundFrames()) {
+    // A touch screen keeps only the status strip at the top: the MAC address is the first line of the content.
+    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, tenorchrome::contentTop() + tenorchrome::INFO_TOP_GAP,
+                      renderer.truncatedText(UI_10_FONT_ID, cachedMacAddress.c_str(),
+                                             screen.width - 2 * metrics.contentSidePadding, EpdFontFamily::REGULAR).c_str());
+  } else {
+    GUI.drawSubHeader(
+        renderer,
+        Rect{screen.x, screen.y + metrics.topPadding + metrics.headerHeight, screen.width, metrics.tabBarHeight},
+        cachedMacAddress.c_str());
+  }
 
   switch (state) {
     case WifiSelectionState::AUTO_CONNECTING:
@@ -1085,13 +1221,29 @@ void WifiSelectionActivity::buildListScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
   // Content below the header + MAC sub-band, above the legend line.
+  const int listTop = tenorchrome::roundFrames()
+                          ? tenorchrome::contentTop() + tenorchrome::INFO_TOP_GAP + renderer.getLineHeight(UI_10_FONT_ID) +
+                                metrics.verticalSpacing
+                          : safe.y + metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight +
+                                metrics.verticalSpacing;
   screen.setContentMarginFromScreen(fui::Insets{
-      static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight +
-                           metrics.verticalSpacing),
+      static_cast<int16_t>(listTop),
       static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
       static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.verticalSpacing * 2),
       static_cast<int16_t>(safe.x)});
 
+  if (shell::uglyParts() && tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tr(STR_UGLY_WIFI_TIP)));
+    const int bottom = screen.body().y + screen.body().height;
+    if (bottom > layout.bodyRect.bottom())
+      screen.takeBottom(static_cast<int16_t>(bottom - layout.bodyRect.bottom()));
+  } else if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* tip = state == WifiSelectionState::NETWORK_LIST && networks.empty() ? tr(STR_PRESS_OK_SCAN) : nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip));
+    const int height = renderer.getLineHeight(SMALL_FONT_ID);
+    screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(layout.bodyRect.y + height * 3), 0,
+        static_cast<int16_t>(renderer.getScreenHeight() - layout.bodyRect.bottom() + height * 2), 0});
+  }
   if (state == WifiSelectionState::SAVE_PROMPT || state == WifiSelectionState::FORGET_PROMPT) {
     buildPromptDialog(screen);
     return;
@@ -1126,25 +1278,41 @@ void WifiSelectionActivity::buildListScreen(UiScreen& screen) {
   // Tap opens; long-press a saved network forgets it (physical buttons stay in loop()).
   props.inputMask = fui::InputTouch | fui::InputLongPress;
   props.valueInset = 8;  // air between the signal bars and the row edge
-  // Long SSIDs wrap onto a second line inside the row (two body lines always
-  // fit the theme row height) instead of truncating; the trailing value is
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  // Touch (C1): the rows in a round frame 16 px in from the screen edges, their text 16 px into it.
+  props.rowInset = tenorchrome::FOOT_BACK_X;
+  props.sidePadding = 16;
+#else
+  if (mappedInput.hasTouch()) {
+    // Touch has no Right key to scan again with, and a list that always ends in the hidden network
+    // never shows the empty-list retry: keep a retry button under the rows.
+    const auto& theme = screen.theme();
+    const fui::Rect b = screen.takeBottom(static_cast<int16_t>(theme.rowHeight + theme.spaceMd));
+    fui::ButtonProps scan;
+    scan.label = tr(STR_RETRY);
+    scan.action = ACTION_SCAN;
+    scan.inputMask = fui::InputTouch;
+    scan.text = theme.bodyText;
+    fui::button(screen.frame(), fui::Rect{b.x, b.y, b.width, static_cast<int16_t>(theme.rowHeight)}, scan);
+  }
+#endif
+  // Long SSIDs grow their row to a second line; the trailing value is
   // just the short status glyphs, so skip the balanced 60%-band wrap cap.
   props.labelText = screen.theme().bodyText;
   props.labelText.maxLines = 2;
   props.balanceWrappedLabelWithValue = false;
   listNav.selected = static_cast<int>(selectedNetworkIndex);
-  int16_t rowHeight = screen.theme().rowHeight;
-  if (!mappedInput.hasTouch()) {
-    // Non-touch hardware (X3/X4) keeps the original, denser row height
-    // instead of FreeInkUI's touch-target-sized default (see
-    // UiListActivity::syncListViewport; this screen predates that base and
-    // syncs its own viewport directly). A long SSID that wraps grows only
-    // its own row: list() sizes wrapped items per-row.
-    rowHeight = static_cast<int16_t>(metrics.listRowHeight);
-    props.rowHeight = rowHeight;
-  }
-  listNav.syncToProps(screen.body(), rowHeight, screen.theme().listRowGap, static_cast<int>(networks.size()), props);
+  props.partialTrailingRow = true;
+  if (tenorchrome::kTouchShell) props.rowInset = tenorchrome::FOOT_BACK_X;
+  screen.syncListViewport(listNav, props, static_cast<int>(networkRowItems.size()));
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  props.selectedIndex = -1;  // a finger picks the row: no black cursor
+#endif
+  props.scrollIndicator = false;
+  const auto viewport = screen.body();
   screen.list(props);
+  PageScrollbar::instance().drawList(renderer, screen.target(), viewport, listNav,
+                                       static_cast<int>(networkRowItems.size()));
 }
 
 void WifiSelectionActivity::buildPromptDialog(UiScreen& screen) {
@@ -1203,8 +1371,32 @@ void WifiSelectionActivity::buildPromptDialog(UiScreen& screen) {
   fui::optionDialog(screen.frame(), fui::centeredRect(body, fui::Size{width, height}), props);
 }
 
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+// Touch (C1): the round grey frame round the rows on screen, a grey dotted rule halfway between 2 rows.
+void WifiSelectionActivity::drawRowFrame() const {
+  const int count = static_cast<int>(networkRowItems.size());
+  const int x0 = tenorchrome::FOOT_BACK_X + 16, x1 = renderer.getScreenWidth() - tenorchrome::FOOT_BACK_X - 17;
+  int top = -1, bottom = 0, gap = 8;
+  for (int i = listNav.top; i < count; ++i) {
+    const fui::Rect r = app.publishedRect(ACTION_ROW, static_cast<int16_t>(i));
+    if (r.height <= 0) continue;
+    if (top < 0) {
+      top = r.y;
+    } else {
+      gap = r.y - bottom;
+      tenorchrome::drawRowRule(renderer, bottom + gap / 2, x0, x1);
+    }
+    bottom = r.y + r.height;
+  }
+  if (top >= 0) tenorchrome::drawPanel(renderer, top - gap / 2 - 2, bottom - top + gap + 4);
+}
+#endif
+
 void WifiSelectionActivity::renderNetworkList(const Rect* screen, const ThemeMetrics* metrics) {
   renderUi();
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  drawRowFrame();
+#endif
   if (networks.empty() && !mappedInput.hasTouch()) {
     // Below the centered "no networks" line the app drew. Touch boards get an
     // on-screen Retry button from the screen builder instead of this hint.
@@ -1213,9 +1405,11 @@ void WifiSelectionActivity::renderNetworkList(const Rect* screen, const ThemeMet
     UITheme::drawCenteredText(renderer, *screen, SMALL_FONT_ID, top + height + 10, tr(STR_PRESS_OK_SCAN));
   }
 
-  GUI.drawHelpText(renderer,
-                   Rect{screen->x, screen->y + screen->height - metrics->contentSidePadding - 15, screen->width, 20},
-                   tr(STR_NETWORK_LEGEND));
+  if (shell::isUgly()) {
+    GUI.drawHelpText(renderer,
+                     Rect{screen->x, screen->y + screen->height - metrics->contentSidePadding - 15, screen->width, 20},
+                     tr(STR_NETWORK_LEGEND));
+  }
 
   const bool hasSavedPassword = !networks.empty() && networks[selectedNetworkIndex].hasSavedPassword;
   const char* forgetLabel = hasSavedPassword ? tr(STR_FORGET_BUTTON) : "";
@@ -1236,7 +1430,7 @@ void WifiSelectionActivity::renderConnecting(const Rect* screen, const ThemeMetr
     const Rect statusBounds{statusX, screen->y, statusWidth, screen->height};
     UITheme::drawCenteredWrappedText(renderer, statusBounds, UI_10_FONT_ID, statusText, MAX_STATUS_LINES);
     if (autoConnecting) {
-      const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_SHOW_NETWORKS), "", "");
+      const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), deferManualNetworkList ? "" : tr(STR_SHOW_NETWORKS), "", "");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     }
   } else {
@@ -1249,9 +1443,10 @@ void WifiSelectionActivity::renderConnecting(const Rect* screen, const ThemeMetr
     if (ssidInfo.length() > 25) {
       ssidInfo.replace(22, ssidInfo.length() - 22, "...");
     }
+    ssidInfo = renderer.truncatedText(UI_10_FONT_ID, ssidInfo.c_str(), statusWidth, EpdFontFamily::REGULAR);
     UITheme::drawCenteredText(renderer, *screen, UI_10_FONT_ID, top, ssidInfo.c_str());
     if (autoConnecting) {
-      const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_SHOW_NETWORKS), "", "");
+      const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), deferManualNetworkList ? "" : tr(STR_SHOW_NETWORKS), "", "");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     }
   }
@@ -1267,6 +1462,8 @@ void WifiSelectionActivity::renderConnected(const Rect* screen, const ThemeMetri
   if (ssidInfo.length() > 28) {
     ssidInfo.replace(25, ssidInfo.length() - 25, "...");
   }
+  ssidInfo = renderer.truncatedText(UI_10_FONT_ID, ssidInfo.c_str(),
+                                    screen->width - metrics->contentSidePadding * 2, EpdFontFamily::REGULAR);
   UITheme::drawCenteredText(renderer, *screen, UI_10_FONT_ID, top + 10, ssidInfo.c_str());
 
   const std::string ipInfo = std::string(tr(STR_IP_ADDRESS_PREFIX)) + connectedIP;
@@ -1288,6 +1485,102 @@ void WifiSelectionActivity::renderConnectionFailed(const Rect* screen, const The
   // Use centralized button hints
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_DONE), "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+}
+
+// The waits of this screen as notes. The list and its two questions wait for the shared ugly parts.
+bool WifiSelectionActivity::renderUglyNote() const {
+  const char* line = nullptr;
+  std::string detail;
+  ugly::Hints hints;
+  switch (state) {
+    case WifiSelectionState::SCANNING:
+      line = autoConnecting ? tr(STR_FINDING_SAVED_WIFI) : tr(STR_UGLY_WIFI_SCANNING);
+      hints.back = autoConnecting;
+      hints.confirm = autoConnecting && !deferManualNetworkList;
+      break;
+    case WifiSelectionState::AUTO_CONNECTING:
+    case WifiSelectionState::CONNECTING:
+      line = tr(STR_UGLY_WIFI_CONNECTING);
+      detail = selectedSSID;
+      hints.back = autoConnecting;
+      hints.confirm = autoConnecting && !deferManualNetworkList;
+      break;
+    case WifiSelectionState::CONNECTED:
+      line = tr(STR_UGLY_WIFI_CONNECTED);
+      detail = selectedSSID + "   " + connectedIP;
+      hints.confirm = true;
+      break;
+    case WifiSelectionState::CONNECTION_FAILED:
+      line = tr(STR_UGLY_WIFI_FAILED);
+      detail = connectionError;
+      hints.back = hints.confirm = true;
+      break;
+    default:
+      return false;
+  }
+  ugly::notePage(renderer, mappedInput, tr(STR_WIFI_NETWORKS), line, detail.empty() ? nullptr : detail.c_str(), -1,
+                 hints);
+  return true;
+}
+
+// The list by hand: laid out as usual with its ink off, each row it placed written with the shared row; the MAC stays
+// data in the UI font under the header, the legend becomes the tip.
+void WifiSelectionActivity::renderUglyList() {
+  [[maybe_unused]] const uint32_t started = millis();
+  renderer.clearScreen();
+  uiTarget.setPaintingEnabled(false);
+  renderUi();
+  uiTarget.setPaintingEnabled(true);
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+  char countStr[64];
+  snprintf(countStr, sizeof(countStr), tr(STR_NETWORKS_FOUND), realNetworkCount);
+  GUI.drawHeader(renderer, Rect{safe.x, safe.y + metrics.topPadding, safe.width, metrics.headerHeight},
+                 tr(STR_WIFI_NETWORKS), countStr);
+  renderer.drawText(SMALL_FONT_ID, safe.x + metrics.contentSidePadding,
+                    safe.y + metrics.topPadding + metrics.headerHeight + 4, cachedMacAddress.c_str());
+  if (networks.empty()) {
+    const int w = renderer.getScreenWidth();
+    ugly::paragraph(renderer, ugly::Size::S30, ugly::NOTE_X, renderer.getScreenHeight() / 2, w - ugly::NOTE_X - 30, 44,
+                    tr(STR_UGLY_WIFI_NONE));
+  }
+  for (size_t i = 0; i < networkRowItems.size(); ++i) {
+    const auto box = app.publishedRect(ACTION_ROW, static_cast<int16_t>(i));
+    if (box.empty()) continue;
+    uglychrome::Row row;
+    row.label = networkRowItems[i].label;
+    row.value = networkRowItems[i].value;
+    row.marks.selected = i == selectedNetworkIndex;
+    uglychrome::row(renderer, box, row, mark_.get(selectedNetworkIndex));
+  }
+  tenorchrome::drawTip(renderer, tr(STR_UGLY_WIFI_TIP));
+  const bool hasSavedPassword = !networks.empty() && networks[selectedNetworkIndex].hasSavedPassword;
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONNECT), hasSavedPassword ? tr(STR_FORGET_BUTTON) : "",
+                                            tr(STR_RETRY));
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  PageScrollbar::instance().repaint(renderer, uiTarget);
+  renderer.displayBuffer();
+#ifdef UGLY_FRAME_LOG
+  LOG_INF("UGLY", "Wifi list frame rows=%u total=%lums heap=%u", static_cast<unsigned>(networkRowItems.size()),
+          static_cast<unsigned long>(millis() - started), ESP.getFreeHeap());
+#endif
+}
+
+// The two questions in the shared question box. The answers keep the order of the plain dialog, so the
+// selection means the same thing to loop().
+void WifiSelectionActivity::renderUglyPrompt() {
+  const bool forget = state == WifiSelectionState::FORGET_PROMPT;
+  const char* answers[2] = {forget ? tr(STR_UGLY_WIFI_FORGET_NO) : tr(STR_UGLY_WIFI_SAVE_YES),
+                            forget ? tr(STR_UGLY_WIFI_FORGET_YES) : tr(STR_UGLY_WIFI_SAVE_NO)};
+  ugly::Box drawn[2];
+  ugly::askBox(renderer, mappedInput, forget ? tr(STR_UGLY_WIFI_FORGET_ASK) : tr(STR_UGLY_WIFI_SAVE_ASK), "", answers,
+               forget ? forgetPromptSelection : savePromptSelection, drawn,
+               mark_.get((static_cast<uint64_t>(state) << 32) |
+                         static_cast<uint32_t>(forget ? forgetPromptSelection : savePromptSelection)));
+  renderer.displayBuffer();
+#ifdef UGLY_FRAME_LOG
+  LOG_INF("UGLY", "Wifi ask frame forget=%d sel=%d", forget ? 1 : 0, forget ? forgetPromptSelection : savePromptSelection);
+#endif
 }
 
 void WifiSelectionActivity::onComplete(const bool connected) {

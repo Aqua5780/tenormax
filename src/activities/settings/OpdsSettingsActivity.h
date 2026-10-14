@@ -1,4 +1,5 @@
 #pragma once
+#include "activities/settings/X3SettingsLayout.h"
 
 #include "OpdsServerStore.h"
 #include "activities/UiListActivity.h"
@@ -10,6 +11,7 @@
  */
 class OpdsSettingsActivity final : public UiListActivity {
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Network; }
   /**
    * @param serverIndex Index into OpdsServerStore, or -1 for a new server
    */
@@ -26,6 +28,10 @@ class OpdsSettingsActivity final : public UiListActivity {
   int listCount() const override { return getMenuItemCount(); }
   void buildScreen(UiScreen& screen) override;
   void activateIndex(int index) override;
+  void drawChrome() override {
+    if (tenorchrome::x3ScreenLayoutEnabled()) x3settings::drawPath(renderer, headerTitle());
+    else UiListActivity::drawChrome();
+  }
   const char* headerTitle() const override;
   void drawFooter() override;
 

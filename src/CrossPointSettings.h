@@ -1,12 +1,15 @@
 #pragma once
+
 #include <ArduinoJson.h>
+#include <BlePageTurner.h>
 #include <Epub/ReaderRenderSpec.h>
 #include <Epub/ReaderSpacing.h>
 #include <PersistableStore.h>
 
+#include <array>
 #include <cstdint>
 
-#include "activities/settings/BleKeyBinding.h"
+#include "util/HomeButtonInput.h"
 
 class CrossPointSettings : public PersistableStore<CrossPointSettings> {
  private:
@@ -34,6 +37,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     STATS = 9,
     // A random saved quote with the small cover of its book (v1.0.11).
     QUOTE = 10,
+    // The tenor/ugly doodle and a line of abuse (the default sleep screen of that shell).
+    UGLY = 11,
     SLEEP_SCREEN_MODE_COUNT
   };
   enum SLEEP_SCREEN_COVER_MODE { FIT = 0, CROP = 1, SLEEP_SCREEN_COVER_MODE_COUNT };
@@ -70,6 +75,16 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     STATUS_BAR_CLOCK_MODE_COUNT
   };
 
+  // Auto follows the timezone's baked DST rule; On/Off override it - the
+  // escape hatch for a zone whose law changed before the firmware caught up.
+  enum CLOCK_DST_MODE { CLOCK_DST_AUTO = 0, CLOCK_DST_ON = 1, CLOCK_DST_OFF = 2, CLOCK_DST_MODE_COUNT };
+
+  // clockShowInHeader. Was a toggle: a saved 0 (off) reads as hidden, a saved 1 (on) as the time.
+  // The value a fresh device holds in `field` (the struct initializers and the tenor preset).
+  static uint8_t defaultOf(uint8_t CrossPointSettings::* field);
+
+  enum CLOCK_HEADER_MODE { CLOCK_HEADER_HIDE = 0, CLOCK_HEADER_TIME = 1, CLOCK_HEADER_TIME_DATE = 2, CLOCK_HEADER_MODE_COUNT };
+
   enum ORIENTATION {
     PORTRAIT = 0,       // 480x800 logical coordinates (current default)
     LANDSCAPE_CW = 1,   // 800x480 logical coordinates, rotated 180° (swap top/bottom)
@@ -99,15 +114,16 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   };
 
   // Side button layout options
-  // Default: Up = Previous, Down = Next
-  // NEXT_NEXT is appended rather than slotted in beside its siblings: the value is
-  // persisted as a number, so inserting would silently change what an existing
-  // save means.
+  // Default: Up = Previous, Down = Next. NEXT_NEXT and PREV_PREV assign both
+  // buttons to the same direction for one-handed reading. Both are appended
+  // rather than slotted in beside their siblings: the value is persisted as a
+  // number, so inserting would silently change what an existing save means.
   enum SIDE_BUTTON_LAYOUT {
     PREV_NEXT = 0,
     NEXT_PREV = 1,
     SIDE_BUTTONS_DISABLED = 2,
     NEXT_NEXT = 3,
+    PREV_PREV = 4,
     SIDE_BUTTON_LAYOUT_COUNT
   };
 
@@ -150,7 +166,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     REFRESH_FREQUENCY_COUNT
   };
 
-  // Short power button press actions
+  // Short power button press actions. PWR_CONFIRM is only offered on touch
+  // boards (see SettingsList.h).
   enum SHORT_PWRBTN {
     IGNORE = 0,
     SLEEP = 1,
@@ -165,9 +182,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   };
 
   // Long-press Confirm action while reading an EPUB. The setting cycles through these values.
-  // Persisted in settings.json by index: any new function (e.g. dictionary, bookmark) MUST use a
-  // value >= 2 and be appended at the END of the enumValues array in SettingsList.h, otherwise the
-  // stored indices shift and existing saves are silently misinterpreted.
+  // Persisted in settings.json by number: a new function takes the next number after the last one and
+  // is appended at the END of this enum, otherwise stored numbers shift and existing saves are silently
+  // misinterpreted. The row in SettingsList.h maps list position to number (buildLongPressMenuSetting).
   enum LONG_PRESS_MENU_FUNCTION {
     LP_MENU_KOSYNC = 0,
     LP_MENU_DISABLED = 1,
@@ -175,9 +192,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     LP_MENU_DICTIONARY = 3,
     LP_MENU_READER_MENU = 4,
     LP_MENU_FILE_TRANSFER = 5,
-    // Last on purpose: boards without an IMU drop it from the list without
-    // shifting any stored index.
+    // Boards without an IMU leave this one out of the list; its number stays reserved.
     LP_MENU_TILT_PAGE_TURN = 6,
+    // Runs the reader menu's Save quotation (the quote selector). Appended after the tilt toggle, so
+    // every earlier save reads as before; the list shows it at position 6 on a board without an IMU.
+    LP_MENU_SAVE_QUOTE = 7,
+    LP_MENU_CONNECT_REMOTE = 8,
     LONG_PRESS_MENU_FUNCTION_COUNT
   };
 
@@ -194,8 +214,6 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     LONG_PRESS_BUTTON_BEHAVIOR_COUNT
   };
 
-  // UI Theme
-  enum UI_THEME { CLASSIC = 0, LYRA = 1, LYRA_3_COVERS = 2, ROUNDEDRAFF = 3, TENOR_UI = 4 };
   enum UI_TEXT_SIZE { UI_TEXT_SMALL = 0, UI_TEXT_MEDIUM = 1, UI_TEXT_LARGE = 2, UI_TEXT_SIZE_COUNT };
 
   // Image rendering in EPUB reader
@@ -216,13 +234,22 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     TILT_STRENGTH_COUNT
   };
 
+  // touchReaderControls is now a master on/off (#3586); which gesture turns
+  // the page in each direction lives in the two PAGE_TURN_GESTURE fields
+  // below. Touch boards only (X3/X4 have no touch controller and hide this
+  // row entirely - see settingHiddenOnThisBoard).
+  enum TOUCH_READER_CONTROLS { TOUCH_READER_OFF = 0, TOUCH_READER_ON = 1, TOUCH_READER_CONTROLS_COUNT };
 
-  enum TOUCH_READER_CONTROLS {
-    TOUCH_READER_OFF = 0,
-    TOUCH_READER_ON = 1,
-    TOUCH_READER_SWIPE = 2,
-    TOUCH_READER_INVERTED_TAP = 3,
-    TOUCH_READER_CONTROLS_COUNT
+  // Per-direction reader page-turn gestures. INVERTED_TAP is tap-only; either
+  // direction set to it swaps both directions' shared tap zones (see
+  // ReaderUtils::detectTouchPageTurn).
+  enum PAGE_TURN_GESTURE {
+    TAP_AND_SWIPE = 0,
+    TAP_ONLY = 1,
+    SWIPE_ONLY = 2,
+    INVERTED_TAP = 3,
+    PAGE_TURN_GESTURE_DISABLED = 4,
+    PAGE_TURN_GESTURE_COUNT
   };
 
   // How the reader menu opens on touch boards. Persisted under the legacy
@@ -261,10 +288,25 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     READER_STATUS_BAR_CHAPTER_PROGRESS = 3,  // Ten chuong & tien trinh chuong
     READER_STATUS_BAR_CHAPTER_CLOCK = 4,     // Ten chuong & dong ho
     READER_STATUS_BAR_CHAPTER_BATTERY = 5,   // Ten chuong & pin
+    READER_STATUS_BAR_CLOCK_CHAPTER_PROGRESS = 6,
+    READER_STATUS_BAR_BOOK_DETAILS = 7,
     READER_STATUS_BAR_MODE_COUNT
   };
+  enum READER_STATUS_SLOT : uint8_t {
+    STATUS_SLOT_NONE = 0, STATUS_SLOT_CLOCK, STATUS_SLOT_BATTERY, STATUS_SLOT_CHAPTER_PAGES,
+    STATUS_SLOT_BOOK_PERCENT, STATUS_SLOT_CHAPTER_ETA, STATUS_SLOT_BOOK_ETA, STATUS_SLOT_CHAPTER_NAME,
+    STATUS_SLOT_CHAPTER_AND_BOOK_PROGRESS, STATUS_SLOT_COUNT
+  };
+  uint8_t readerStatusSlotsEnabled = 0;
+  uint8_t readerStatusTop = HIDE_TITLE;
+  uint8_t readerStatusLeft = STATUS_SLOT_CLOCK;
+  uint8_t readerStatusCenter = STATUS_SLOT_CHAPTER_PAGES;
+  uint8_t readerStatusRight = STATUS_SLOT_BATTERY;
+  uint8_t readerStatusItem(int row) const;
+  bool setReaderStatusItem(int row, uint8_t value);
   // Trang thai thanh trang thai
   uint8_t globalStatusBarMode = GLOBAL_STATUS_BAR_SMALL;
+  uint8_t tipsEnabled = 1;
   uint8_t readerStatusBarMode = READER_STATUS_BAR_DEFAULT;
   // Hai co cua v1.0.2 chi con de doc file cu roi quy doi trong fromJson.
   uint8_t hideReaderStatusBar = 0;
@@ -272,6 +314,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   bool globalStatusBarHidden() const { return globalStatusBarMode == GLOBAL_STATUS_BAR_OFF; }
   bool globalStatusBarLarge() const { return globalStatusBarMode == GLOBAL_STATUS_BAR_LARGE; }
   bool readerStatusBarHidden() const { return readerStatusBarMode == READER_STATUS_BAR_OFF; }
+  // Hide Battery %: the one place that says whether the number beside the battery is drawn.
+  bool batteryPercentShown(const bool inReader) const {
+    return hideBatteryPercentage == HIDE_NEVER || (hideBatteryPercentage == HIDE_READER && !inReader);
+  }
   // The chapter name (statusBarTitle), chapter page count and book percentage each
   // have their own switch; Off, battery and clock stay with readerStatusBarMode.
   // statusBarItemsMode names the mode the three switches belong to. The reader menu
@@ -287,22 +333,39 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t statusBarTitle = CHAPTER_TITLE;
   uint8_t statusBarBattery = 1;
   uint8_t xtcStatusBarMode = XTC_STATUS_BAR_HIDE;
-  // Clock display in status bar (X3 only, requires DS3231 RTC)
+  // Clock display in status bar (any board whose RTC probe succeeds)
   uint8_t statusBarClock = STATUS_BAR_CLOCK_HIDE;
-  // Clock UTC offset in quarter-hour steps, biased by 48 so it fits in uint8_t.
-  // Value 48 = UTC+0, 0 = UTC-12:00, 104 = UTC+14:00.
-  // Quarter-hour granularity supports oddball zones like Nepal (+5:45) and Chatham (+12:45).
+  // LEGACY, kept for migration only: quarter-hour UTC offset biased by 48
+  // (48 = UTC+0). Superseded by clockTimezone; read once by
+  // timezones::activeIndex() when clockTimezone is unset.
   uint8_t clockUtcOffsetQ = 48;
   // Clock display format: 0 = 24-hour, 1 = 12-hour
   uint8_t clockFormat = 0;
+  // Tenor: resolve clockUtcOffsetQ from network lookup (src/network/TimezoneLookup.cpp)
+  // instead of a manual offset. Independent of upstream's named-timezone picker below.
   uint8_t clockAutoTimezone = 1;
+  // Index into the timezone table (src/util/Timezones.cpp, append-only).
+  // 255 = never chosen; falls back to the legacy UTC offset, then UTC.
+  uint8_t clockTimezone = 255;
+  // CLOCK_DST_MODE: follow the zone's DST rule, or force it on/off.
+  uint8_t clockDst = CLOCK_DST_AUTO;
+  // CLOCK_HEADER_MODE: the clock (and the date) opposite the battery in every header band that draws one.
+  // tenor/cross draws the time for both shown modes; tenor/ugly adds the date.
+  uint8_t clockShowInHeader = CLOCK_HEADER_HIDE;
   // Set once an NTP sync succeeds. Used to skip re-syncing on every WiFi connect.
   // Resetting to 0 (e.g. via the web UI) forces a re-sync on next WiFi connect.
   uint8_t clockHasBeenSynced = 0;
-  // Text rendering settings. Each of these three is a readerSpacing::Level, not
+  // Text rendering settings. Each of these four is a readerSpacing::Level, not
   // a private enum: the ordinal is what settings.json stores, and ReaderSpacing.h
   // turns it into the line factor, the letter delta and the paragraph gap.
   // toJson stamps textSpacingVersion 3; fromJson folds v1/v2 files into it.
+  //
+  // Upstream's own word/character spacing redesign (percent-scale wordSpacing,
+  // separate characterSpacing 0..4 offset) is NOT taken here: it retypes the
+  // "wordSpacing" JSON key from a 5-level ordinal to a 50..200 percent, which
+  // would misread every existing save. Tenor's unified Level-based scheme
+  // covers the same UX (letterSpacing already is upstream's characterSpacing
+  // idea, just under Tenor's own key) so no capability is lost.
   uint8_t extraParagraphSpacing = readerSpacing::LEVEL_DEFAULT;
   uint8_t letterSpacing = readerSpacing::LEVEL_DEFAULT;
   // readerSpacing::Level applied to the U+0020 advance. Joined the group at
@@ -314,6 +377,13 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t textAntiAliasing = 1;
   // Short power button click behaviour
   uint8_t shortPwrBtn = IGNORE;
+  // X4 Pro: double-click power toggles the frontlight. Disabling frees the
+  // power button for shortPwrBtn actions without the double-click wait.
+  uint8_t doubleClickPwrLight = 1;
+  uint8_t homeButtonTapAction = static_cast<uint8_t>(HomeButtonAction::Home);
+  // Unassigned: a double tap action makes every single tap wait 350 ms to see whether a second follows.
+  uint8_t homeButtonDoubleTapAction = static_cast<uint8_t>(HomeButtonAction::Ignore);
+  uint8_t homeButtonLongPressAction = static_cast<uint8_t>(HomeButtonAction::ReaderMenu);
   // EPUB reading orientation settings
   // 0 = portrait (default), 1 = landscape clockwise, 2 = inverted, 3 = landscape counter-clockwise
   uint8_t orientation = PORTRAIT;
@@ -328,6 +398,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Tab Yeu thich cua menu doc: cac muc nguoi doc tu ghim, THEO DUNG THU TU ho xep.
   // Giu o day de no song qua lan tat may. Moi o la mot readermenu::Action, luu bang so
   // chu khong bang ten, nen them muc moi phai THEM VAO CUOI enum do (xem ReaderMenuLayout.h).
+  // X4 Pro con ghim duoc cai dat chu: o mang readermenu::PIN_TEXT, luu bang "text/<key>".
   // Tran 8 phai khop readermenu::TOI_DA_GHIM; CrossPointSettings.cpp co static_assert giu.
   static constexpr uint8_t READER_FAVORITE_MAX = 8;
   uint8_t readerFavorites[READER_FAVORITE_MAX] = {};
@@ -367,6 +438,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   static constexpr uint8_t SCREEN_MARGIN_MAX = 40;
   static constexpr uint8_t SCREEN_MARGIN_STEP = 5;
   uint8_t screenMargin = SCREEN_MARGIN_MIN;
+  uint8_t homeStyle = 0;
   // OPDS download destination folder ("" = SD root). Global; edited from the
   // OPDS server list. Persisted via a category-less SettingInfo::String in
   // SettingsList.h, so it stays out of the on-device Settings screen.
@@ -382,12 +454,29 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Long-press Confirm function in EPUB reader (cycles through LONG_PRESS_MENU_FUNCTION values).
   // Defaults to Disabled so shortcut-based bookmark toggling remains opt-in.
   uint8_t longPressMenuFunction = LP_MENU_DISABLED;
-  // UI Theme
-  uint8_t uiTheme = TENOR_UI;
   // UI font tier. Persisted ordinals: 0 Small, 1 Medium, 2 Large.
   uint8_t uiTextSize = UI_TEXT_SMALL;
+  // Which shell draws Home: 0 tenor/cross, 1 tenor/ugly. A settings file without the key loads as 0.
+  uint8_t uiShell = 0;
+  // How ugly tenor/ugly draws its letters: 0 ugly (straight), 1 ugly af (turned as they are drawn). A settings file without the key loads as 1.
+  uint8_t uiUglyLevel = 1;
+  // The sleep screen tenor/ugly took over when the user went in, as that screen + 1 (0 = none taken). Leaving
+  // gives it back. Persisted in settings.json, never shown on the device or the web page.
+  uint8_t uiShellSleepMemo = 0;
+  // 1 when going into tenor/ugly turned a hidden header clock on (its default there is the time); leaving
+  // hides it again if it still shows just the time. Persisted only.
+  uint8_t uiShellClockMemo = 0;
+  // 1 once the header clock of tenor/ugly has had its one-time turn on (shell::settingsLoaded): a device already
+  // in tenor/ugly when that arrived shows the time, and a clock hidden after that stays hidden. Persisted only.
+  uint8_t uiShellClockOnce = 0;
+  // tenor/ugly on a touch screen: the battery struck off the top band (a ring round its corner brings it
+  // back). Persisted only; tenor/cross never reads it.
+  uint8_t uglyBatteryHidden = 0;
   // Tenor-only appearance preferences; existing themes retain their own hints.
   uint8_t tenorButtonSymbols = 1;
+  // The front button hints at the foot of a button reader (Button hints). Off: the clock and the battery go to
+  // a strip at the top.
+  uint8_t tenorButtonHints = 1;
   uint8_t tenorSideArrows = 1;
   // Sunlight fading compensation
   uint8_t fadingFix = 0;
@@ -406,11 +495,14 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // SdCardFontSystem::begin() clears the name and the built-in fontFamily takes over.
   // A settings file that already exists wins over this - loadFromFile() reads the stored
   // name (blank included), so nobody's saved font choice gets overwritten by an upgrade.
-  char sdFontFamilyName[32] = "Bokerlam";
+  char sdFontFamilyName[64] = "Bokerlam";
   // Dictionary folder name under /dictionaries (empty = no dictionary)
   char dictionaryName[32] = "";
   // Show hidden files/directories (starting with '.') in the file browser (0 = hidden, 1 = show)
   uint8_t showHiddenFiles = 0;
+  // Show the title and author read from inside each book rather than its
+  // filename. Users can disable this to make index rebuilds skip EPUB parsing.
+  uint8_t libraryUseMetadata = 1;
   // Remove a book from the Recent Books list when its End-of-Book screen is reached (0 = off, 1 = on)
   uint8_t removeReadBooksFromRecents = 0;
   // Move epub to /Read/ folder on SD card when finished (0 = disabled, 1 = enabled)
@@ -437,10 +529,21 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Face down and face up actions, each a place in quickaction::SHAKE_ORDER (0 = Off).
   uint8_t faceDownAction = 0;
   uint8_t faceUpAction = 0;
-  // Double tap action, a place in quickaction::SHAKE_ORDER (0 = Off).
+  // Double tap on the back, on the screen and on a side edge, each a place in
+  // quickaction::SHAKE_ORDER (0 = Off). The key doubleTapAction predates the other two and stays.
   uint8_t doubleTapAction = 0;
-  // Touch screen reader zones/gestures on boards with a touch controller.
-  uint8_t touchReaderControls = TOUCH_READER_SWIPE;
+  uint8_t screenTapAction = 0;
+  uint8_t edgeTapAction = 0;
+  // Master reader-touch toggle on boards with a touch controller.
+  uint8_t touchReaderControls = TOUCH_READER_ON;
+  // Which gestures turn the page in each direction (PAGE_TURN_GESTURE).
+  uint8_t pageTurnGesture = TAP_AND_SWIPE;
+  uint8_t previousPageGesture = TAP_AND_SWIPE;
+  // Width of the back-tap column on a reader page, a step of readertap::BACK_PERCENT (15/20/25/33%).
+  uint8_t backTapZone = 2;
+  // X4 Pro: the reader's tap-zone tip over the first page. "Don't show this tip again" turns it off; the
+  // Controls row turns it back on.
+  uint8_t readerTapTip = 1;
   // Reader menu open gesture (SHOW_READER_MENU: off / center tap / bottom-edge
   // up-swipe). Only surfaced on home-key boards, where Home is the capacitive
   // key and the bottom edge is free; elsewhere it stays at the Tap default.
@@ -466,80 +569,21 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Wake straight back into the book that was open when deep sleep began,
   // instead of returning to Home. 0 = off, 1 = on.
   uint8_t wakeIntoBook = 0;
+  // X3 UC8279: a wake to Home from a kept sleep frame draws the "Starting up" notice over the sleep
+  // screen first (measured +270 ms to Home done). 0 = off (default), 1 = on.
+  uint8_t wakeNotice = 0;
   // X3 only: end every sleep screen on one full black and white refresh, gray art as an
-  // ordered dither (v1.0.12). 0 keeps the v1.0.11 gray waveforms. 1 = on (default).
-  uint8_t sleepBwRefresh = 1;
+  // ordered dither (v1.0.12). 0 = gray waveforms, real 4-level gray (default since v1.0.52),
+  // 1 = fold to black and white. Stored as "sleepBwFold": the v1.0.12 to v1.0.51 key
+  // "sleepBwRefresh" held 1 on every card by default, and is no longer read.
+  uint8_t sleepBwFold = 0;
 
   // --- BLE page turner (BTH2) -------------------------------------------------
-  // Mac dinh TAT. Nam truong nay duoc luu tay trong toJson/fromJson (khong qua
-  // SettingsList) vi man hinh cua chung la BlePageTurnerActivity, khong phai
-  // man Cai dat chung. File v1.0.2 khong co nam khoa nay: doc len ra dung mac
-  // dinh duoi day, va khong truong cu nao bi mat.
-  //
-  // `blePeerAddr`/`blePeerName` la thiet bi nguoi dung da chon: giu lai de lan
-  // sau ket noi lai ma khong phai quet lai. `blePrevKeyUsage`/`bleNextKeyUsage`
-  // la ma HID usage THO da hoc duoc tu report da phan giai; 0 = chua hoc.
-  uint8_t blePageTurnerEnabled = 0;
-  char blePeerAddr[18] = "";
-  char blePeerName[32] = "";
-  uint8_t blePrevKeyUsage = 0;
-  uint8_t bleNextKeyUsage = 0;
-  // Per-remote button tables (by BLE address), key `bleRemotes`. The rules for
-  // learning, reading and lookup live in activities/settings/BleKeyBinding.h; this
-  // only holds the storage.
-  blebinding::RemoteTable bleRemotes[blebinding::kMaxRemotes] = {};
-  uint8_t bleRemoteCount = 0;
-
-  static constexpr uint8_t BLE_USAGE_NONE = 0;
-  // HID Usage Tables, Keyboard/Keypad (page 0x07): Left 0x50, Right 0x4F,
-  // Page Up 0x4B, Page Down 0x4E, Up 0x52, Down 0x51, Space 0x2C, Enter 0x28,
-  // Backspace 0x2A. Volume Up/Down and Scan Next/Prev live on the Consumer page
-  // (0x0C) and reach the app as the low byte of the 16-bit usage.
-  static constexpr uint8_t BLE_USAGE_LEFT = 0x50;
-  static constexpr uint8_t BLE_USAGE_RIGHT = 0x4F;
-  static constexpr uint8_t BLE_USAGE_PAGE_UP = 0x4B;
-  static constexpr uint8_t BLE_USAGE_PAGE_DOWN = 0x4E;
-  static constexpr uint8_t BLE_USAGE_UP = 0x52;
-  static constexpr uint8_t BLE_USAGE_DOWN = 0x51;
-  static constexpr uint8_t BLE_USAGE_SPACE = 0x2C;
-  static constexpr uint8_t BLE_USAGE_ENTER = 0x28;
-  static constexpr uint8_t BLE_USAGE_BACKSPACE = 0x2A;
-  static constexpr uint8_t BLE_USAGE_VOLUME_UP = 0xE9;
-  static constexpr uint8_t BLE_USAGE_VOLUME_DOWN = 0xEA;
-  static constexpr uint8_t BLE_USAGE_SCAN_NEXT = 0xB5;
-  static constexpr uint8_t BLE_USAGE_SCAN_PREV = 0xB6;
-
-  enum class BlePageAction : uint8_t { None = 0, PreviousPage, NextPage };
-
-  // Y nghia lat trang cua mot usage HID da phan giai. Nut DA HOC thay cho mac
-  // dinh cua dung chieu do: hoc roi thi nut cu khong con lat trang nua, neu
-  // khong nguoi dung khong bao gio bo duoc mot anh xa sai. Chua hoc gi thi bo
-  // nut mac dinh duoi day duoc nhan - van ban go binh thuong KHONG lat trang.
-  // Mot usage di kem modifier (Ctrl/Alt/...) khong tinh.
-  //
-  // Bo mac dinh phai du rong cho dieu khien gia: mot so remote chi gui mui ten
-  // Len/Xuong, Space, Enter, hoac phim am luong - khong phai bon nut ban phim
-  // chuan nhu ban dau.
-  BlePageAction blePageActionFor(const uint8_t usageId, const uint8_t mods) const {
-    if (!blePageTurnerEnabled || usageId == BLE_USAGE_NONE || mods != 0) return BlePageAction::None;
-    if (blePrevKeyUsage != BLE_USAGE_NONE && usageId == blePrevKeyUsage) return BlePageAction::PreviousPage;
-    if (bleNextKeyUsage != BLE_USAGE_NONE && usageId == bleNextKeyUsage) return BlePageAction::NextPage;
-    if (blePrevKeyUsage == BLE_USAGE_NONE && macDinhLatLui(usageId)) return BlePageAction::PreviousPage;
-    if (bleNextKeyUsage == BLE_USAGE_NONE && macDinhLatToi(usageId)) return BlePageAction::NextPage;
-    return BlePageAction::None;
-  }
-
-  // Bo nut mac dinh cua tung chieu khi chua hoc nut nao. Mot so remote chi gui
-  // mui ten Len/Xuong, Space, Enter, hoac phim am luong.
-  static constexpr bool macDinhLatLui(const uint8_t usageId) {
-    return usageId == BLE_USAGE_LEFT || usageId == BLE_USAGE_PAGE_UP || usageId == BLE_USAGE_UP ||
-           usageId == BLE_USAGE_BACKSPACE || usageId == BLE_USAGE_VOLUME_DOWN || usageId == BLE_USAGE_SCAN_PREV;
-  }
-  static constexpr bool macDinhLatToi(const uint8_t usageId) {
-    return usageId == BLE_USAGE_RIGHT || usageId == BLE_USAGE_PAGE_DOWN || usageId == BLE_USAGE_DOWN ||
-           usageId == BLE_USAGE_SPACE || usageId == BLE_USAGE_ENTER || usageId == BLE_USAGE_VOLUME_UP ||
-           usageId == BLE_USAGE_SCAN_NEXT;
-  }
+  // Mac dinh TAT. Luu tay trong toJson/fromJson (khong qua SettingsList) vi man
+  // hinh cua no la BlePageTurnerActivity, khong phai man Cai dat chung. Cac khoa
+  // JSON va luat doc/ghi nam o lib/BlePageTurner (BlePageTurnerJson.h), nen file
+  // cai dat cu doc len y nhu truoc.
+  bleturner::Config ble;
 
   static constexpr uint8_t MIN_SLEEP_TIMEOUT_MINUTES = 1;
   static constexpr uint8_t SLEEP_TIMEOUT_NEVER_MINUTES = 31;
@@ -550,6 +594,32 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   using SdFontIdResolver = int (*)(void* ctx, const char* familyName, uint8_t fontSize);
   SdFontIdResolver sdFontIdResolver = nullptr;
   void* sdFontResolverCtx = nullptr;
+
+  enum UGLY_START_SCREEN : uint8_t {
+    UGLY_START_BOOK = 0,
+    UGLY_START_ROOT = 1,
+    UGLY_START_RECENT = 2,
+    UGLY_START_SCREEN_COUNT
+  };
+  enum UGLY_ROOT_SCREEN : uint8_t { UGLY_ROOT_DIARY, UGLY_ROOT_DESK, UGLY_ROOT_SCREEN_COUNT };
+  uint8_t uglyStartScreen = UGLY_START_ROOT;
+  uint8_t uglyRootScreen = UGLY_ROOT_DIARY;
+
+  bool uglyRootIsDesk() const { return uglyRootScreen == UGLY_ROOT_DESK; }
+
+  bool migrateUglyRoot(const bool hasRoot, const uint8_t storedStart) {
+    const uint8_t oldRoot = uglyRootScreen;
+    if (!hasRoot && (storedStart == 1 || storedStart == 3))
+      uglyRootScreen = storedStart == 3 ? UGLY_ROOT_DESK : UGLY_ROOT_DIARY;
+    uglyStartScreen = storedStart == UGLY_START_BOOK || storedStart == UGLY_START_RECENT
+                          ? storedStart : static_cast<uint8_t>(UGLY_START_ROOT);
+    return !hasRoot || oldRoot != uglyRootScreen || storedStart != uglyStartScreen;
+  }
+
+  UGLY_START_SCREEN startScreen(const bool normalBoot) const {
+    if (!normalBoot || uglyStartScreen >= UGLY_START_SCREEN_COUNT) return UGLY_START_ROOT;
+    return static_cast<UGLY_START_SCREEN>(uglyStartScreen);
+  }
 
   // Whether a power-button wake may boot. With Short Power Button = Sleep a tap
   // puts the device to sleep, so a tap must also wake it, on every board;
@@ -625,6 +695,17 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // refresh. Locking here would instead put a mutex on the render path and
   // stall it behind the SD write inside saveToFile(). Don't add one back.
   struct StatusBarSpec {
+    bool slotsEnabled = false;
+    uint8_t topTitleMode = HIDE_TITLE;
+    std::array<uint8_t, 3> slots{STATUS_SLOT_NONE, STATUS_SLOT_NONE, STATUS_SLOT_NONE};
+    bool hasSlot(uint8_t item) const {
+      for (const auto slot : slots) {
+        if (slot == item) return true;
+        if (slot == STATUS_SLOT_CHAPTER_AND_BOOK_PROGRESS &&
+            (item == STATUS_SLOT_CHAPTER_PAGES || item == STATUS_SLOT_BOOK_PERCENT)) return true;
+      }
+      return false;
+    }
     bool showChapterPageCount = false;
     bool showBookProgressPercent = false;
     uint8_t titleMode = HIDE_TITLE;  // STATUS_BAR_TITLE
@@ -632,7 +713,6 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     bool showBatteryPercent = false;
     uint8_t clockMode = STATUS_BAR_CLOCK_HIDE;  // STATUS_BAR_CLOCK_MODE
     bool clock12h = false;
-    uint8_t clockUtcOffsetQ = 48;             // 48 = UTC+0
     uint8_t progressBarMode = HIDE_PROGRESS;  // STATUS_BAR_PROGRESS_BAR
     uint8_t progressBarHeightPx = 0;          // (thickness+1)*2; 0 when the bar is hidden
     uint8_t xtcMode = XTC_STATUS_BAR_HIDE;    // XTC_STATUS_BAR_MODE
@@ -643,6 +723,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     // Visibility of the text lane. Clock hardware presence is the caller's
     // concern: pass halClock.isAvailable(), or true for layout reservation.
     bool textLaneVisible(bool clockAvailable) const {
+      if (slotsEnabled) {
+        if (topTitleMode != HIDE_TITLE) return true;
+        for (const auto slot : slots)
+          if (slot != STATUS_SLOT_NONE && (slot != STATUS_SLOT_CLOCK || clockAvailable)) return true;
+        return false;
+      }
       return showChapterPageCount || showBookProgressPercent || showsTitle() || showBattery ||
              (showsClock() && clockAvailable);
     }

@@ -12,6 +12,7 @@
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
 #include "components/icons/customListIcons.h"
@@ -34,7 +35,8 @@ constexpr fui::ActionId ACTION_TILE = 6;  // value = tile index
 constexpr int16_t kPanelSideMargin = 16;
 constexpr int16_t kGrabberHeight = 5;     // fui::SheetProps default, mirrored here
 constexpr int16_t kSliderRowHeight = 56;  // the pill itself (finger-sized)
-constexpr int16_t kTileHeight = 84;
+// The X4 Pro draws the panel in tenor/cross: round controls (circle buttons, stadium slider and tiles).
+constexpr int16_t kTileHeight = tenorchrome::kTouchShell ? 64 : 84;
 constexpr int16_t kTileGap = 16;
 constexpr int kTileCols = 2;
 // One percent per press, on the -/+ buttons and on the physical Left/Right keys
@@ -101,8 +103,21 @@ void FrontlightPanelActivity::persistLightSettings() {
 }
 
 void FrontlightPanelActivity::onExit() {
+  // A global gesture may have changed the light on the same pass that Home
+  // bypassed loop(). Read the live HAL before persisting the closing panel.
+  syncFrontlight();
   persistLightSettings();
   Activity::onExit();
+}
+
+bool FrontlightPanelActivity::syncFrontlight() {
+  const bool changed = brightness != Frontlight.brightness() || warmth != Frontlight.warmth() ||
+                       lightOn != Frontlight.isOn();
+  if (lightOn != Frontlight.isOn()) lightOnChanged = true;
+  brightness = Frontlight.brightness();
+  warmth = Frontlight.warmth();
+  lightOn = Frontlight.isOn();
+  return changed;
 }
 
 void FrontlightPanelActivity::onBrightnessEvent(const fui::ActionEvent& event, void* user) {
@@ -224,6 +239,10 @@ bool FrontlightPanelActivity::handleHomeGesture() {
 }
 
 void FrontlightPanelActivity::loop() {
+  {
+    RenderLock lock;
+    if (syncFrontlight()) requestUpdate();
+  }
   const auto touch = routeTouch(mappedInput, false, /*routeHeld=*/true);
   if (touch.routed) {
     if (app.invalidated()) requestUpdate();
@@ -273,7 +292,9 @@ int FrontlightPanelActivity::computePanelBottom() const {
   const int16_t lineHeight = uiTarget.lineHeight(tokens.smallText.font);
   // Slim battery band + the air around it (mirrors buildPanelScreen).
   const int y0 = std::max<int>(metrics.batteryHeight, lineHeight);
-  int y = tokens.spaceMd + y0 + tokens.spaceMd;
+  // Touch shell: the header row, where every screen keeps the clock and the battery.
+  int y = tenorchrome::kTouchShell ? tenorchrome::tabTop()
+                                   : tokens.spaceMd + y0 + tokens.spaceMd;
   if (Frontlight.present()) {
     // Screen::sliderRow reserves caption + spaceMd + control band, then a
     // spaceMd gap; addSliderRow() adds one more spaceMd of air after each row.
@@ -317,6 +338,10 @@ void FrontlightPanelActivity::addSliderRow(UiScreen& screen, const char* label, 
   rowProps.increment = stepAction;
   rowProps.decrementValue = -BRIGHTNESS_STEP;
   rowProps.incrementValue = BRIGHTNESS_STEP;
+  if (tenorchrome::kTouchShell) {
+    rowProps.buttonRadius = static_cast<uint8_t>(kSliderRowHeight / 2);
+    rowProps.capsuleRadius = static_cast<uint8_t>(kSliderRowHeight / 2);
+  }
   if (showToggle) {
     // Lamp on/off after the +: the sliders set the level, this kills the light
     // outright. Filled glyph = on, outline = off.
@@ -351,7 +376,11 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
   // Reuse the exact battery renderer and header rectangle used by Home. Call
   // the base implementation directly because RoundedRaff suppresses its
   // untitled Home header.
-  {
+  if (tenorchrome::kTouchShell) {
+    // The clock and the battery on the header row, as on every other screen.
+    screen.takeTop(static_cast<int16_t>(tenorchrome::tabTop()));
+    tenorchrome::drawStatus(renderer);
+  } else {
     const auto& metrics = UITheme::getInstance().getMetrics();
     screen.spacer(theme.spaceMd);
     const int16_t bandH = std::max<int16_t>(static_cast<int16_t>(metrics.batteryHeight),
@@ -404,6 +433,7 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
     gridProps.action = ACTION_TILE;
     gridProps.tileHeight = kTileHeight;
     gridProps.gap = kTileGap;
+    if (tenorchrome::kTouchShell) gridProps.radius = static_cast<uint8_t>(kTileHeight / 2);
     screen.tileGrid(gridProps);
   }
 }

@@ -1,5 +1,7 @@
 #include "NetworkModeSelectionActivity.h"
 
+#include "activities/X3ActivityLayout.h"
+
 #include <GfxRenderer.h>
 #include <I18n.h>
 
@@ -65,9 +67,15 @@ void NetworkModeSelectionActivity::activateIndex(const int index) {
 void NetworkModeSelectionActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   // Content below the GUI.drawHeader band, above the button hints.
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, nullptr, 8));
+    screen.setContentMarginFromScreen({static_cast<int16_t>(layout.bodyRect.y), 0,
+        static_cast<int16_t>(renderer.getScreenHeight() - layout.bodyRect.bottom() + 0), 0});
+  } else {
   screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
                                                 static_cast<int16_t>(metrics.buttonHintsHeight), 0});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
+  if (!tenorchrome::x3ScreenLayoutEnabled()) screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   // rowItems_ was built once in the constructor and is reused here on every
   // repaint.
@@ -78,7 +86,7 @@ void NetworkModeSelectionActivity::buildScreen(UiScreen& screen) {
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
   props.subtitleText = screen.theme().smallText;
   props.subtitleText.maxLines = 2;
-  syncListViewport(screen, props, /*hasSubtitle=*/true);
+  syncListViewport(screen, props);
   screen.list(props);
 }
 
@@ -92,4 +100,13 @@ void NetworkModeSelectionActivity::onCancel() {
   result.isCancelled = true;
   setResult(std::move(result));
   finish();
+}
+
+void NetworkModeSelectionActivity::drawChrome() {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, nullptr, 8));
+    x3activity::drawBar(renderer, layout.barRect, headerTitle(), navigationPrefix.c_str());
+    return;
+  }
+  UiListActivity::drawChrome();
 }

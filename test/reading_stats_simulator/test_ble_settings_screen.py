@@ -12,15 +12,15 @@ Ban do dieu huong do duoc (do lai bang anh, xem docstring cua class):
   Home (the dau) -> DOWN x4 = the Cai dat; RIGHT x7 = nhom `Thiet bi` (v1.0.17 them nhom
   Cam bien chuyen dong truoc He thong); CONFIRM mo
   man Cai dat tai nhom do; trong nhom `Thiet bi` vong N dong bat dau o dong 1, dong 4
-  la `Ble page turner` va dong 5 (cuoi, v1.0.17) la chip man hinh chi doc; LEFT hai lan
-  tu dong 1 quay ve dong 4, CONFIRM mo man BLE.
+  la `Ble page turner`, dong 5 la `Gioi thieu` (About, CrossPoint 1.6.5) va dong 6 (cuoi,
+  v1.0.17) la chip man hinh chi doc; LEFT ba lan tu dong 1 quay ve dong 4, CONFIRM mo man BLE.
   Trong man Cai dat: UP/DOWN doi nhom, RIGHT/LEFT di dong. Nhip phim >= 800 ms
   (nhip 900 ms tung bi hut mot nhip; bai nay dung 1200 ms).
 
 Ky vong dung khi co BLE DANG TAT (FREEINK_CAP_BLE_HID_HOST=0, mac dinh):
   - man BLE VAN mo duoc (khong treo, khong chan);
   - trang thai hien `Bản dựng này không có Bluetooth` (STR_BLE_UNAVAILABLE) va
-    KHONG BAO GIO thanh `BẬT` (STR_STATE_ON): radio khong chay duoc;
+    KHONG BAO GIO thanh `Bật` (STR_STATE_ON): radio khong chay duoc;
   - nhip Chon vao dong `BLE page turner` van ghi y dinh (enabled=1) nhung
     begin() that bai -> ghi log ERR; tat lai thi `settings.json` tro ve 0.
   - hai dong `Gán nút lật tới` / `Gán nút lật lui` nam sau dong quet, gia tri
@@ -49,7 +49,7 @@ ART = Path(os.environ.get("CROSSPOINT_TEST_ARTIFACTS", REPO / "t3"))
 
 # Man BLE dang tat: chuoi trang thai cua STR_BLE_UNAVAILABLE trong lib/I18n/translations/vietnamese.yaml.
 UNAVAILABLE = "Bản dựng này không có Bluetooth"
-ON = "BẬT"
+ON = "Bật"
 
 NHIP_MS = 1200  # >= 800 ms: nhip nhanh hon tung lam hut nhip phim
 # `[BLE] BlePageTurner status=Bản dựng này không có Bluetooth enabled=0 bonds=0 devices=0`
@@ -104,16 +104,16 @@ class BleSettingsScreenTest(unittest.TestCase):
 
     def test_man_ble_mo_duoc_va_khong_bat_duoc_khi_co_ble_tat(self):
         # Home the dau -> the Cai dat (DOWN x4) -> nhom Thiet bi (RIGHT x7) ->
-        # mo man Cai dat (CONFIRM) -> LEFT x2 -> mo man BLE (CONFIRM) -> thu bat (CONFIRM)
+        # mo man Cai dat (CONFIRM) -> LEFT x3 -> mo man BLE (CONFIRM) -> thu bat (CONFIRM)
         # -> tat lai (CONFIRM) -> ra khoi man BLE (BACK) -> ra khoi Cai dat (BACK).
-        buoc = ["DOWN"] * 4 + ["RIGHT"] * 7 + ["CONFIRM", "LEFT", "LEFT", "CONFIRM", "CONFIRM", "CONFIRM"]
+        buoc = ["DOWN"] * 4 + ["RIGHT"] * 7 + ["CONFIRM", "LEFT", "LEFT", "LEFT", "CONFIRM", "CONFIRM", "CONFIRM"]
         # Moc chup: sau khi mo Cai dat, sau khi mo man BLE, sau moi nhip Chon.
-        mo_cai_dat, mo_ble = 2000 + 11 * NHIP_MS, 2000 + 14 * NHIP_MS
+        mo_cai_dat, mo_ble = 2000 + 11 * NHIP_MS, 2000 + 15 * NHIP_MS
         shots = [
             (mo_cai_dat + 900, "ble-cai-dat-nhom-thiet-bi"),
             (mo_ble + 900, "ble-man-hinh-1-khong-kha-dung"),
-            (2000 + 15 * NHIP_MS + 900, "ble-man-hinh-2-thu-bat"),
-            (2000 + 16 * NHIP_MS + 900, "ble-man-hinh-3-tat-lai"),
+            (2000 + 16 * NHIP_MS + 900, "ble-man-hinh-2-thu-bat"),
+            (2000 + 17 * NHIP_MS + 900, "ble-man-hinh-3-tat-lai"),
         ]
         buoc += ["BACK", "BACK", "QUIT"]
         log = self.chay(buoc, shots)
@@ -160,7 +160,7 @@ class BleSettingsScreenTest(unittest.TestCase):
         # Hang Trang thai bo qua khi bam nut: RIGHT x2 toi "Gan nut" (chua quet nen khong
         # co thiet bi chen giua), CONFIRM mo cac hang gan nut, con tro dung o "Gan nut lat
         # toi", CONFIRM bat dau cho. Het cho thi BACK chi dong cac hang gan nut, man van mo.
-        buoc = ["DOWN"] * 4 + ["RIGHT"] * 7 + ["CONFIRM", "LEFT", "LEFT", "CONFIRM"] + ["RIGHT"] * 2 + ["CONFIRM"] * 2
+        buoc = ["DOWN"] * 4 + ["RIGHT"] * 7 + ["CONFIRM", "LEFT", "LEFT", "LEFT", "CONFIRM"] + ["RIGHT"] * 2 + ["CONFIRM"] * 2
         bat_cho = 2000 + (len(buoc) - 1) * NHIP_MS
         script = kich_ban(buoc) + f"{bat_cho + 16500}:BACK;{bat_cho + 17500}:QUIT;"
         shots = [

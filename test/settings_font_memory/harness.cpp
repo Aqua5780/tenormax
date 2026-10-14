@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <vector>
 #include <BoardConfig.h>
@@ -47,12 +49,19 @@ void operator delete(void* p, size_t) noexcept { ::operator delete(p); }
 void operator delete[](void* p, size_t) noexcept { ::operator delete(p); }
 #include "Boundaries.inc"
 namespace fui = freeink::ui;
+namespace shell {
+bool isUgly() { return false; }
+}
 struct ActivityResult { bool isCancelled = false; };
 struct FontDownloadActivity {
   template<class A, class B> FontDownloadActivity(A&, B&) {}
   FontDownloadActivity() = default;
   enum State { LOADING_MANIFEST, ERROR, GROUP_LIST, FAMILY_LIST } state_ = FAMILY_LIST;
   struct Nav { void reset() {} } groupNav_, nav;
+  struct Renderer {
+    Renderer* getFontCacheManager() { return this; }
+    void releaseSdFontCaches() {}
+  } renderer;
   bool rowsDirty_ = false, finished = false, locked = false, sawReleased = false, fetchOk = true;
   void finish() { finished = true; }
   void requestUpdateAndWait() {}
@@ -63,12 +72,13 @@ struct FontDownloadActivity {
   void onWifiSelectionComplete(bool);
 };
 struct RenderLock {
-  FontDownloadActivity& owner;
-  explicit RenderLock(FontDownloadActivity& value) : owner(value) {
-    if(owner.locked) std::abort();
-    owner.locked = true; ++mem::renderLockDepth;
+  FontDownloadActivity* owner = nullptr;
+  explicit RenderLock(FontDownloadActivity& value) : owner(&value) {
+    if(owner->locked) std::abort();
+    owner->locked = true; ++mem::renderLockDepth;
   }
-  ~RenderLock() { owner.locked = false; --mem::renderLockDepth; }
+  template<class T> explicit RenderLock(T&) { ++mem::renderLockDepth; }
+  ~RenderLock() { if (owner) owner->locked = false; --mem::renderLockDepth; }
 };
 namespace obfuscation {
 String obfuscateToBase64(const std::string& s) { return String(s.c_str()); }
@@ -80,10 +90,15 @@ std::string deobfuscateFromBase64(const char* s, size_t, bool* ok, bool* tooLong
 }
 
 struct SettingsActivity {
-  struct Cursor { int selected = 0; bool followOnBuild = false; };
+  // Same shape as freeink::ui::ListNav: the selection is atomic (read by the render task).
+  struct Cursor { std::atomic<int> selected{0}; bool followOnBuild = false; };
   struct Input { bool hasTouch() const { return BoardConfig::hasTouch(); } } mappedInput;
   int renderer = 0;
   int selectedCategoryIndex = static_cast<int>(settingstabs::Tab::READER), settingsCount = 0;
+  struct FormBoundary { void invalidate() {} } form_;
+  std::atomic<bool> formPaintReady_{false};
+  uint8_t formCount_ = 0;
+  void bindForm() {}
   bool releaseListsForFontDownload_ = false;
   bool routingClosed = false;
   int saves = 0;
@@ -100,12 +115,15 @@ struct SettingsActivity {
     resultHandler = std::move(handler);
   }
   std::vector<SettingInfo>& danhSachCuaThe(settingstabs::Tab);
-  void rebuildSettingsLists();
+  static bool listedAsRow(const SettingInfo& setting);
+  void rebuildSettingsLists(bool lockHeld = false);
   void rebuildRowItems();
   void onPause();
   void onResume();
   void launchFontDownload();
 };
+// The X4 Pro About & updates screen (InfoUpdateActivity) holds no rows on these boards.
+namespace infoupdate { inline bool holds(settingstabs::Action, bool = false) { return false; } }
 #include "Methods.inc"
 #include "PostWifiMethods.inc"
 
@@ -127,6 +145,7 @@ bool catalogReleaseProbe() {
   const auto& initial = getBaseSettingsList();
   mem::active = false;
   const size_t bytes = mem::live;
+  const size_t sourceRows = initial.size();
   const auto copied = initial;
   const auto webCopy = getSettingsList();
   const auto clock = std::find_if(copied.begin(), copied.end(), [](const auto& row) {
@@ -138,7 +157,7 @@ bool catalogReleaseProbe() {
   bool ok = check(mem::live == 0, "shared catalog allocations released");
   std::printf("catalog_rows=%zu sizeof_SettingInfo=%zu allocated=%zu after_release=%zu\n",
               copied.size(), sizeof(SettingInfo), bytes, mem::live);
-  ok &= check(copied.size() == 80 && !webCopy.empty(), "80 base rows and owned web copy survive release");
+  ok &= check(sourceRows > 0 && copied.size() == sourceRows && !webCopy.empty(), "base rows and owned web copy survive release");
   clockCopy.valueSetter(1);
   ok &= check(clockCopy.valueGetter() == 1, "copied dynamic callback survives catalog release");
   SETTINGS.statusBarClock = CrossPointSettings::STATUS_BAR_CLOCK_HIDE;
@@ -160,14 +179,14 @@ bool catalogReleaseProbe() {
   deserializeJson(prior, beforeJson);
   ok &= check(SETTINGS.fromJson(prior.as<JsonVariantConst>()), "real settings JSON reload succeeds");
   ok &= check(jsonSettings() == beforeJson, "real settings JSON byte-equivalent roundtrip");
-  // A Wi-Fi time save can recreate the catalog. Release must happen after that
+  // A Wi-Fi time save builds no catalog (forEachBaseSetting, v1.0.53). Release must still happen after that
   // child returns and before manifest TLS, using the actual production callback.
   releaseBaseSettingsList();
   JsonDocument wifiSave;
   mem::active = true;
   SETTINGS.toJson(wifiSave);
   mem::active = false;
-  ok &= check(mem::live > 0, "Wi-Fi save has a full rebuilt catalog");
+  ok &= check(mem::live == 0, "Wi-Fi save builds no catalog");
   FontDownloadActivity font;
   mem::requireReleaseLock = true;
   font.onWifiSelectionComplete(true);
@@ -188,12 +207,12 @@ bool catalogReleaseProbe() {
 int main() {
   BoardConfig::ACTIVE = BoardConfig::XTEINK_X3;
   gpio.x3 = true; halTiltSensor.available = true;
-  SETTINGS.uiTheme = CrossPointSettings::TENOR_UI;
   (void)I18N.get(StrId::STR_SETTINGS_TITLE);
   bool ok = catalogReleaseProbe();
   for (const bool dictionaries : {false, true}) {
     discovered.clear();
     if (dictionaries) discovered.push_back({"Long dictionary owned label for lifetime verification", "book"});
+    (void)getBaseSettingsList();  // resident before the screen, as a boot that read settings left it until v1.0.53
     SettingsActivity activity;
     ++mem::epoch; mem::live = mem::peak = 0; mem::active = true;
     activity.rebuildSettingsLists();

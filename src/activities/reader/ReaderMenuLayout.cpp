@@ -4,6 +4,11 @@
 
 namespace readermenu {
 
+void separateTextTab(std::vector<Item>& items) {
+  for (auto& item : items)
+    if (item.action == Action::TEXT_SETTINGS) item.tab = Tab::TEXT;
+}
+
 void buildItems(std::vector<Item>& items, const bool hasFootnotes, const bool hasBookmarks, const bool hasFrontlight,
                 const bool hasTilt) {
   items.clear();
@@ -92,25 +97,6 @@ int rowsOfFavorites(const std::vector<Item>& all, const Action* favorites, const
     }
   }
   return n;
-}
-
-bool daGhim(const std::vector<Action>& ghim, const Action action) {
-  for (const auto a : ghim) {
-    if (a == action) return true;
-  }
-  return false;
-}
-
-bool doiGhim(std::vector<Action>& ghim, const Action action) {
-  for (size_t i = 0; i < ghim.size(); i++) {
-    if (ghim[i] != action) continue;
-    ghim.erase(ghim.begin() + static_cast<long>(i));
-    return true;
-  }
-  // Go ra thi luc nao cung duoc, ke ca khi day; chi viec THEM moi vuong tran.
-  if (static_cast<int>(ghim.size()) >= TOI_DA_GHIM) return false;
-  ghim.push_back(action);
-  return true;
 }
 
 int dayBac(std::vector<Action>& ghim, const int viTri, const int huong) {

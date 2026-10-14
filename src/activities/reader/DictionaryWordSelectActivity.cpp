@@ -2,6 +2,7 @@
 
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
+#include <HeapFloor.h>
 #include <Memory.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -18,9 +19,12 @@
 #include "QuoteHighlight.h"
 #include "QuoteReselect.h"
 #include "ReadingStatsStore.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "components/themes/TenorRadius.h"
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyInk.h"
 
 namespace {
 
@@ -54,7 +58,7 @@ void DictionaryWordSelectActivity::onEnter() {
   // No null check: a failed allocation just disables the differential
   // fast path (drawHighlightWithSnapshot skips the read), keeping the
   // full-repaint path as the fallback.
-  if (!quoteMode) snapshot = makeUniqueNoThrow<uint8_t[]>(SNAPSHOT_CAPACITY);
+  if (!quoteMode) snapshot = heapfloor::array<uint8_t[]>(SNAPSHOT_CAPACITY, "word-snapshot");
   extractWords();
   // Start on the middle row's word nearest mid-screen instead of top-left:
   // any word on the page is then at most half a page of moves away.
@@ -436,6 +440,10 @@ bool DictionaryWordSelectActivity::drawHighlightWithSnapshot() {
 // hint's screen area. No side-button hints: the full-bleed reader page has no
 // spare gutter for them, so a hint box there would hide text.
 void DictionaryWordSelectActivity::drawHints() const {
+  if (tenorchrome::kTouchShell) {
+    tenorchrome::clearFootBand(renderer);  // the bar's "<" over the page, no button hints
+    return;
+  }
   if (popup == Popup::Saved) {
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_DONE), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -456,6 +464,15 @@ void DictionaryWordSelectActivity::drawHints() const {
 }
 
 void DictionaryWordSelectActivity::drawSavedPopup() const {
+  if (shell::uglyParts()) {
+    // The shared scrap of paper with the jab, and where the quote went written small under it.
+    const std::string route = std::string(tr(STR_HOME_TAB_STATS)) + " > " + tr(STR_QUOTES);
+    const auto box = GUI.drawPopup(renderer, tr(STR_UGLY_QUOTE_SAVED), false);
+    const int rw = ugly::width(renderer, ugly::Size::S22, route.c_str());
+    ugly::text(renderer, ugly::Size::S22, box.x + (box.width - rw) / 2, box.y + box.height - 14, route.c_str());
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    return;
+  }
   const auto& metrics = UITheme::getInstance().getMetrics();
   const char* title = tr(STR_QUOTES_SAVED);
   const std::string route = std::string(tr(STR_HOME_TAB_STATS)) + " > " + tr(STR_QUOTES);

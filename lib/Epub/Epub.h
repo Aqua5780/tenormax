@@ -11,6 +11,7 @@
 #include "Epub/css/CssParser.h"
 
 class ZipFile;
+struct ImageDimensions;
 
 class Epub {
   // the ncx file (EPUB 2)
@@ -30,8 +31,11 @@ class Epub {
   // CSS files
   std::vector<std::string> cssFiles;
 
-  bool findContentOpfFile(std::string* contentOpfFile) const;
-  bool parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, bool writeSpineEntries = true);
+  bool findContentOpfFile(std::string* contentOpfFile, ZipFile* sharedZip = nullptr) const;
+  // `metadataOnly` stops at the end of <metadata> (title, author, language). `sharedZip` reads
+  // through an already open zip instead of opening the book per item.
+  bool parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, bool writeSpineEntries = true,
+                       bool metadataOnly = false, ZipFile* sharedZip = nullptr);
   bool parseTocNcxFile(BookMetadataCache* target, BookMetadataCache::StopFn stop) const;
   bool parseTocNavFile(BookMetadataCache* target, BookMetadataCache::StopFn stop) const;
   void discoverCssFilesFromZip();
@@ -63,6 +67,11 @@ class Epub {
   // step leaves either its whole result on the card or nothing, so a stop, a power cut or a
   // reopen at any point resumes at a step boundary. `stop` is asked every few milliseconds.
   IndexStep indexSome(BookMetadataCache::StopFn stop);
+  // Whether the next indexSome step streams the book's TOC through the 43 KB inflater, which takes
+  // the framebuffer when the caller lends it (GfxRenderer::FrameBufferLoan) and the heap otherwise.
+  bool indexStepInflates() const;
+  // Title and author from the book's cache, or from content.opf alone when it has none.
+  bool loadMetadata(std::string& title, std::string& author);
   bool clearCache() const;
   void setupCacheDir() const;
   const std::string& getCachePath() const;
@@ -76,11 +85,20 @@ class Epub {
   bool generateCoverBmp(bool cropped = false, bool originalThresholds = false, bool oneBit = false) const;
   std::string getThumbBmpPath() const;
   std::string getThumbBmpPath(int height) const;
+  std::string getThumbBmpPath(int width, int height) const;
   // Writes the 1-bit cover thumbnail for each height not on the card yet.
   void generateThumbBmps(const int* heights, int count) const;
   // The same from the cover's path in the book, for a book whose index is not loaded (Home).
   void generateThumbBmps(const std::string& coverImageHref, const int* heights, int count) const;
+  // Writes Home's X4 Pro cover using the exact frame size, with a width and height cache key.
+  void generateThumbBmps(const std::string& coverImageHref, const int* widths, const int* heights, int count,
+                         bool ink = false, bool four = true) const;
   bool isCoverImage(const std::string& href) const;
+  // One height (see generateThumbBmps); true when a drawable thumbnail is on the card.
+  bool generateThumbBmp(int height) const;
+  // Locate the cover without building spine, TOC, or reading caches.
+  bool generateThumbBmpFromSource(int height);
+  bool readCoverDimensions(const std::string& href, ImageDimensions& dims);
   uint8_t* readItemContentsToBytes(const std::string& itemHref, size_t* size = nullptr,
                                    bool trailingNullByte = false) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize,
@@ -98,6 +116,8 @@ class Epub {
   int getSpineIndexForTocIndex(int tocIndex) const;
   int getTocIndexForSpineIndex(int spineIndex) const;
   size_t getCumulativeSpineItemSize(int spineIndex) const;
+  // The first spine item whose cumulative size reaches `bytes`, -1 if none does.
+  int getSpineIndexForSize(size_t bytes) const;
   int getSpineIndexForTextReference() const;
 
   size_t getBookSize() const;

@@ -16,7 +16,8 @@ const std::vector<Action> kDongHanhDong = {
     Action::RemapFrontButtons, Action::CustomiseStatusBar, Action::KOReaderSync,    Action::OPDSBrowser,
     Action::Network,           Action::ClearCache,         Action::CheckForUpdates, Action::SdFirmwareUpdate,
     Action::Language,          Action::DownloadFonts,      Action::TextSettings,    Action::KeyboardLayouts,
-    Action::DeviceName,        Action::FileTransfer,       Action::BrowseOPDS,
+    Action::DeviceName,        Action::FileTransfer,       Action::BrowseOPDS,      Action::HomeButton,
+    Action::About,
 };
 
 std::map<Tab, int> demTheoThe() {
@@ -25,7 +26,7 @@ std::map<Tab, int> demTheoThe() {
   return dem;
 }
 
-TEST(SettingsTabs, CuaDongHoNamTrongHeThong) { EXPECT_EQ(settingstabs::nhaCua(Action::Clock), Tab::SYSTEM); }
+TEST(SettingsTabs, CuaDongHoNamTrongHeThong) { EXPECT_EQ(settingstabs::nhaCua(Action::ClockSettings), Tab::SYSTEM); }
 
 TEST(SettingsTabs, TamTheCoBanPhimVaNgu) {
   EXPECT_EQ(static_cast<int>(Tab::SLEEP), 7);
@@ -88,11 +89,13 @@ TEST(SettingsTabs, MoiDongCoDungMotNhaCoThat) {
 
 // --- nguong mo trinh chon ---------------------------------------------------------
 
-TEST(NguongTrinhChon, TuBonTroLenMoiMo) {
-  EXPECT_FALSE(settingstabs::moTrinhChon(2)) << "hai lua chon thi bam mot nhip la xong";
-  EXPECT_FALSE(settingstabs::moTrinhChon(3)) << "ba lua chon van doi tai cho";
+TEST(NguongTrinhChon, GiaTriTuHaiTroLenMo) {
+  EXPECT_TRUE(settingstabs::moTrinhChon(2));
+  EXPECT_TRUE(settingstabs::moTrinhChon(3)) << "3 choices open the picker";
   EXPECT_TRUE(settingstabs::moTrinhChon(4)) << "four choices open the picker";
   EXPECT_TRUE(settingstabs::moTrinhChon(6));
+  EXPECT_TRUE(settingstabs::moTrinhChon(7));
+  EXPECT_TRUE(settingstabs::moTrinhChon(130));
 }
 
 // Danh sach rong hay mot lua chon thi khong co gi de mo.

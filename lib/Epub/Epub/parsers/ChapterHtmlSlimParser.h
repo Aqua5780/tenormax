@@ -118,6 +118,20 @@ class ChapterHtmlSlimParser {
   std::vector<uint32_t> tableLineVisibleOffsets;
   bool listItemBulletOnly = false;  // true when currentTextBlock has only the <li> bullet
 
+  // Tracks the innermost open <ul>/<ol> so <li> knows whether to number itself,
+  // bullet itself, or (list-style-type: none) emit no marker at all. Pushed on
+  // <ul>/<ol> open, popped on close, so nested lists restart their own counter
+  // without disturbing the parent list's.
+  struct ListContext {
+    bool ordered = false;    // true for <ol>, false for <ul>
+    bool styleNone = false;  // true when list-style-type: none is set on this list
+    int counter = 0;         // incremented before each direct <li>; used as its number when ordered
+    int depth = 0;           // parser depth at open time; matches the depth seen in endElement
+                             // for the same tag, so a hidden nested list's close can't pop
+                             // an outer list's context
+  };
+  std::vector<ListContext> listStack;
+
   // Anchor-to-page mapping: tracks which page each HTML id attribute lands on
   int completedPageCount = 0;
   std::vector<std::pair<std::string, uint16_t>> anchorData;
@@ -169,7 +183,6 @@ class ChapterHtmlSlimParser {
   // A checkpoint is taken only after a closed text block, at an exact XML
   // event boundary. The read cursor may already be a buffer ahead of it.
   static constexpr size_t MAX_CHECKPOINT_ANCESTORS = 32;
-  static constexpr size_t MAX_CHECKPOINT_PREFIX = 2048;
   uint16_t checkpointPrologBytes_ = 0;
   std::string checkpointPrefix_;
   std::array<uint16_t, MAX_CHECKPOINT_ANCESTORS> checkpointPrefixEnds_{};
@@ -181,6 +194,11 @@ class ChapterHtmlSlimParser {
   // Set by requestCheckpoint(): the next eligible block close stops the parse, page finished or not.
   bool checkpointWanted_ = false;
   bool replayingCheckpoint_ = false;
+  // One page from the middle of a chapter (restoreResumePoint): lines starting at or before the
+  // text offset below replace the candidate page. Its last line opens the preview at Y=0, and
+  // following elements and spacing stay on that page once the target's block is complete.
+  bool holdingLines_ = false;
+  uint32_t holdUntil_ = 0;
   bool xmlSuspended_ = false;
   bool finalBuffer_ = false;
   uint32_t checkpointOffset_ = 0;
@@ -204,7 +222,7 @@ class ChapterHtmlSlimParser {
   void finishTableRow();
   void addTableRowSeparator();
   void setCurrentPageVisibleOffset(uint32_t offset);
-  void makePages();
+  void makePages(bool includeLastLine = true);
   void flushTextIfOverBudget();
   bool createPage();
   bool emitCurrentPage();
@@ -225,6 +243,7 @@ class ChapterHtmlSlimParser {
   static void XMLCALL processEndElement(void* userData, const XML_Char* name);
 
  public:
+  static constexpr size_t MAX_CHECKPOINT_PREFIX = 2048;
   explicit ChapterHtmlSlimParser(
       std::shared_ptr<Epub> epub, const std::string& filepath, GfxRenderer& renderer, const int fontId,
       const float lineCompression, const uint8_t extraParagraphSpacing, const uint8_t paragraphAlignment,
@@ -276,6 +295,22 @@ class ChapterHtmlSlimParser {
   ParseStatus parseStep();
   bool finishParse();  // flush the trailing page and tear down; fails if any build stage failed
   void abortParse();   // tear down without flushing (error / abandon)
+
+  // A safe place to start laying out from in the middle of the chapter: after a closed block, at a
+  // literal closing tag, with nothing pending. The same conditions as a checkpoint, minus "a page has
+  // just finished", and none of it depends on the font, size, spacing or alignment, so a point taken
+  // under one layout opens the chapter under any other. prefix: the open ancestors to replay.
+  struct ResumePoint {
+    uint32_t offset;
+    uint32_t visible;
+    int imageCounter;
+  };
+  std::function<void(const ResumePoint&, const std::string& prefix, uint16_t prologBytes)> resumePointFn;
+  // Call on a newly begun parser: replays prolog + prefix, seeks the file to the point and lays out
+  // from there; the first page starts at the line holding text offset `pageStart` (see holdingLines_).
+  bool restoreResumePoint(const std::string& prologAndPrefix, const ResumePoint& point, uint32_t pageStart);
+  // From the chapter start, with the first page at the line holding `pageStart` (0 = as laid out).
+  void startPageAt(uint32_t pageStart);
 
   bool hasCheckpoint() const;
   // Checkpoints normally come only after a step that finished a page. A caller that must park the

@@ -183,6 +183,7 @@ class InflateStream {
 
 struct CrossPointSettings { enum { LEFT_ALIGN = 0, JUSTIFIED = 1 }; };
 struct Settings {
+  uint8_t readerInkWeight = 0, textAntiAliasing = 0;
   uint8_t screenMargin = 0, paragraphAlignment = 0, extraParagraphSpacing = 0, wordSpacing = 0, paragraphIndent = 0;
   int8_t letterSpacing = 0;
   int getReaderFontId() const { return 0; }
@@ -209,6 +210,9 @@ struct GfxRenderer {
 struct Gui { void drawPopup(GfxRenderer&, const char*) {} } inline GUI;
 constexpr int STR_INDEXING = 0;
 inline const char* tr(int) { return "indexing"; }
+// The indexing notice comes through the voice of the shell (readerugly::notice); here it is the plain string.
+namespace StrId { constexpr int STR_INDEXING = ::STR_INDEXING; }
+namespace readerugly { inline const char* notice(int id) { return tr(id); } }
 
 inline size_t chunkAllocations = 0;
 inline size_t failChunkAllocationAt = 0;

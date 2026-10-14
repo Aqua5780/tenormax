@@ -2,7 +2,7 @@
 
 #include <Epub.h>
 #include <Epub/FootnoteEntry.h>
-#include <Epub/PageLink.h>
+#include <Epub/Page.h>
 #include <Epub/Section.h>
 #include <Epub/blocks/ImageBlock.h>
 
@@ -17,7 +17,11 @@
 #include "ProgressMapper.h"
 #include "QuoteStore.h"
 #include "ReaderActivity.h"
+#include "ReaderFontChon.h"
 #include "ReaderToolbarUi.h"
+#include "ReaderTextRelayout.h"
+#include "SheetRadioPlan.h"
+#include "TextGrayPolicy.h"
 #include "components/OptionPopup.h"
 
 class EpubReaderActivity final : public ReaderActivity {
@@ -69,6 +73,19 @@ class EpubReaderActivity final : public ReaderActivity {
   // The framebuffer holds exactly the page frame on the panel: set when renderBook ends on a
   // page, cleared when a paint begins and when another screen covers the reader. Under RenderLock.
   std::atomic<bool> pageFrameShown{false};
+  class BackgroundBuildFrameGuard {
+   public:
+    explicit BackgroundBuildFrameGuard(EpubReaderActivity& activity);
+    ~BackgroundBuildFrameGuard();
+
+    BackgroundBuildFrameGuard(const BackgroundBuildFrameGuard&) = delete;
+    BackgroundBuildFrameGuard& operator=(const BackgroundBuildFrameGuard&) = delete;
+
+   private:
+    EpubReaderActivity& activity;
+    uint32_t loanCount;
+  };
+  void invalidatePageFrameAfterLoan(uint32_t loanCount);
   // That page leaves the panel as it is under a fast differential refresh that only changes the
   // status bar (see renderContents), and the charging state its status bar shows.
   bool pageFrameKeepsUnderFast = false;
@@ -76,6 +93,8 @@ class EpubReaderActivity final : public ReaderActivity {
   // USB power came or went; the main loop redraws the status bar alone on a quiet pass.
   bool statusBarStale = false;
   void repaintStatusBarAlone();
+  // The page turner's link note changed: the main loop redraws the status bar alone as for USB.
+  void redrawLinkNote() override;
   void saveProgressIfMoved();
 #ifdef TENOR_TURN_TRACE
   TurnTrace pendingManualTurnTrace;
@@ -101,6 +120,7 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr uint8_t MAX_PAGE_LOAD_RETRIES = 3;
   bool skipNextButtonCheck = false;
   bool automaticPageTurnActive = false;
+  TextGrayContext textGrayContext() const;
   bool showBookmarkMessage = false;
   bool showDictionaryMessage = false;
   // "Indexing": a screen that needs the TOC or the chapter sizes was asked for before the book's
@@ -126,6 +146,7 @@ class EpubReaderActivity final : public ReaderActivity {
   bool bookmarkRemoved = false;
   // The bookmark popup slot shows the tilt toggle's new state instead.
   bool tiltMessage = false;
+  bool bleConnectMessage = false;
   std::vector<BookmarkEntry> cachedBookmarks;
   // Anchors of this book's saved quotes, 12 bytes each and capped by the store, read
   // once per book open. Highlights are drawn from these, so no quote text is resident.
@@ -141,15 +162,18 @@ class EpubReaderActivity final : public ReaderActivity {
   // then opens the selector over that page.
   std::atomic<bool> quoteEditPageShown{false};
   bool recentsEntryRemoved = false;
+  bool recentsRemovalAttempted = false;
   unsigned long bookmarkMessageTime = 0UL;
   bool pendingReadFolderMove = false;
 
   // Toolbar reader menu (SETTINGS.readerMenuStyle == READER_MENU_TOOLBAR): drawn
   // over the page instead of pushing the full-screen list menu. Select opens the
   // Toolbar; its tools open the Contents/Text/More bottom-sheet panels.
-  enum class Overlay { None, Toolbar, Contents, Text, More };
+  // Favorites: the X4 Pro's 4th tool (founder 06/10).
+  enum class Overlay { None, Toolbar, Contents, Text, More, Favorites, Reading };
   Overlay overlay = Overlay::None;
-  int focusedTool = 0;  // toolbar tool focus: 0=Contents, 1=Text, 2=More
+  // The tool in focus, by its place on the bar (readermenu::Tool). The menu opens on Contents, as it always has.
+  int focusedTool = static_cast<int>(readermenu::Tool::CONTENTS);
   int panelIndex = 0;   // selected row within the active panel
   // Panel list navigation: a tap steps one row, a hold jumps PANEL_HOLD_STEP rows in one go
   // (a contents list runs to hundreds of chapters). One jump per hold, not a repeat -- every
@@ -172,12 +196,90 @@ class EpubReaderActivity final : public ReaderActivity {
   // overlay, letting panel->toolbar steps restore the page without a full
   // re-render. Discarded on close / whenever the page under the overlay changes.
   bool overlayPageStored = false;
+  bool bwUnderSheet = false;
+  // The sheet opened over a running radio and kept it (TENOR_P5B measurement build): no page
+  // snapshot backs the sheet, so every redraw of it draws the page again first.
+  bool sheetKeptRadio = false;
+  // Stops the radio for the sheet, or keeps it, as sheetradio::planFor answers.
+  sheetradio::Plan beginSheetRadio();
+  // True while a deferred overlay chrome refresh (pushOverlayRefresh) may still
+  // be running on the panel. settleOverlayRefresh() must run before the
+  // framebuffer is touched or another differential refresh is pushed.
+  bool overlayRefreshPending = false;
+  // Text panel changes are applied to the page at once but written to settings.json when the
+  // panel closes (flushTextSettings), not at every step: a card write is 200-400 ms on the X3.
+  bool textSettingsDirty = false;
+  std::atomic<uint8_t> textCloseFrame{0};
+  void markClosedTextFrameUpLocked();
+  void flushTextSettingsLocked();
+  void flushTextSettings();
+  // The Font row opens a second level inside the Text panel: the same sheet lists the families
+  // (the 2 built in, then the card's), the page above is the preview. Back returns to the rows.
+  enum class TextDepth : uint8_t { Rows, Fonts, Spacing, PointSize, Pick };
+  TextDepth textDepth = TextDepth::Rows;
+  // A second level (the fonts, a value list) keeps the frame of the sheet it opened from: its rows.
+  int levelSheetRows = 0;
+#if !defined(FREEINK_DEVICE_X4PRO) || !FREEINK_DEVICE_X4PRO
+  // Buttons (founder 06/10): a row with several values opens them in the same sheet, as the Font row opens
+  // the fonts (TextDepth::Pick). The front buttons move, Select keeps the value, Back drops it.
+  // source: a Text row id (1 size, 2 line spacing, 3 alignment, 4 drop cap) or PICK_MORE + a More action.
+  static constexpr int PICK_MORE = 100;
+  struct Pick {
+    int source = -1;
+    int origin = 0;     // the row that opened it, where Select and Back return the cursor
+    int inUse = 0;      // the value in use: bold with the tick, the cursor's first place
+    std::string title;
+    std::vector<std::string> labels;
+  };
+  Pick pick;
+  void openPick(int source, std::string title);
+  void leavePick(bool keep);
+  // The value at `place` of the list `source`. True when the page is laid out again: its repaint brings
+  // the sheet back.
+  bool applyPick(int source, int place);
+#endif
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  int spacingDraftPermille = 500;
+  bool spacingDragging = false;
+  std::string pointSizeDraft;
+  void enterTextDepth(TextDepth depth);
+  void stepMenuPointSize(int direction);
+  void applyMenuPointSize(uint8_t pointSize);
+  uint8_t enteredPointSize() const;
+#endif
+  // Favorites: the pins (readermenu PIN_TEXT | text row id, or an Action) and the rows shown, the pins this
+  // book has. A hold on a Text, More or Favorites row pins it or takes it off (touch: a long press; buttons:
+  // Select held readermenu::GIU_GHIM_MS).
+  std::vector<uint8_t> pins;
+  std::vector<uint8_t> favoriteRows;
+  void loadPins();
+  void togglePin(uint8_t pin);
+  // Writes `pins` to the settings (not to the card) and lists them again; under the render lock.
+  void storePinsLocked();
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  void showFavoriteActions(int row);
+  void openFavoriteOrder(int row);
+#endif
+  uint8_t pinOfRow(int row) const;
+  std::string favoriteRowName(int row) const;
+  std::string favoriteRowValue(int row) const;
+  void activateFavoriteRow(int row);
+  void enterFontLevel();
+  void leaveFontLevel();
+  void chooseFontFamily(int index);
+  // The panel has closed (or the reader is leaving): save what it changed, drop its second level.
+  void panelClosed(bool leaving = false, bool frameUp = false);
+  void panelClosedLocked(bool leaving, bool frameUp);
+  void pushOverlayRefresh();
+  void settleOverlayRefresh();
+  void redrawSheetLocked();
+  void setReaderStatusBarMode(int mode);
   int autoTurnOption = 0;  // current auto page-turn rate index (More panel)
   std::vector<EpubReaderMenuActivity::MenuItem> moreItems;
 
   // Footnote support
-  std::vector<FootnoteEntry> currentPageFootnotes;
-  std::vector<PageLink> currentPageLinks;
+  Page::Footnotes currentPageFootnotes;
+  Page::Links currentPageLinks;
   int currentPageLinkMarginLeft = 0;
   int currentPageLinkMarginTop = 0;
   struct SavedPosition {
@@ -187,6 +289,14 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr int MAX_FOOTNOTE_DEPTH = 3;
   SavedPosition savedPositions[MAX_FOOTNOTE_DEPTH] = {};
   int footnoteDepth = 0;
+  // The back-stack outlives the reader (sleep, home) in links.bin so Back
+  // still returns to where a followed link was tapped. The card is touched after a frame, never
+  // before: open only reads the file and the first frame's tick removes it (linkStackOnCard), the
+  // exit writes it after the next screen's first frame (ActivityManager::deferWrite) or at once
+  // when the device sleeps. Preview neither reads nor removes it.
+  void saveLinkStack() const;
+  void loadLinkStack();
+  bool linkStackOnCard = false;
 
   uint16_t buildViewportWidth = 0;
   uint16_t buildViewportHeight = 0;
@@ -205,6 +315,8 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr size_t BACKGROUND_BUILD_START_MIN_MAX_ALLOC = 32 * 1024;
   bool deferBackgroundBuildForBle() const;
   bool backgroundBuildStartHeapGate();
+  // Reads the section: requires the render lock. Heap admission is checked separately by the tick.
+  bool backgroundBuildWanted() const;
   bool buildTickHeapGate();
   bool backgroundBuildCanTick();
   // Caller owns RenderLock. Heap-pressure suspension resumes only for an explicit target.
@@ -218,8 +330,11 @@ class EpubReaderActivity final : public ReaderActivity {
   // Set while the radio is stopped so a starved section build can finish. The reader
   // asks for a restart once the page is on screen.
   bool radioReleasedForBuild = false;
-  static constexpr unsigned long RADIO_RELEASE_TIMEOUT_MS = 3000;
-  bool releaseRadioForBuild();
+  // Set once a paint has shed the font caches for a starved build: a second starve in the same
+  // paint stops the radio instead.
+  bool fontsShedForBuild = false;
+  bool releaseHeapForBuild();
+  bool startBuildFreeingHeap(const ReaderRenderSpec& spec, const std::function<void()>& popupFn = nullptr);
   // A book opened on its chapter list builds its TOC and chapter sizes here (Epub::indexSome), one
   // step per quiet pass once the page is up and no parser is alive. A key contact stops a step
   // within milliseconds; its work is redone on a later quiet pass. A failed step waits
@@ -254,6 +369,8 @@ class EpubReaderActivity final : public ReaderActivity {
   // (X3 r29). Once ahead, each turn lays out one page, as with one.
   static constexpr int LOOK_AHEAD_PAGES = 2;
   int lookAheadPage = -1;
+  int lookAheadWorkPage = -1;
+  unsigned long lookAheadStartedMs = 0;
   // The next chapter's first pages, laid out on a quiet pass on the last page of a whole chapter,
   // once per chapter and visit (prepareNextChapter).
   static constexpr unsigned long NEXT_CHAPTER_QUIET_MS = 1500;
@@ -287,6 +404,22 @@ class EpubReaderActivity final : public ReaderActivity {
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action, const MenuResult& menu);
   // Vo hieu section de dan lai trang voi chu moi, giu dung doan dang doc. GOI DUOI RenderLock.
   void danLaiTrang();
+  // Text settings changed: the page on screen is laid out alone from the nearest resume point
+  // (Section::previewPage) and the chapter is laid out again behind it between key presses
+  // (catchUpTick). One request is kept, the latest: a change drops the layout of the one before.
+  bool xemTruoc = false;              // section is null and the page shown is a preview
+  uint32_t xemTruocDich = 0;          // the old page's first character: the same for every change
+  std::unique_ptr<Section> catchUp;   // the chapter laid out under the latest settings
+  int8_t xemTruocLat = 0;             // a turn asked from the preview, applied once the chapter lands
+  bool xemTruocTrenMan = false;       // the chapter landed while the preview stayed on screen
+  unsigned long xemTruocInputMs = 0;  // catch-up waits for a pause in the presses
+  static constexpr unsigned long CATCH_UP_QUIET_MS = TextRelayoutQuiet::kQuietMs;
+  static constexpr uint8_t CATCH_UP_MAX_FAILS = 3;
+  uint8_t catchUpFails = 0;
+  void dropCatchUp();
+  bool catchUpCanTick() const;
+  void catchUpTick(bool inputThisPass);
+  bool renderPreview(int marginTop, int marginRight, int marginBottom, int marginLeft);
   bool docCoChuMotNac(int huong) override;
   // Live section position, or the values cached before a child screen
   // released the section.
@@ -296,6 +429,7 @@ class EpubReaderActivity final : public ReaderActivity {
   // Toolbar reader menu (see Overlay above).
   bool usesToolbarMenu() const;
   void openOverlay(Overlay target);
+  void stopRadioForSheet();
   void closeOverlayToPage();
   void discardOverlayPage();
   void handleOverlayInput();
@@ -305,17 +439,32 @@ class EpubReaderActivity final : public ReaderActivity {
   std::string textRowName(int row) const;
   std::string textRowValue(int row) const;
   void showTextRowPopup(int row);
-  // Persist + re-paginate + re-render under the open panel (live preview).
+  // A Text row by its place on the Text panel. X4 Pro: Font, Size and Line spacing open their level, the others
+  // step. Buttons: Font opens the fonts, an on/off row turns, the others open their values over the sheet.
+  void openTextRow(int row);
+  void cycleTextRow(int row);
+  void chooseTextValue(int row, int place);
+  // Mark for saving + re-paginate + re-render under the open panel (live preview).
   void applyTextSettingLive();
   void paintOverlayPopup();
-  // Persist the reader text settings, (re)load the selected SD font, and
+  // Mark the reader text settings for saving, (re)load the selected SD font, and
   // re-paginate the current chapter so changes apply without re-opening the book.
   void applyReaderTextSettings();
+  void applyReaderTextSettingsLocked(const char* key = nullptr);
+  void invalidateTextSettingsLocked();
+  // The rendered page's glyph caches can yield their heap to the overlay
+  // snapshot, including the first sheet opened with unchanged settings.
+  void releaseTextCachesBeforeOverlaySnapshot();
   // More panel rows.
   void buildMoreActions();
+  int panelActionRow(int row) const;
+  bool actionPanel() const;
   std::string moreRowName(int row) const;
   std::string moreRowValue(int row) const;
+  bool moreRowOn(int row) const;
+  bool favoriteRowOn(int row) const;
   void activateMoreRow(int row);
+  void openFootnoteSelect(bool reopenMenuOnCancel);
   // `editName` non-empty reopens that saved quote for reselection on the current page.
   void openDictionaryWordSelect(bool quotation = false, const std::string& editName = {});
   // Tools > Quotations in this book: the Quotes screen for this book only. A quote it hands
@@ -336,6 +485,8 @@ class EpubReaderActivity final : public ReaderActivity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
+  readerstatus::Pace::Position pacePosition() const override;
+  uint32_t paceLayoutKey() const override;
   // Invert the words of every saved quote that reaches this page, exactly the way the
   // quote selector inverts a live selection. Called on the black and white pass only.
   void drawQuoteHighlights(const Page& page, int fontId, int marginLeft, int marginTop) const;
@@ -352,6 +503,7 @@ class EpubReaderActivity final : public ReaderActivity {
   bool manualPageTurnReady() const override;
   bool pageAwaitsLayout() const override;
   bool loadBook() override;
+  bool handleTapTip();
   bool readingPageVisible() const override;
   std::string getBookTitle() const override { return epub ? epub->getTitle() : ""; }
   std::string getBookAuthor() const override { return epub ? epub->getAuthor() : ""; }
@@ -377,7 +529,9 @@ class EpubReaderActivity final : public ReaderActivity {
 
   bool skipLoopDelay() override;
   bool holdsRadio() const override;
-  bool readyForRadio() override;
+  bool yieldForRadio() override;
+  // A sheet that kept the radio leaves the book in front for the radio (remote keys are dropped under it).
+  bool coversPage() const override { return overlay != Overlay::None && !sheetKeptRadio; }
 
   ScreenshotInfo getScreenshotInfo() const override;
   CrossPointPosition getCurrentPosition() const;

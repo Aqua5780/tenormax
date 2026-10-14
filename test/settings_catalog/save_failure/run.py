@@ -19,6 +19,8 @@ parser.add_argument('--output', type=pathlib.Path, required=True)
 parser.add_argument('--baseline-dir', type=pathlib.Path)
 parser.add_argument('--baseline-ref')
 parser.add_argument('--sanitize', action='store_true')
+parser.add_argument('--settings-source', type=pathlib.Path,
+                    help='Extract SettingsActivity.cpp from an isolated production candidate')
 args = parser.parse_args()
 ROOT = args.repo.resolve()
 OUT = args.output.resolve()
@@ -42,8 +44,9 @@ def method_slice(text, signature):
 include_paths = [
     'test/host_stubs', 'src', '.pio/libdeps/gh_release/ArduinoJson/src',
     'lib/Epub', 'lib/I18n', 'lib/Logging', 'lib/EpdFont', 'lib/Serialization',
-    'lib/KOReaderSync', 'freeink-sdk/libs/hardware/BoardConfig/include',
+    'lib/KOReaderSync', 'freeink-sdk/libs/hardware/BoardConfig/include', 'lib/BlePageTurner/include',
     'freeink-sdk/libs/ui/FreeInkUI/include',
+    'freeink-sdk/libs/assets/Icons/include',
 ]
 includes = ['-I' + str(ROOT / path) for path in include_paths]
 manifest = {}
@@ -60,10 +63,13 @@ for mode in modes:
                 return (args.baseline_dir / ('before-' + pathlib.Path(path).name)).read_text()
             return subprocess.check_output(
                 ['git', 'show', f'{args.baseline_ref}:{path}'], cwd=ROOT, text=True)
+        if args.settings_source and path == 'src/activities/settings/SettingsActivity.cpp':
+            return args.settings_source.resolve().read_text()
         return (ROOT / path).read_text()
 
     paths = ['src/activities/settings/SettingsActivity.h',
-             'src/activities/settings/SettingsActivity.cpp']
+             'src/activities/settings/SettingsActivity.cpp',
+             'src/shells/Shell.cpp']
     sources = {path: read(path) for path in paths}
     manifest[mode] = {path: hashlib.sha256(text.encode()).hexdigest()
                       for path, text in sources.items()}
@@ -73,23 +79,42 @@ for mode in modes:
     descriptor = header[header.index('enum class SettingType'):
                         header.index('class SettingsActivity final')]
     (output / 'activities/settings/SettingsActivity.h').write_text(
-        '#pragma once\n#include <functional>\n#include <string>\n#include <vector>\n'
+        '#pragma once\n#include <functional>\n#include <span>\n#include <string>\n#include <vector>\n'
         '#include <I18n.h>\n#include "CrossPointSettings.h"\n'
-        '#include "activities/settings/SettingsTabs.h"\n' + descriptor)
+        '#include "activities/settings/SettingsTabs.h"\n'
+        '#include "components/SettingsChoiceStyle.h"\n'
+        'namespace tenorchrome {\n'
+        '#include "TouchShell.inc"\n}\n' + descriptor)
     state = next((line.strip() for line in header.splitlines()
                   if 'saveFailed' in line and ';' in line), '')
     (output / 'State.inc').write_text(state + '\n')
     source = sources[paths[1]]
+    chrome = (ROOT / 'src/components/TenorMenuChrome.h').read_text()
+    manifest[mode]['boundary:src/components/TenorMenuChrome.h'] = hashlib.sha256(chrome.encode()).hexdigest()
+    start = chrome.index('#if defined(FREEINK_DEVICE_X4PRO)')
+    (output / 'TouchShell.inc').write_text(chrome[start:chrome.index('#endif', start) + len('#endif')] + '\n')
     signatures = ['bool SettingsActivity::handleButtons()',
                   'void SettingsActivity::toggleCurrentSetting()',
+                  'void SettingsActivity::noteValue(',
                   'void SettingsActivity::openSleepTimeoutPicker()',
                   'void SettingsActivity::render(RenderLock&&)']
     if 'bool SettingsActivity::showWakeHint() const' in source:
         signatures.insert(0, 'bool SettingsActivity::showWakeHint() const')
-    if 'bool SettingsActivity::saveSettings()' in source:
-        signatures.insert(0, 'bool SettingsActivity::saveSettings()')
-    (output / 'Methods.inc').write_text(''.join(method_slice(source, signature)
-                                               for signature in signatures))
+    if 'bool SettingsActivity::applySettingValue(' in source:
+        signatures.insert(0, 'bool SettingsActivity::applySettingValue(')
+    if 'bool SettingsActivity::saveSettings(' in source:
+        signatures.insert(0, 'bool SettingsActivity::saveSettings(')
+    methods = ''.join(method_slice(source, signature) for signature in signatures)
+    (output / 'Methods.inc').write_text(methods)
+    save_declaration = ('bool saveSettings(bool repaint = true);'
+                        if 'bool SettingsActivity::saveSettings(const bool repaint)' in source
+                        else 'bool saveSettings();')
+    (output / 'SaveDeclaration.inc').write_text(save_declaration + '\n')
+    shell_source = sources['src/shells/Shell.cpp']
+    settle = ('namespace {\n' + method_slice(shell_source, 'void settle()') + '}\n'
+              if 'void settle()' in shell_source else '')
+    (output / 'ShellChanged.inc').write_text(
+        'namespace shell {\n' + settle + method_slice(shell_source, 'void changed()') + '}\n')
     sanitizer = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if args.sanitize else []
     dead_strip = '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections'
     command = [os.environ.get('CXX', 'c++'), '-std=c++20', '-g', '-O1', *sanitizer,

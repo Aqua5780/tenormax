@@ -3,6 +3,7 @@
 // Section numbers are those of the BQ27220 Technical Reference Manual, SLUUBD4A (Nov 2022).
 namespace {
 constexpr uint8_t CONTROL = 0x00;                 // Control(), low byte then high byte (2.2)
+constexpr uint8_t FULL_CHARGE_CAPACITY = 0x12;    // FullChargeCapacity() (2.10)
 constexpr uint8_t OPERATION_STATUS = 0x3A;        // OperationStatus() (2.27)
 constexpr uint8_t OPERATION_STATUS_HIGH = 0x3B;   // its high byte, read alone in 6.1 steps 4 and 15
 constexpr uint8_t CFGUPDATE_BIT = 1 << 2;         // bit 2 of that byte: CONFIG UPDATE mode
@@ -50,6 +51,12 @@ bool readWord(Bq27220Capacity::Bus& bus, const uint8_t reg, uint16_t& value) {
 uint8_t security(const uint16_t operationStatus) { return (operationStatus >> 1) & 0b11; }
 
 bool due(const uint32_t nowMs, const uint32_t atMs) { return static_cast<int32_t>(nowMs - atMs) >= 0; }
+
+// A Learned Full Charge Capacity more than a quarter above the cell was learned against TI's 3000
+// mAh default: a learning cycle moves it at most 256 mAh down (1.1.3), so it stays far above a
+// small cell, and FullChargeCapacity() copies it at every reinit (1.1.10). One learned on the cell
+// itself is kept.
+bool learnedTooHigh(const uint16_t learned, const uint16_t target) { return learned > target + target / 4; }
 }  // namespace
 
 uint8_t Bq27220Capacity::replaceChecksum(const uint8_t oldSum, const uint8_t oldMsb, const uint8_t oldLsb,
@@ -96,7 +103,10 @@ Bq27220Capacity::Param Bq27220Capacity::writeParam(Bus& bus, const uint16_t addr
   if (length < MAC_DATA_LEN_MIN || length > MAC_DATA_LEN_MAX) return Param::Failed;
   detail = 5;
   detailValue = static_cast<uint16_t>((oldMsb << 8) | oldLsb);
-  if (((oldMsb << 8) | oldLsb) != TI_DEFAULT_MAH) return required ? Param::Failed : Param::Skipped;
+  const uint16_t old = static_cast<uint16_t>((oldMsb << 8) | oldLsb);
+  if (address == DM_FULL_CHARGE_CAPACITY ? !learnedTooHigh(old, target) : old != TI_DEFAULT_MAH) {
+    return required && old != target ? Param::Failed : Param::Skipped;
+  }
   const uint8_t newMsb = target >> 8;
   const uint8_t newLsb = target & 0xFF;
   // Steps 10 to 13: new value, new checksum, then the length, which moves the block into RAM.
@@ -128,14 +138,37 @@ void Bq27220Capacity::tick(Bus& bus, const uint32_t nowMs) {
       }
       uint16_t status = 0;
       if (!readWord(bus, DESIGN_CAPACITY, dcRead) ||
-          (dcRead == TI_DEFAULT_MAH && !readWord(bus, OPERATION_STATUS, status))) {
+          ((dcRead == TI_DEFAULT_MAH || dcRead == target) && !readWord(bus, OPERATION_STATUS, status))) {
         // Nothing was sent to the gauge: nothing to undo.
         failStage = stage;
         outcome = Result::Failed;
         stage = Stage::Done;
         return;
       }
-      if (dcRead != TI_DEFAULT_MAH) {
+      checkStatus = status;
+      const bool inConfig = (status >> 8) & CFGUPDATE_BIT;
+      if (dcRead == target && (inConfig || security(status) != SEC_SEALED)) {
+        // The target is in, but a load cut short (sleep, or a refused exit or SEALED) left the gauge
+        // in CONFIG UPDATE, where it stops gauging, or unsealed. DesignCapacity() reading the target
+        // means a block was written, so the exit reinitializes, as at the end of a load (step 14).
+        resealing = true;
+        if (!inConfig) return seal(bus);
+        stage = Stage::WaitExit;
+        if (!control(bus, EXIT_CFG_UPDATE_REINIT)) {
+          failed = true;
+          failStage = stage;
+          return seal(bus);
+        }
+        return wait(nowMs, Stage::WaitExit);
+      }
+      uint16_t fcc = 0;
+      if (dcRead == target && !readWord(bus, FULL_CHARGE_CAPACITY, fcc)) {
+        failStage = stage;
+        outcome = Result::Failed;
+        stage = Stage::Done;
+        return;
+      }
+      if (dcRead == target ? !learnedTooHigh(fcc, target) : dcRead != TI_DEFAULT_MAH) {
         // Already loaded since the gauge last lost power, or a battery someone else configured.
         outcome = Result::NotNeeded;
         stage = Stage::Done;
@@ -184,10 +217,10 @@ void Bq27220Capacity::tick(Bus& bus, const uint32_t nowMs) {
       stage = Stage::Block;
       // After the reinit FullChargeCapacity() is a copy of Learned Full Charge Capacity, which
       // should start at the Design Capacity (1.1.10). Written first: if Design Capacity then
-      // fails, it still reads 3000 and the next start loads both again. A learned value other
-      // than the default is kept.
+      // fails, it still reads 3000 and the next start loads both again. A learned value up to a
+      // quarter above the target is kept; Design Capacity is skipped when it already holds it.
       if (writeParam(bus, DM_FULL_CHARGE_CAPACITY, false) == Param::Failed ||
-          writeParam(bus, DM_DESIGN_CAPACITY, true) != Param::Written) {
+          writeParam(bus, DM_DESIGN_CAPACITY, true) == Param::Failed) {
         return giveUp(bus, nowMs);
       }
       // Step 14: the reinit recomputes FullChargeCapacity() and RemainingCapacity() (1.1.10).
@@ -241,7 +274,7 @@ void Bq27220Capacity::seal(Bus& bus) {
     failed = true;
   }
   if (!readWord(bus, DESIGN_CAPACITY, dcRead)) dcRead = 0;
-  outcome = !failed && dcRead == target ? Result::Loaded : Result::Failed;
+  outcome = failed || dcRead != target ? Result::Failed : resealing ? Result::Resealed : Result::Loaded;
   if (outcome == Result::Failed && !failed) failStage = stage;
   stage = Stage::Done;
 }

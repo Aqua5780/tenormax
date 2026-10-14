@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <BoardConfig.h>
@@ -21,9 +23,9 @@ namespace menucustom {
 State& state() { static State data; return data; }
 bool save() { return true; }
 }
-struct RenderLock { template<class T> explicit RenderLock(T&) {} };
 struct SettingsActivity {
-  struct Cursor { int selected=0; bool followOnBuild=false; };
+  // Same shape as freeink::ui::ListNav: the selection is atomic (read by the render task).
+  struct Cursor { std::atomic<int> selected{0}; bool followOnBuild=false; };
   struct Input { bool hasTouch() const { return BoardConfig::hasTouch(); } } mappedInput;
   int selectedCategoryIndex=0, settingsCount=0;
   static constexpr int categoryCount=settingstabs::TAB_COUNT;
@@ -39,16 +41,27 @@ struct SettingsActivity {
     settingsCount=currentSettings->size();
   }
   std::vector<SettingInfo>& danhSachCuaThe(settingstabs::Tab);
-  void rebuildSettingsLists();
+  static bool listedAsRow(const SettingInfo& setting);
+  struct FormBoundary { void invalidate() {} } form_;
+  std::atomic<bool> formPaintReady_{false};
+  void bindForm() {}
+  void focusForm(int) {}
+  void rebuildSettingsLists(bool lockHeld = false);
   std::string favoriteKey(int) const;
   int focusFavorite(const std::string&);
 };
+// The X4 Pro About & updates screen (InfoUpdateActivity) holds no rows on these boards.
+namespace infoupdate { inline bool holds(settingstabs::Action, bool = false) { return false; } }
 #include "Methods.inc"
+#include "HomeSettings.inc"
 struct HomeSettings {
   std::vector<int> settingsGroups;
   std::vector<std::string> rowLabels;
   void build() {
-#include "HomeSettings.inc"
+    rowLabels.emplace_back(tr(STR_FILE_TRANSFER));
+    auto groups = homerows::settingsGroups();
+    settingsGroups = std::move(groups.ids);
+    for (auto& label : groups.labels) rowLabels.push_back(std::move(label));
   }
 };
 // Preserve symbolic label identities across unrelated translation regeneration.
@@ -81,19 +94,22 @@ static bool check(bool value, const char* message) {
 }
 int main(int argc, char** argv) {
   const std::string board=argc>1?argv[1]:"x3";
-  const bool tenor=argc>2?std::atoi(argv[2]):true;
-  const bool imu=argc>3?std::atoi(argv[3]):true;
-  const bool optional=argc>4?std::atoi(argv[4]):false;
+  const bool imu=argc>2?std::atoi(argv[2]):true;
+  const bool optional=argc>3?std::atoi(argv[3]):false;
+  SETTINGS.uiShell=argc>4?std::atoi(argv[4]):0;
+  const bool ugly=SETTINGS.uiShell==1;
   BoardConfig::ACTIVE=board=="x3"?BoardConfig::XTEINK_X3:board=="x4"?BoardConfig::XTEINK_X4:BoardConfig::XTEINK_X4_PRO;
   gpio.x3=board=="x3";
   halTiltSensor.available=imu;
   halClock.available=optional;
-  SETTINGS.uiTheme=tenor?CrossPointSettings::TENOR_UI:CrossPointSettings::CLASSIC;
   SETTINGS.shortPwrBtn=optional?CrossPointSettings::FOOTNOTES:CrossPointSettings::IGNORE;
   if(optional) discovered.push_back({"Dictionary", "dict"});
   CrossPointWebServer web;
   web.handleGetSettings();
   bool ok=true;
+  if (BoardConfig::isX4Pro())
+    ok &= check(SETTINGS.homeButtonDoubleTapAction == static_cast<uint8_t>(HomeButtonAction::Ignore),
+                "touch Home double tap defaults to Ignore so single tap has no double tap wait");
   ok &= check(settingstabs::TAB_COUNT==9,"nine settings tabs");
   ok &= check(static_cast<int>(settingstabs::Tab::OTHER)==6,"old tab IDs preserved");
   SettingsActivity activity;
@@ -102,17 +118,20 @@ int main(int argc, char** argv) {
   std::map<std::string,int> occurrences, routes;
   JsonDocument result;
   auto counts=result["counts"].to<JsonArray>();
+  auto inventory=result["rows"].to<JsonArray>();
   for(int tab=0;tab<settingstabs::TAB_COUNT;++tab) {
     const auto& rows=activity.danhSachCuaThe(static_cast<settingstabs::Tab>(tab));
     counts.add(rows.size());
+    auto tabRows=inventory.add<JsonArray>();
     for(const auto& row:rows) {
       const auto key=row.key?std::string("settings/")+row.key:"action/"+std::to_string(static_cast<int>(row.action));
+      tabRows.add(key);
       // A row without key or action (the read-only panel chip row) has no route to collide on.
       if(!row.key && row.action==SettingAction::None) continue;
       ++occurrences[key];
       // Tenor keeps the legacy action/2 pin on the battery and clock corners, so the
       // status bar row that shares its action is deliberately not pinnable there.
-      if(tenor && row.action==SettingAction::CustomiseStatusBar) {
+      if(row.action==SettingAction::CustomiseStatusBar) {
         activity.selectCategory(tab);
         ok &= check(activity.favoriteKey(static_cast<int>(&row-rows.data())).empty(),"Tenor status bar row is not pinnable");
         continue;
@@ -124,8 +143,15 @@ int main(int argc, char** argv) {
     }
   }
   for(const auto& [key,n]:occurrences) ok &= check(n==1,"each visible row has exactly one tab");
-  const char* moved[]={"sleepScreen","sleepScreenCoverMode","sleepScreenCoverFilter","quickResumeSleepScreen","wakeIntoBook","sleepTimeoutMinutes"};
+  const char* moved[]={"sleepScreen","sleepScreenCoverMode","sleepScreenCoverFilter","quickResumeSleepScreen","sleepTimeoutMinutes"};
   for(const char* key:moved) ok &= check(routes[std::string("settings/")+key]==7,"moved sleep row resolves to tab ID7");
+  ok &= check(ugly ? routes["settings/uglyStartScreen"]==7 && !routes.count("settings/wakeIntoBook")
+                  : routes["settings/wakeIntoBook"]==7 && !routes.count("settings/uglyStartScreen"),
+              "the shell has exactly one start row in Sleep");
+  ok &= check(activity.focusFavorite(ugly ? "settings/wakeIntoBook" : "settings/uglyStartScreen")<0,
+              "a hidden start row pin stays hidden");
+  ok &= check(ugly ? routes["settings/uglyRootScreen"]==0 : !routes.count("settings/uglyRootScreen"),
+              "the Root row belongs to Display only in ugly");
   ok &= check(!routes.count("settings/wakeButtons"),"retired wakeButtons row is gone on every board");
   const bool light=BoardConfig::hasPwmFrontlight()||BoardConfig::hasI2cFrontlight();
   ok &= check(light ? routes["settings/frontlightRestoreOnWake"]==7 : !routes.count("settings/frontlightRestoreOnWake"),"restore light belongs to Sleep only on supported board");
@@ -147,6 +173,35 @@ int main(int argc, char** argv) {
   ok &= check(activity.focusFavorite("settings/wakeButtons")<0,"an old wakeButtons pin resolves to no row");
   result["catalog"]=catalog.size(); result["checks"]=checks;
   JsonDocument webDoc; deserializeJson(webDoc, before); result["web"]=webDoc;
+  bool hasWake=false, hasStart=false, hasRoot=false;
+  int tipsRows=0;
+  for (JsonObjectConst row : webDoc.as<JsonArrayConst>()) {
+    const std::string key=row["key"] | "";
+    if(key=="wakeIntoBook") hasWake=true;
+    if(key=="tipsEnabled") {
+      ++tipsRows;
+      ok &= check(row["category"]=="STR_CAT_DISPLAY" && row["name"]=="STR_TIPS" &&
+                  row["type"]=="toggle" && row["value"].as<int>()==1,
+                  "web exposes the independent Display tips toggle, enabled by default");
+    }
+    if(key=="uglyStartScreen") {
+      hasStart=true;
+      ok &= check(row["value"].as<int>()==CrossPointSettings::UGLY_START_ROOT,
+                  "web start screen defaults to Root");
+    }
+    if(key=="uglyRootScreen") {
+      hasRoot=true;
+      ok &= check(row["value"].as<int>()==CrossPointSettings::UGLY_ROOT_DIARY,
+                  "web Root defaults to Diary");
+    }
+  }
+  const bool hasTips=!ugly && !BoardConfig::isX4Pro();
+  ok &= check(hasRoot==ugly,"web exposes Root only in ugly");
+  ok &= check(tipsRows==(hasTips ? 1 : 0),"tips toggle is shown once on cross button readers only");
+  ok &= check(hasTips ? routes.count("settings/tipsEnabled")==1 && routes.at("settings/tipsEnabled")==0
+                     : !routes.count("settings/tipsEnabled"),
+              "tips pin follows the visible Display row");
+  ok &= check(ugly ? hasStart && !hasWake : hasWake && !hasStart,"web has exactly one start row for the shell");
   std::string output; serializeJson(result,output); std::puts(output.c_str());
   return ok?0:1;
 }

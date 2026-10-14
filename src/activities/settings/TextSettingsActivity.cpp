@@ -1,6 +1,8 @@
 #include "TextSettingsActivity.h"
+#include "X3SettingsLayout.h"
 
 #include <GfxRenderer.h>
+#include <HalDisplay.h>
 #include <I18n.h>
 #include <Logging.h>
 
@@ -12,14 +14,22 @@
 #include <vector>
 
 #include "CrossPointSettings.h"
+#include "MenuTiltInput.h"
+#include "ReadingStatsStore.h"
+#include "SettingsList.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyInk.h"
+#include "shells/ugly/UglyQuip.h"
 #include "MappedInputManager.h"
 #include "MenuFavorites.h"
+#include "MenuCustomization.h"
 #include "ReaderFontChon.h"
 #include "ReaderFontSizes.h"
 #include "ReaderInkWeight.h"
 #include "SdCardFontSystem.h"
 #include "TextSettingsPreview.h"
 #include "components/TenorMenuChrome.h"
+#include "components/icons/tenorTextTabIcons.h"
 #include "components/SettledListRender.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
@@ -28,8 +38,8 @@
 namespace fui = freeink::ui;
 
 namespace {
-// Tab labels for Font | Size | Layout | Style.
-constexpr StrId TAB_NAME_IDS[] = {StrId::STR_FONT, StrId::STR_SIZE, StrId::STR_LAYOUT, StrId::STR_STYLE};
+constexpr StrId TAB_NAME_IDS[] = {StrId::STR_FONT, StrId::STR_SIZE, StrId::STR_LAYOUT, StrId::STR_STYLE,
+                                 StrId::STR_READER_TAB_FAVORITES};
 
 // Same order as TextSettingsActivity::LayoutRow, one label per row.
 constexpr StrId LAYOUT_ROW_NAME_IDS[] = {StrId::STR_LINE_SPACING,     StrId::STR_LETTER_SPACING,
@@ -41,10 +51,17 @@ constexpr StrId STYLE_ROW_NAME_IDS[] = {StrId::STR_FOCUS_READING, StrId::STR_HYP
 
 // One label set for every spacing row: line, letter and paragraph spacing share
 // one five-value scale (readerSpacing::Level), so they share one label order.
+// No percent/pixel-offset word or character spacing labels: upstream's #3528
+// redesign is not taken (see RESOLUTION.md).
 constexpr StrId SPACING_LEVEL_IDS[] = {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT,
                                        StrId::STR_WIDE, StrId::STR_VERY_WIDE};
+constexpr StrId LINE_SPACING_IDS[] = {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT,
+                                     StrId::STR_WIDE, StrId::STR_VERY_WIDE, StrId::STR_LINE_SPACING_130,
+                                     StrId::STR_LINE_SPACING_160};
+static_assert(std::size(LINE_SPACING_IDS) == readerSpacing::LINE_LEVEL_COUNT, "line spacing labels");
 constexpr StrId INK_WEIGHT_IDS[] = {StrId::STR_READER_INK_0, StrId::STR_READER_INK_1,
-                                    StrId::STR_READER_INK_2, StrId::STR_READER_INK_3};
+                                    StrId::STR_READER_INK_2, StrId::STR_READER_INK_3,
+                                    StrId::STR_READER_INK_4, StrId::STR_READER_INK_5};
 static_assert(std::size(INK_WEIGHT_IDS) == readerInk::LEVEL_COUNT, "reader ink labels");
 // Tắt / Mặc định / Lớn, matching readerSpacing::DropCapMode.
 constexpr StrId DROP_CAP_IDS[] = {StrId::STR_STATE_OFF, StrId::STR_INK_DEFAULT, StrId::STR_SPACING_LARGE};
@@ -59,18 +76,50 @@ constexpr int MARGIN_STEP = CrossPointSettings::SCREEN_MARGIN_STEP;
 
 TextSettingsActivity::TextSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                            const SdCardFontRegistry* registry, Tab initialTab)
-    : UiTabListActivity("TextSettings", renderer, mappedInput), registry_(registry), tab_(initialTab) {}
+    // Touch: a held card offers Reorder.
+    : UiTabListActivity("TextSettings", renderer, mappedInput, tenorchrome::kTouchShell), registry_(registry),
+      tab_(initialTab) {}
 
-const char* TextSettingsActivity::tabLabel(const int index) const { return I18N.get(TAB_NAME_IDS[index]); }
+int TextSettingsActivity::displayIndex(const Tab tab) const {
+  return static_cast<int>(tab);
+}
+
+TextSettingsActivity::Tab TextSettingsActivity::tabForIndex(const int index) const {
+  return static_cast<Tab>(index);
+}
+
+const char* TextSettingsActivity::tabLabel(const int index) const {
+  return I18N.get(TAB_NAME_IDS[static_cast<int>(tabForIndex(index))]);
+}
+
+freeink::ui::BitmapRef TextSettingsActivity::tabIcon(const int index, const bool bold) const {
+  if (index < 0 || index >= tabCount()) return {};
+  switch (tabForIndex(index)) {
+    case Tab::Family:
+      return fui::bitmapFromIcon(bold ? icon_tenor_text_font_bold_40 : icon_tenor_text_font_40);
+    case Tab::Size:
+      return fui::bitmapFromIcon(bold ? icon_tenor_text_co_chu_bold_40 : icon_tenor_text_co_chu_40);
+    case Tab::Layout:
+      return fui::bitmapFromIcon(bold ? icon_tenor_text_bo_cuc_bold_40 : icon_tenor_text_bo_cuc_40);
+    case Tab::Style:
+      return fui::bitmapFromIcon(bold ? icon_tenor_text_kieu_bold_40 : icon_tenor_text_kieu_40);
+    case Tab::Favorites:
+      return fui::bitmapFromIcon(bold ? icon_tenor_home_favorites_bold_40 : icon_tenor_home_favorites_40);
+    case Tab::Count:
+      return {};
+  }
+  return {};
+}
 
 void TextSettingsActivity::onEnter() {
+  RenderLock lock(*this);
 #ifdef TENOR_PRESS_PROBE
   const unsigned long started = millis();
 #endif
   UiTabListActivity::onEnter();
 
   metrics_ = UITheme::getInstance().getMetrics();
-  afterHeader = tenorchrome::enabled() ? tenorchrome::contentTop()
+  afterHeader = tenorchrome::enabled() ? tenorchrome::contentTopUnderTabs()
                                        : metrics_.topPadding + metrics_.headerHeight + metrics_.verticalSpacing;
   bottomReserved = metrics_.buttonHintsHeight + metrics_.verticalSpacing;
   updatePreviewGeometry();
@@ -83,10 +132,14 @@ void TextSettingsActivity::onEnter() {
 
   currentFamilyIndex_ = fontdoc::hoDangDung(registry_);
   for (auto& n : tabNavs) n.selected = 1;  // default to the first list row
-  tabNavs[static_cast<int>(Tab::Family)].selected = currentFamilyIndex_ + 1;
-  tabNavs[static_cast<int>(Tab::Size)].selected = currentSizeIndex_ + 1;
+  tabNavs[displayIndex(Tab::Family)].selected = currentFamilyIndex_ + 1;
+  tabNavs[displayIndex(Tab::Size)].selected = currentSizeIndex_ + 1;
 
-  rebuildRowItems();
+  if (shell::isUgly()) {
+    ugly::ensureFonts(renderer);
+    bindForm();
+    focusForm(formIndex(tab_, 0));
+  } else rebuildRowItems();
 #ifdef TENOR_PRESS_PROBE
   LOG_INF("TXT", "Enter ms=%lu", millis() - started);
 #endif
@@ -96,6 +149,15 @@ void TextSettingsActivity::onEnter() {
 // call only when tab_ or its backing data (fonts_/sizes_) changes, never from
 // buildScreen(), which just refreshes rowValues_/rowItems_[].value in place.
 void TextSettingsActivity::rebuildRowItems() {
+  if (shell::isUgly()) return;
+  if (tab_ == Tab::Favorites) {
+    favoriteCount_ = 0;
+    const auto& pins = menucustom::state();
+    for (int index = 0; index < pins.pinCount; ++index) {
+      const auto* item = menufavorites::find(pins.pins[index].data());
+      if (item && std::strcmp(item->screen, "text") == 0) favoritePins_[favoriteCount_++] = index;
+    }
+  }
   const int count = listCount();
   rowValues_.assign(count, std::string());
   rowItems_.clear();
@@ -103,6 +165,9 @@ void TextSettingsActivity::rebuildRowItems() {
   for (int i = 0; i < count; i++) {
     fui::ListItem item;
     switch (tab_) {
+      case Tab::Favorites:
+        item.label = I18N.get(menufavorites::label(favoriteKey(i)));
+        break;
       case Tab::Family:
         item.label = fonts_[i].name.c_str();
         break;
@@ -119,8 +184,24 @@ void TextSettingsActivity::rebuildRowItems() {
         break;
     }
     item.actionValue = static_cast<int16_t>(i);
+    item.opensNext = rowChoiceStyle(i) == SettingsChoiceStyle::Page;
     rowItems_.push_back(item);
   }
+}
+
+void TextSettingsActivity::refreshFavoriteRows() {
+  if (tab_ != Tab::Favorites) return;
+  int count = 0;
+  bool changed = false;
+  const auto& pins = menucustom::state();
+  for (int index = 0; index < pins.pinCount; ++index) {
+    const auto* item = menufavorites::find(pins.pins[index].data());
+    if (!item || std::strcmp(item->screen, "text") != 0) continue;
+    changed = changed || count >= favoriteCount_ || favoritePins_[count] != index ||
+              rowItems_[count].label != I18N.get(item->label);
+    ++count;
+  }
+  if (changed || count != favoriteCount_) rebuildRowItems();
 }
 
 // The selectable sizes belong to the active family, so this runs on entry and
@@ -149,10 +230,16 @@ void TextSettingsActivity::rebuildSizeList() {
 }
 
 void TextSettingsActivity::onTabAction(const int index) {
-  if (optionPopup_.isActive()) return;
-  if (tab_ != static_cast<Tab>(index)) {
+  if (index < 0 || index >= tabCount()) return;
+  if (shell::isUgly()) {
     RenderLock lock(*this);
     tab_ = static_cast<Tab>(index);
+    return;
+  }
+  if (optionPopup_.isActive()) return;
+  if (tab_ != tabForIndex(index)) {
+    RenderLock lock(*this);
+    tab_ = tabForIndex(index);
     rebuildRowItems();
     auto& n = activeNav();
     if (!mappedInput.hasTouch() && listCount() > 0 && n.selected <= 0) n.selected = 1;
@@ -165,6 +252,29 @@ void TextSettingsActivity::onTabAction(const int index) {
 }
 
 void TextSettingsActivity::activateIndex(const int index) {
+  if (shell::isUgly()) {
+    if (index < 0 || index >= 14) return;
+    ugly::QuestionSheet::Intent intent;
+    {
+      RenderLock lock(*this);
+      focusForm(index);
+      const auto row = formRow(this, index);
+      if (index < 2) {
+        // Font/Size favorites open their chooser with the current value intact.
+        if (row.kind == ugly::QuestionSheet::Kind::Paper && !form_.paperOpen()) {
+          intent = form_.input(ugly::QuestionSheet::Key::Confirm);
+          ++formSurface_;
+        } else intent.repaint = true;
+      } else {
+        // Layout/Style favorite launches retain their direct cycle behavior.
+        intent = {ugly::QuestionSheet::IntentKind::Commit, row.id, index,
+                  row.count ? (row.selected + 1) % row.count : 0, true};
+      }
+      formPaintReady_.store(false);
+    }
+    applyFormIntent(intent);
+    return;
+  }
   if (optionPopup_.isActive()) return;
   // Most rows repaint a different surface (popup, preview, new value);
   // a lingering tap flash would gray an unrelated element.
@@ -172,14 +282,322 @@ void TextSettingsActivity::activateIndex(const int index) {
   activateRow(index);
 }
 
+void TextSettingsActivity::queueForm(FormEvent event) {
+  if (event.type == FormEvent::Type::Tap || event.type == FormEvent::Type::Hold || event.type == FormEvent::Type::Strike)
+    event.surface = formVisibleSurface_.load();
+  if (formCount_ < formQueue_.size()) formQueue_[(formHead_ + formCount_++) % formQueue_.size()] = event;
+  else LOG_ERR("UGLY", "Settings form queue full");
+}
+
+void TextSettingsActivity::pollTilt() {
+  if (!shell::isUgly()) {
+    UiTabListActivity::pollTilt();
+    return;
+  }
+  menutilt::pollTabs(static_cast<uint8_t>(renderer.getOrientation()), false);
+  const auto tilt = menutilt::pollRows(true);
+  using Key = ugly::QuestionSheet::Key;
+  if (tilt.previous) queueForm({FormEvent::Type::Key, Key::PreviousQuestion});
+  else if (tilt.next) queueForm({FormEvent::Type::Key, Key::NextQuestion});
+}
+
 bool TextSettingsActivity::handleCustomInput() {
-  return optionPopup_.handleInput(mappedInput, [this] { requestUpdate(); });
+  if (!shell::isUgly()) return optionPopup_.handleInput(mappedInput, [this] { requestUpdate(); });
+  using Button = MappedInputManager::Button;
+  using Key = ugly::QuestionSheet::Key;
+  const auto key = [this](Key value) { queueForm({FormEvent::Type::Key, value}); };
+  if (mappedInput.wasLongPressed(Button::Left, 700)) key(Key::PreviousSheet);
+  else if (mappedInput.wasReleased(Button::Left)) key(Key::PreviousQuestion);
+  if (mappedInput.wasLongPressed(Button::Right, 700)) key(Key::NextSheet);
+  else if (mappedInput.wasReleased(Button::Right)) key(Key::NextQuestion);
+  if (mappedInput.wasReleased(Button::Up)) key(Key::PreviousOption);
+  if (mappedInput.wasReleased(Button::Down)) key(Key::NextOption);
+  if (mappedInput.wasLongPressed(Button::Confirm, 700)) queueForm({FormEvent::Type::Pin});
+  else if (mappedInput.wasReleased(Button::Confirm)) key(Key::Confirm);
+  const bool back = mappedInput.wasReleased(Button::Back);
+  const bool home = mappedInput.wasHomeGesture();
+  if (back) key(Key::Back);
+  if (home) key(Key::Home);
+  int x = 0, y = 0;
+  if (mappedInput.wasScreenLongPress(x, y)) queueForm({FormEvent::Type::Hold, Key::Confirm, static_cast<int16_t>(x), static_cast<int16_t>(y)});
+  else if (mappedInput.wasScreenTapped(x, y)) queueForm({FormEvent::Type::Tap, Key::Confirm, static_cast<int16_t>(x), static_cast<int16_t>(y)});
+#if FREEINK_DEVICE_X4PRO
+  int16_t sx = 0, sy = 0;
+  if (mappedInput.wasStrike(sx, sy)) queueForm({FormEvent::Type::Strike, Key::Confirm, sx, sy});  // back to its default
+#endif
+  const auto swipe = mappedInput.wasSwipe();
+  if (!back && !home) {
+    if (swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Up) key(Key::NextSheet);
+    else if (swipe == MappedInputManager::SwipeDir::Right || swipe == MappedInputManager::SwipeDir::Down) key(Key::PreviousSheet);
+  }
+  if (!formCount_ || !formPaintReady_.load()) return true;
+  ugly::QuestionSheet::Intent intent;
+  int pinRow = -1, strikeRow = -1;
+  bool homeEvent = false;
+  {
+    RenderLock lock(RenderLock::TryTake{});
+    if (!lock.acquired() || !formPaintReady_.load()) return true;
+    const auto event = formQueue_[formHead_];
+    formHead_ = static_cast<uint8_t>((formHead_ + 1) % formQueue_.size());
+    --formCount_;
+    // A finger event belongs to the surface that was visible when sampled.
+    // A tap queued before a paper opened cannot choose a row on that paper.
+    if ((event.type == FormEvent::Type::Tap || event.type == FormEvent::Type::Hold || event.type == FormEvent::Type::Strike) &&
+        event.surface != formSurface_)
+      return true;
+    homeEvent = event.type == FormEvent::Type::Key && event.key == Key::Home;
+    const bool paperWasOpen = form_.paperOpen();
+    const int previousSheet = form_.sheet();
+    const int previousPaperFirst = form_.paperFirst();
+    if (event.type == FormEvent::Type::Key) intent = form_.input(event.key);
+    else if (event.type == FormEvent::Type::Tap) intent = form_.tap(event.x, event.y);
+    else if (event.type == FormEvent::Type::Strike) strikeRow = form_.paperOpen() ? -1 : form_.questionAt(event.x, event.y);
+    else if (!form_.paperOpen()) pinRow = event.type == FormEvent::Type::Hold ? form_.questionAt(event.x, event.y) : form_.question();
+    if (paperWasOpen != form_.paperOpen() || previousSheet != form_.sheet() ||
+        (form_.paperOpen() && previousPaperFirst != form_.paperFirst())) ++formSurface_;
+    activeNav().selected = form_.question() + 1;
+    if (intent.repaint || pinRow >= 0 || strikeRow >= 0) formPaintReady_.store(false);
+  }
+  if (strikeRow >= 0) {
+    const int option = defaultOption(strikeRow), previous = formRow(this, strikeRow).selected;
+    if (option >= 0 && applyChosenValue(formTab(strikeRow), formLocalRow(strikeRow), option, false)) {
+      RenderLock lock(*this);
+      form_.didCommit(strikeRow, previous);
+    }
+    requestUpdate();
+  } else if (pinRow >= 0 && !favoriteKey(pinRow).empty()) {
+    const bool wasPinned = rowIsPinned(pinRow);
+    formPinFailed_.store(!toggleFavorite(pinRow));
+    auto line = ugly::quip(wasPinned ? ugly::Quip::Unpin : ugly::Quip::Pin, 0, 0, 0, formRow(this, pinRow).question);
+    { RenderLock lock(*this); form_.setQuip(pinRow, std::move(line)); }
+    requestUpdate();
+  } else {
+    // An inert hold must leave the input-to-paint handshake open.
+    if (pinRow >= 0) formPaintReady_.store(true);
+    applyFormIntent(intent, homeEvent);
+  }
+  return true;
+}
+
+
+int TextSettingsActivity::formIndex(const Tab tab, const int row) {
+  if (tab == Tab::Family) return 0;
+  if (tab == Tab::Size) return 1;
+  if (tab == Tab::Layout && row >= 0 && row < static_cast<int>(LayoutRow::Count)) return row + 2;
+  if (tab == Tab::Style && row >= 0 && row < static_cast<int>(StyleRow::Count)) return row + 9;
+  return -1;
+}
+
+TextSettingsActivity::Tab TextSettingsActivity::formTab(const int row) {
+  return row == 0 ? Tab::Family : row == 1 ? Tab::Size : row < 9 ? Tab::Layout : Tab::Style;
+}
+
+int TextSettingsActivity::formLocalRow(const int row) {
+  return row < 2 ? 0 : row < 9 ? row - 2 : row - 9;
+}
+
+const SettingInfo* TextSettingsActivity::formSetting(const int row) {
+  if (row < 0 || row >= 14) return nullptr;
+  const StrId name = row == 0 ? StrId::STR_FONT_FAMILY : row == 1 ? StrId::STR_FONT_SIZE
+                     : row < 9 ? LAYOUT_ROW_NAME_IDS[row - 2] : STYLE_ROW_NAME_IDS[row - 9];
+  for (const auto& setting : getBaseSettingsList()) if (setting.nameId == name) return &setting;
+  return nullptr;
+}
+
+ugly::QuestionSheet::Row TextSettingsActivity::formRow(void* context, const int row) {
+  using Kind = ugly::QuestionSheet::Kind;
+  auto& self = *static_cast<TextSettingsActivity*>(context);
+  const auto* setting = formSetting(row);
+  if (!setting) return {};
+  ugly::QuestionSheet::Row out;
+  out.id = static_cast<uint32_t>(setting->nameId) + 1;
+  out.question = I18N.get(setting->nameId);
+  if (row == 0) {
+    out.count = static_cast<int>(self.fonts_.size());
+    out.selected = self.currentFamilyIndex_;
+    out.kind = settingsChoiceStyle(out.count, true) == SettingsChoiceStyle::Page ? Kind::Paper : Kind::Choice;
+  } else if (row == 1) {
+    out.count = static_cast<int>(self.sizes_.size());
+    out.selected = self.currentSizeIndex_;
+    out.kind = out.count <= 6 ? Kind::Choice : out.count <= 15 ? Kind::Ruler : Kind::Paper;
+  } else {
+    int value = setting->valuePtr ? SETTINGS.*setting->valuePtr : 0;
+    if (setting->nameId == StrId::STR_READER_INK_WEIGHT) value = readerInk::clamp(value);
+    if (setting->nameId == StrId::STR_FOCUS_READING) value = readerSpacing::clampDropCapMode(value);
+    if (setting->type == SettingType::TOGGLE) {
+      out.count = 2;
+      out.selected = value != 0;
+      out.kind = Kind::Toggle;
+    } else if (setting->type == SettingType::VALUE && setting->valueRange.step) {
+      out.count = (setting->valueRange.max - setting->valueRange.min) / setting->valueRange.step + 1;
+      out.selected = (value - setting->valueRange.min) / setting->valueRange.step;
+      out.kind = out.count <= 6 ? Kind::Choice : out.count <= 11 ? Kind::Ruler : Kind::Paper;
+    } else {
+      out.count = static_cast<int>(setting->enumLabels().size());
+      out.selected = value;
+      out.kind = settingsChoiceStyle(*setting, true) == SettingsChoiceStyle::Page ? Kind::Paper : Kind::Choice;
+    }
+  }
+  out.selected = std::clamp(out.selected, 0, std::max(0, out.count - 1));
+  return out;
+}
+
+void TextSettingsActivity::formLabel(void* context, const int row, const int option, char* out, const size_t size) {
+  if (!size) return;
+  out[0] = 0;
+  auto& self = *static_cast<TextSettingsActivity*>(context);
+  const auto* setting = formSetting(row);
+  const auto info = formRow(context, row);
+  if (!setting || option < 0 || option >= info.count) return;
+  const char* label = "";
+  if (row == 0) label = self.fonts_[option].name.c_str();
+  else if (row == 1) label = self.sizes_[option].name.c_str();
+  else if (setting->type == SettingType::TOGGLE) label = option ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
+  else if (setting->type == SettingType::VALUE) {
+    snprintf(out, size, "%u", static_cast<unsigned>(setting->valueRange.min + option * setting->valueRange.step));
+    return;
+  } else label = I18N.get(setting->enumLabels()[option]);
+  snprintf(out, size, "%s", label);
+}
+
+bool TextSettingsActivity::saveSettings(const bool repaint) {
+  const bool saved = SETTINGS.saveToFile();
+  saveFailed_.store(!saved);
+  if (!saved) LOG_ERR("TXT", "Saving text settings failed");
+  if (repaint) requestUpdate();
+  return saved;
+}
+
+int TextSettingsActivity::defaultOption(const int row) const {
+  // The font and its size come from the card: no default to go back to.
+  const auto* setting = formSetting(row);
+  if (!setting || !setting->valuePtr || formTab(row) == Tab::Family || formTab(row) == Tab::Size) return -1;
+  const int value = CrossPointSettings::defaultOf(setting->valuePtr);
+  if (setting->type == SettingType::VALUE && setting->valueRange.step)
+    return (value - setting->valueRange.min) / setting->valueRange.step;
+  return setting->type == SettingType::TOGGLE ? value != 0 : value;
+}
+
+bool TextSettingsActivity::applyChosenValue(const Tab tab, const int row, const int option, const bool repaint) {
+  const int question = formIndex(tab, row);
+  if (question < 0) return false;
+  const auto current = formRow(this, question);
+  if (option < 0 || option >= current.count) return false;
+  if (current.selected == option) return true;
+  if (tab == Tab::Family) {
+    if (!applyFamily(option)) return false;
+  } else if (tab == Tab::Size) {
+    if (!applySize(option)) return false;
+  } else {
+    const auto* setting = formSetting(question);
+    if (!setting || !setting->valuePtr) return false;
+    RenderLock lock(*this);
+    SETTINGS.*setting->valuePtr = static_cast<uint8_t>(setting->type == SettingType::VALUE
+        ? setting->valueRange.min + option * setting->valueRange.step : option);
+    if (setting->valuePtr == &CrossPointSettings::readerInkWeight ||
+        setting->valuePtr == &CrossPointSettings::textAntiAliasing) readerInk::apply(renderer);
+  }
+  // RAM stays applied on an SD failure. Its visible error and Back retry are
+  // separate from the font lifecycle, whose resources changed under the lock.
+  saveSettings(repaint);
+  return true;
+}
+
+void TextSettingsActivity::focusForm(const int row) {
+  if (row < 0 || row >= 14) return;
+  const int previousSheet = form_.sheet();
+  for (int n = 0; form_.question() != row && n < 14; ++n) form_.input(ugly::QuestionSheet::Key::NextQuestion);
+  if (previousSheet != form_.sheet()) ++formSurface_;
+  activeNav().selected = row + 1;
+}
+
+void TextSettingsActivity::bindForm() {
+  ++formSurface_;
+  ugly::QuestionSheet::View view;
+  view.context = this;
+  view.count = 14;
+  view.subject = tr(STR_TEXT_SETTINGS);
+  view.date = ReadingStatsStore::currentDay();
+  view.code = 10;
+  view.row = formRow;
+  view.label = formLabel;
+  form_.bind(renderer, view, mappedInput.hasTouch());
+  activeNav().selected = form_.question() + 1;
+  formPaintReady_.store(false);
+}
+
+void TextSettingsActivity::prepareFormQuip(const int row, const int candidate) {
+  if (row < 0 || row >= 14 || candidate < 0 || candidate >= formRow(this, row).count) return;
+  uint16_t key = 0;
+  int number = candidate;
+  if (row == 0) key = ugly::valueKey(buildFontFamilySetting(registry_), candidate);
+  else if (row == 1) {
+    key = ugly::valueKey(buildFontSizeSetting(registry_), candidate);
+    number = sizes_[candidate].pointSize;
+  } else {
+    const auto* setting = formSetting(row);
+    if (setting->type == SettingType::VALUE) number = setting->valueRange.min + candidate * setting->valueRange.step;
+    key = ugly::valueKey(*setting, number);
+  }
+  auto line = ugly::quip(ugly::Quip::SetValue, key, 0, number);
+  RenderLock lock(*this);
+  form_.setQuip(row, std::move(line));
+}
+
+void TextSettingsActivity::applyFormIntent(const ugly::QuestionSheet::Intent& intent, const bool home) {
+  using Intent = ugly::QuestionSheet::IntentKind;
+  if (intent.kind == Intent::Back) {
+    formCount_ = 0;
+    if (saveFailed_.load() && !saveSettings(false)) { requestUpdate(); return; }
+    if (home) onGoHome(HomeMenuItem::SETTINGS_MENU);
+    else finish();
+    return;
+  }
+  if (intent.row >= 0 && intent.row < 14 && intent.id == formRow(this, intent.row).id) {
+    if (intent.kind == Intent::Commit) {
+      const int previous = formRow(this, intent.row).selected;
+      if (applyChosenValue(formTab(intent.row), formLocalRow(intent.row), intent.candidate, false)) {
+        RenderLock lock(*this);
+        form_.didCommit(intent.row, previous);
+      }
+    }
+    if (intent.kind == Intent::Preview || intent.kind == Intent::Commit) prepareFormQuip(intent.row, intent.candidate);
+  }
+  if (intent.repaint) requestUpdate();
+}
+
+void TextSettingsActivity::onPause() {
+  form_.invalidate();
+  formPaintReady_.store(false);
+  formCount_ = 0;
+}
+
+void TextSettingsActivity::onResume() {
+  if (shell::isUgly()) bindForm();  // ActivityManager owns RenderLock.
+}
+
+bool TextSettingsActivity::handleHomeGesture() {
+  if (!shell::isUgly()) return false;
+  queueForm({FormEvent::Type::Key, ugly::QuestionSheet::Key::Home});
+  return true;
+}
+
+void TextSettingsActivity::restoreNavigation(const MenuNavigationState& state) {
+  UiTabListActivity::restoreNavigation(state);
+  if (shell::isUgly()) {
+    RenderLock lock(*this);
+    focusForm(std::clamp(ringPos() - 1, 0, 13));
+  }
+}
+
+int TextSettingsActivity::favoriteSelectedRow() {
+  return shell::isUgly() ? form_.question() : UiTabListActivity::favoriteSelectedRow();
 }
 
 bool TextSettingsActivity::handleButtons() {
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     // Roi man mot nhip (chot 14/09/2026 dem), nhu menu doc va man Cai dat.
-    finish();
+    if (!saveFailed_.load() || saveSettings()) finish();
     return true;
   }
 
@@ -198,10 +616,17 @@ bool TextSettingsActivity::handleButtons() {
 void TextSettingsActivity::buildScreen(UiScreen& screen) {
   // Content sits below the preview pane (render() draws header + preview
   // directly) and above the caption band + button hints.
-  const int tabTop = tenorchrome::enabled() ? tenorchrome::tabTop() : afterHeader + previewHeight;
-  const int captionHeight = renderer.getTextHeight(UI_10_FONT_ID) + metrics_.verticalSpacing;
-  screen.setContentMarginFromScreen(
-      fui::Insets{static_cast<int16_t>(tabTop), 0, static_cast<int16_t>(bottomReserved + captionHeight), 0});
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* tip = x3TipText();
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tip ? tenorchrome::tipHeight(renderer, tip, 6) : 0);
+    screen.setContentMarginFromScreen(
+        fui::Insets{static_cast<int16_t>(layout.bodyRect.y), 0, static_cast<int16_t>(bottomReserved), 0});
+  } else {
+    const int tabTop = tenorchrome::enabled() ? tenorchrome::tabTop() : afterHeader + previewHeight;
+    const int captionHeight = renderer.getTextHeight(UI_10_FONT_ID) + metrics_.verticalSpacing;
+    screen.setContentMarginFromScreen(
+        fui::Insets{static_cast<int16_t>(tabTop), 0, static_cast<int16_t>(bottomReserved + captionHeight), 0});
+  }
 
   buildTabBar(screen);
   if (tenorchrome::enabled()) screen.takeTop(static_cast<int16_t>(previewHeight));
@@ -213,11 +638,14 @@ void TextSettingsActivity::buildScreen(UiScreen& screen) {
   const int count = listCount();
   for (int i = 0; i < count; i++) {
     switch (tab_) {
+      case Tab::Favorites:
+        rowValues_[i] = menufavorites::value(favoriteKey(i), registry_);
+        break;
       case Tab::Family:
-        rowValues_[i] = (i == currentFamilyIndex_) ? tr(STR_SELECTED) : "";
+        rowValues_[i] = (i == currentFamilyIndex_ && !tenorchrome::kTouchShell) ? tr(STR_SELECTED) : "";
         break;
       case Tab::Size:
-        rowValues_[i] = (i == currentSizeIndex_) ? tr(STR_SELECTED) : "";
+        rowValues_[i] = (i == currentSizeIndex_ && !tenorchrome::kTouchShell) ? tr(STR_SELECTED) : "";
         break;
       case Tab::Layout:
         rowValues_[i] = layoutValueText(i);
@@ -229,6 +657,11 @@ void TextSettingsActivity::buildScreen(UiScreen& screen) {
         break;
     }
     rowItems_[i].value = rowValues_[i].empty() ? nullptr : rowValues_[i].c_str();
+    rowItems_[i].toggle = rowChoiceStyle(i) == SettingsChoiceStyle::Inline;
+    rowItems_[i].toggleChecked = rowItems_[i].toggle && formRow(this, formIndex(tab_, i)).selected;
+    // Touch: the font or size in use is the chosen row (bold, a tick), no word.
+    rowItems_[i].chosen = tenorchrome::kTouchShell && ((tab_ == Tab::Family && i == currentFamilyIndex_) ||
+                                                       (tab_ == Tab::Size && i == currentSizeIndex_));
   }
 
   fui::ListProps props;
@@ -236,6 +669,8 @@ void TextSettingsActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(rowItems_.size());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
+  // Touch: a held row opens like a tap, as before cards took a hold.
+  if (tenorchrome::kTouchShell) props.inputMask |= fui::InputLongPress;
   props.valueInset = 8;               // air between the value and the row edge
   // Titles match the value's font size (smallText) so both sides of a row
   // read as one unit; labels that still don't fit wrap onto a second line.
@@ -248,29 +683,36 @@ void TextSettingsActivity::buildScreen(UiScreen& screen) {
 
 const char* TextSettingsActivity::confirmLabelText() const {
   if (ringPos() == 0) return tr(STR_SELECT);
-  switch (tab_) {
-    case Tab::Layout:
-      // Inline choices cycle directly; the other rows open a picker.
-      return ringPos() - 1 == static_cast<int>(LayoutRow::LineSpacing) ||
-                     ringPos() - 1 == static_cast<int>(LayoutRow::LetterSpacing) ||
-                     ringPos() - 1 == static_cast<int>(LayoutRow::WordSpacing) ||
-                     ringPos() - 1 == static_cast<int>(LayoutRow::ParaSpacing) ||
-                     ringPos() - 1 == static_cast<int>(LayoutRow::ParaIndent)
-                 ? tr(STR_TOGGLE)
-                 : tr(STR_SELECT);
-    case Tab::Style:
-      return tr(STR_TOGGLE);
-    default:
-      return tr(STR_SELECT);
+  if (tab_ == Tab::Layout || tab_ == Tab::Style) {
+    const int row = ringPos() - 1;
+    const auto style = rowChoiceStyle(row);
+    return style == SettingsChoiceStyle::Popup || style == SettingsChoiceStyle::Page
+               ? tr(STR_SELECT) : tr(STR_TOGGLE);
   }
+  return tr(STR_SELECT);
 }
 
 void TextSettingsActivity::render(RenderLock&&) {
+  if (shell::isUgly()) {
+    [[maybe_unused]] const uint32_t started = millis();
+    form_.paint(renderer, mappedInput);
+    if (saveFailed_.load()) GUI.drawPopup(renderer, tr(STR_HABIT_SAVE_FAILED));
+    else if (formPinFailed_.load()) GUI.drawPopup(renderer, tr(STR_MENU_SAVE_FAILED));
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    formVisibleSurface_.store(formSurface_);
+    formPaintReady_.store(true);
+#ifdef UGLY_FRAME_LOG
+    LOG_INF("UGLY", "Text form total=%lums rows=14 sheet=%d/%d question=%d candidate=%d paper=%d",
+            static_cast<unsigned long>(millis() - started), form_.sheet() + 1, form_.sheetCount(), form_.question(),
+            form_.candidate(), form_.paperOpen());
+#endif
+    return;
+  }
   if (optionPopup_.processRender(renderer, mappedInput)) return;  // picker draws over everything
+  if (rowMenu.processRender(renderer, mappedInput)) return;  // a held card's menu (touch)
 
+  refreshFavoriteRows();
   updatePreviewGeometry();
-
-  const auto pageWidth = renderer.getScreenWidth();
 
   const char* familyName = (currentFamilyIndex_ >= 0 && currentFamilyIndex_ < static_cast<int>(fonts_.size()))
                                ? fonts_[currentFamilyIndex_].name.c_str()
@@ -285,35 +727,44 @@ void TextSettingsActivity::render(RenderLock&&) {
 #endif
   renderSettledList(activeNav(), [&] {
     renderer.clearScreen();
-    drawNavigationHeader(tr(STR_TEXT_SETTINGS));
+    if (!tenorchrome::x3ScreenLayoutEnabled()) drawNavigationHeader(tr(STR_TEXT_SETTINGS));
 #ifdef TENOR_PRESS_PROBE
     const unsigned long previewStarted = millis();
     ++passes;
 #endif
     textsettings::renderPreview(renderer, previewLayout_, metrics_.previewPadding, metrics_.verticalSpacing, afterHeader,
-                               previewHeight, familyName, sizeName);
+                               previewHeight, familyName, sizeName, drawsSideArrows());
 #ifdef TENOR_PRESS_PROBE
     previewMs += millis() - previewStarted;
 #endif
     renderUi();
   });
 
-  const bool weightUnavailable =
-      tab_ == Tab::Style && ringPos() - 1 == static_cast<int>(StyleRow::InkWeight) &&
-      !readerInk::available(SETTINGS.readerInkWeight, sdFontSystem.availableWeightMask());
-  if (weightUnavailable || focusedRowHasNoPreview()) {
+  if (!tenorchrome::x3ScreenLayoutEnabled() && focusedRowHasNoPreview()) {
     const int captionHeight = renderer.getTextHeight(UI_10_FONT_ID) + metrics_.verticalSpacing;
     const int capY = afterHeader + usableHeight - captionHeight + metrics_.verticalSpacing;
-    renderer.drawText(UI_10_FONT_ID, metrics_.previewPadding, capY,
-                      weightUnavailable ? tr(STR_INK_UNAVAILABLE) : tr(STR_NOT_IN_PREVIEW));
+    renderer.drawText(UI_10_FONT_ID, metrics_.previewPadding, capY, tr(STR_NOT_IN_PREVIEW));
+  }
+
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* tip = x3TipText();
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tip ? tenorchrome::tipHeight(renderer, tip, 6) : 0);
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect, 6);
+    if (!screenInfo_.empty()) {
+      auto info = layout.bodyRect;
+      const int height = tenorchrome::tipHeight(renderer, screenInfo_.c_str(), 8);
+      info.y = info.bottom() - height;
+      info.height = height;
+      tenorchrome::drawInfoInRect(renderer, screenInfo_.c_str(), info, 8);
+    }
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabelText(), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-
 #ifdef TENOR_PRESS_PROBE
   const unsigned long painted = millis();
 #endif
+  if (!tenorchrome::x3ScreenLayoutEnabled() && saveFailed_.load()) GUI.drawPopup(renderer, tr(STR_HABIT_SAVE_FAILED));
   renderer.displayBuffer();
 #ifdef TENOR_PRESS_PROBE
   LOG_INF("TXT", "Frame paint=%lu preview=%lu passes=%u display=%lu", painted - started, previewMs, passes,
@@ -322,6 +773,15 @@ void TextSettingsActivity::render(RenderLock&&) {
 }
 
 void TextSettingsActivity::updatePreviewGeometry() {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* tip = x3TipText();
+    const auto layout = tenorchrome::x3ScreenLayout(renderer,
+        tip ? tenorchrome::tipHeight(renderer, tip, 6) : 0);
+    afterHeader = layout.bodyRect.y;
+    bottomReserved = renderer.getScreenHeight() - layout.bodyRect.bottom();
+    screenInfo_ = x3InfoText();
+    if (!screenInfo_.empty()) bottomReserved += tenorchrome::tipHeight(renderer, screenInfo_.c_str(), 8) + 8;
+  }
   usableHeight = std::max(0, renderer.getScreenHeight() - afterHeader - bottomReserved);
   previewHeight = usableHeight * metrics_.previewHeightPercent / 100;
 
@@ -354,112 +814,76 @@ void TextSettingsActivity::updatePreviewGeometry() {
 // next one, and the render task walks that same object inside the preview's
 // prewarmCache() - so without this lock a font switch can free the mini glyph
 // arrays out from under prewarmStyle() (crash: null s.miniGlyphs mid-read/sort).
-void TextSettingsActivity::applyFamily(int listIndex) {
+bool TextSettingsActivity::applyFamily(const int listIndex) {
   RenderLock lock;
-  if (!fontdoc::apHo(renderer, registry_, listIndex)) return;  // switch failed, keep the old size list
+  if (!fontdoc::apHo(renderer, registry_, listIndex)) return false;
   currentFamilyIndex_ = listIndex;
-
-  // The new family ships its own set of point sizes, and ensureLoaded() may have
-  // snapped the selection into it, so the Size tab's list and its nav position
-  // both have to be rebuilt.
+  if (shell::isUgly()) form_.invalidate();
   rebuildSizeList();
-  tabNavs[static_cast<int>(Tab::Size)].selected = currentSizeIndex_ + 1;
+  tabNavs[displayIndex(Tab::Size)].selected = currentSizeIndex_ + 1;
+  if (shell::isUgly()) bindForm();
+  return true;
 }
 
-void TextSettingsActivity::activateRow(int row) {
-  commitTabNavigation();
-  switch (tab_) {
-    case Tab::Family:
-      if (row != currentFamilyIndex_) {
-        applyFamily(row);
-        // Persist immediately (like SettingsActivity's per-change saves): the
-        // parent's result callback only runs on a normal finish(), so relying
-        // on it loses the change when this screen is left via the home
-        // gesture/key or a sleep. Saved here, not inside applyFamily, so the
-        // SD write happens outside its RenderLock.
-        if (currentFamilyIndex_ == row) {
-          SETTINGS.saveToFile();
-        }
-        requestUpdate();
-      }
-      break;
-    case Tab::Size:
-      if (row != currentSizeIndex_) {
-        applySize(row);
-        SETTINGS.saveToFile();
-        requestUpdate();
-      }
-      break;
-    case Tab::Layout:
-      confirmLayoutRow(row);
-      break;
-    case Tab::Style:
-      confirmStyleRow(row);
-      break;
-    default:
-      break;
+void TextSettingsActivity::activateRow(const int row) {
+  if (row < 0 || row >= listCount()) return;
+  if (tab_ == Tab::Favorites) {
+    const std::string key = favoriteKey(row);
+    const int focused = focusFavorite(key);
+    if (focused >= 0 && (tab_ == Tab::Layout || tab_ == Tab::Style)) activateRow(focused);
+    return;
   }
+  commitTabNavigation();
+  if (tab_ == Tab::Family || tab_ == Tab::Size) applyChosenValue(tab_, 0, row);
+  else if (tab_ == Tab::Layout) confirmLayoutRow(row);
+  else if (tab_ == Tab::Style) confirmStyleRow(row);
 }
 
 // Same RenderLock rationale as applyFamily(): a size change reloads the SD font
 // file, which frees and replaces the SdCardFont the render task may be reading.
-void TextSettingsActivity::applySize(int listIndex) {
+bool TextSettingsActivity::applySize(const int listIndex) {
   RenderLock lock;
+  if (listIndex < 0 || listIndex >= static_cast<int>(sizes_.size())) return false;
   currentSizeIndex_ = listIndex;
   fontdoc::apCo(renderer, sizes_[listIndex].pointSize);
+  return true;
 }
 
-void TextSettingsActivity::confirmLayoutRow(int row) {
-  switch (static_cast<LayoutRow>(row)) {
-    case LayoutRow::LetterSpacing:
-      SETTINGS.letterSpacing = readerSpacing::clampLevel(SETTINGS.letterSpacing + 1);
-      SETTINGS.saveToFile();
-      requestUpdate();
-      break;
-    case LayoutRow::WordSpacing:
-      SETTINGS.wordSpacing = readerSpacing::clampLevel(SETTINGS.wordSpacing + 1);
-      SETTINGS.saveToFile();
-      requestUpdate();
-      break;
-    case LayoutRow::ParaIndent:
-      SETTINGS.paragraphIndent = (SETTINGS.paragraphIndent + 1) % std::size(INDENT_IDS);
-      SETTINGS.saveToFile();
-      requestUpdate();
-      break;
-    case LayoutRow::ParaSpacing:
-      SETTINGS.extraParagraphSpacing = readerSpacing::clampLevel(SETTINGS.extraParagraphSpacing + 1);
-      SETTINGS.saveToFile();
-      requestUpdate();
-      break;
-    case LayoutRow::LineSpacing:
-      SETTINGS.lineSpacing = readerSpacing::clampLevel(SETTINGS.lineSpacing + 1);
-      SETTINGS.saveToFile();
-      requestUpdate();
-      break;
-    case LayoutRow::Alignment:
-      optionPopup_.show(StrId::STR_ALIGNMENT, ALIGNMENT_IDS, static_cast<int>(std::size(ALIGNMENT_IDS)),
-                        SETTINGS.paragraphAlignment, [](int idx) {
-                          SETTINGS.paragraphAlignment = static_cast<uint8_t>(idx);
-                          SETTINGS.saveToFile();
-                        });
-      requestUpdate();
-      break;
-    case LayoutRow::ScreenMargin: {
-      std::vector<std::string> options;
-      options.reserve((MARGIN_MAX - MARGIN_MIN) / MARGIN_STEP + 1);
-      for (int m = MARGIN_MIN; m <= MARGIN_MAX; m += MARGIN_STEP) options.push_back(std::to_string(m));
-      const int cur = (std::clamp<int>(SETTINGS.screenMargin, MARGIN_MIN, MARGIN_MAX) - MARGIN_MIN) / MARGIN_STEP;
-      optionPopup_.show(StrId::STR_SCREEN_MARGIN, options, cur, [](int idx) {
-        SETTINGS.screenMargin = static_cast<uint8_t>(MARGIN_MIN + idx * MARGIN_STEP);
-        SETTINGS.saveToFile();
-      });
-      requestUpdate();
-      break;
-    }
+void TextSettingsActivity::confirmLayoutRow(const int row) {
+  confirmValueRow(Tab::Layout, row);
+}
 
-    default:
-      break;
+void TextSettingsActivity::confirmValueRow(const Tab tab, const int row) {
+  const int question = formIndex(tab, row);
+  if (question < 0) return;
+  const auto current = formRow(this, question);
+  const auto* setting = formSetting(question);
+  if (!setting || current.count <= 0) return;
+  const auto style = settingsChoiceStyle(*setting, tenorchrome::kTouchShell);
+  if (style == SettingsChoiceStyle::Popup || style == SettingsChoiceStyle::Page) {
+    std::vector<std::string> options;
+    options.reserve(current.count);
+    for (int option = 0; option < current.count; ++option) {
+      char label[128];
+      formLabel(this, question, option, label, sizeof(label));
+      options.emplace_back(label);
+    }
+    const auto onSelect = [this, tab, row](int option) { applyChosenValue(tab, row, option); };
+    showSettingsChoices(optionPopup_, setting->nameId, options, current.selected, row, onSelect);
+  } else {
+    applyChosenValue(tab, row, (current.selected + 1) % current.count);
   }
+}
+
+SettingsChoiceStyle TextSettingsActivity::rowChoiceStyle(const int row) const {
+  if (tab_ != Tab::Layout && tab_ != Tab::Style) return SettingsChoiceStyle::None;
+  const auto* setting = formSetting(formIndex(tab_, row));
+  return setting ? settingsChoiceStyle(*setting, tenorchrome::kTouchShell) : SettingsChoiceStyle::None;
+}
+
+int TextSettingsActivity::settingsChoiceCount(const int row) const {
+  if (tab_ != Tab::Layout && tab_ != Tab::Style) return 0;
+  return formRow(const_cast<TextSettingsActivity*>(this), formIndex(tab_, row)).count;
 }
 
 std::string TextSettingsActivity::layoutValueText(int row) {
@@ -471,7 +895,7 @@ std::string TextSettingsActivity::layoutValueText(int row) {
     case LayoutRow::ParaIndent:
       return I18N.get(INDENT_IDS[SETTINGS.paragraphIndent < std::size(INDENT_IDS) ? SETTINGS.paragraphIndent : 0]);
     case LayoutRow::LineSpacing:
-      return I18N.get(SPACING_LEVEL_IDS[readerSpacing::clampLevel(SETTINGS.lineSpacing)]);
+      return I18N.get(LINE_SPACING_IDS[readerSpacing::clampLineLevel(SETTINGS.lineSpacing)]);
     case LayoutRow::ParaSpacing:
       return I18N.get(SPACING_LEVEL_IDS[readerSpacing::clampLevel(SETTINGS.extraParagraphSpacing)]);
     case LayoutRow::Alignment: {
@@ -486,35 +910,8 @@ std::string TextSettingsActivity::layoutValueText(int row) {
   }
 }
 
-void TextSettingsActivity::confirmStyleRow(int row) {
-  switch (static_cast<StyleRow>(row)) {
-    case StyleRow::InkWeight:
-      {
-        RenderLock lock;
-        SETTINGS.readerInkWeight = readerInk::next(SETTINGS.readerInkWeight);
-        sdFontSystem.ensureLoaded(renderer);
-      }
-      break;
-    case StyleRow::FocusReading:
-      // The drop cap cycles Off -> Default -> Large; the Settings list and the
-      // reader toolbar show the same three labels.
-      SETTINGS.dropCapMode = static_cast<uint8_t>((SETTINGS.dropCapMode + 1) % readerSpacing::DROP_CAP_MODE_COUNT);
-      break;
-    case StyleRow::Hyphenation:
-      SETTINGS.hyphenationEnabled = !SETTINGS.hyphenationEnabled;
-      break;
-    case StyleRow::EmbeddedStyle:
-      SETTINGS.embeddedStyle = !SETTINGS.embeddedStyle;
-      break;
-    case StyleRow::AntiAliasing:
-      SETTINGS.textAntiAliasing = !SETTINGS.textAntiAliasing;
-      break;
-
-    default:
-      return;
-  }
-  SETTINGS.saveToFile();
-  requestUpdate();
+void TextSettingsActivity::confirmStyleRow(const int row) {
+  confirmValueRow(Tab::Style, row);
 }
 
 std::string TextSettingsActivity::styleValueText(int row) {
@@ -543,7 +940,8 @@ bool TextSettingsActivity::focusedRowHasNoPreview() const {
 }
 
 void TextSettingsActivity::switchTab(const int direction) {
-  tab_ = static_cast<Tab>(adjacentTab(direction));
+  RenderLock lock(*this);
+  tab_ = tabForIndex(adjacentTab(direction));
   rebuildRowItems();
   auto& n = activeNav();
   if (!mappedInput.hasTouch() && listCount() > 0 && n.selected <= 0) n.selected = 1;
@@ -552,7 +950,10 @@ void TextSettingsActivity::switchTab(const int direction) {
 }
 
 int TextSettingsActivity::listCount() const {
+  if (shell::isUgly()) return 14;
   switch (tab_) {
+    case Tab::Favorites:
+      return favoriteCount_;
     case Tab::Family:
       return static_cast<int>(fonts_.size());
     case Tab::Size:
@@ -568,13 +969,24 @@ int TextSettingsActivity::listCount() const {
 }
 
 std::string TextSettingsActivity::favoriteKey(int row) const {
+  if (shell::isUgly()) {
+    if (row < 0 || row >= 14) return {};
+    return menufavorites::keyFor("text", static_cast<int>(formTab(row)), formLocalRow(row));
+  }
   if (row < 0 || row >= listCount()) return {};
-  return menufavorites::keyFor("text", activeTab(), tab_ == Tab::Family || tab_ == Tab::Size ? 0 : row);
+  if (tab_ == Tab::Favorites) return menucustom::state().pins[favoritePins_[row]].data();
+  return menufavorites::keyFor("text", static_cast<int>(tab_), tab_ == Tab::Family || tab_ == Tab::Size ? 0 : row);
 }
 int TextSettingsActivity::focusFavorite(const std::string& key) {
   const auto* route = menufavorites::find(key);
   if (!route || std::string(route->screen) != "text") return -1;
-  onTabAction(route->tab);
+  if (shell::isUgly()) {
+    const int question = formIndex(static_cast<Tab>(route->tab), route->row);
+    RenderLock lock(*this);
+    focusForm(question);
+    return question;
+  }
+  onTabAction(displayIndex(static_cast<Tab>(route->tab)));
   if (tab_ == Tab::Family || tab_ == Tab::Size) {
     RenderLock lock(*this);
     activeNav().selected = (tab_ == Tab::Family ? currentFamilyIndex_ : currentSizeIndex_) + 1;
@@ -589,4 +1001,27 @@ int TextSettingsActivity::focusFavorite(const std::string& key) {
       return row;
     }
   return -1;
+}
+
+const char* TextSettingsActivity::favoriteHintText() {
+  return tenorchrome::x3ScreenLayoutEnabled() ? nullptr : UiListActivity::favoriteHintText();
+}
+
+const char* TextSettingsActivity::x3TipText() {
+  if (tab_ == Tab::Favorites && favoriteCount_ == 0) return tr(STR_READER_FAVORITES_EMPTY);
+  const char* hint = UiListActivity::favoriteHintText();
+  return hint == tr(STR_MENU_SAVE_FAILED) ? nullptr : hint;
+}
+
+std::string TextSettingsActivity::x3InfoText() {
+  std::string info;
+  if (tab_ == Tab::Favorites && favoriteCount_ == 0) info = tr(STR_FAVORITES_EMPTY);
+  const auto append = [&](const char* text) {
+    if (!info.empty()) info += "\n";
+    info += text;
+  };
+  if (UiListActivity::favoriteHintText() == tr(STR_MENU_SAVE_FAILED)) append(tr(STR_MENU_SAVE_FAILED));
+  if (saveFailed_.load()) append(tr(STR_HABIT_SAVE_FAILED));
+  if (focusedRowHasNoPreview()) append(tr(STR_NOT_IN_PREVIEW));
+  return info;
 }

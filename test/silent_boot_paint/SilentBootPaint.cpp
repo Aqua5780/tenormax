@@ -7,6 +7,12 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include "../../src/shells/ugly/UglyIcons.h"
+#include "../../src/shells/ugly/UglyMarkSeed.h"
+
+namespace shell { bool isUgly() { return false; } }
+namespace ugly { void setIconFrameSeed(uint32_t) {} }
+uint32_t millis() { return 0; }
 
 // The production paint request, waited paint and render task, the flush at the end of
 // ActivityManager::loop() and the tail of a silent boot in setup(), on fake FreeRTOS tasks.
@@ -52,13 +58,31 @@ struct {
   void setInverted(bool) {}
 } display;
 struct {
+  void waitRefreshComplete() {}
+} renderer;
+struct SleepActivity {
+  static bool takeWakeNoticeRunning() { return false; }
+};
+struct {
   int screenInverted = 0;
 } SETTINGS;
 std::atomic<bool> frameAfterDeferredWrite{false};
 std::atomic<bool> frameDrawn{false};
+std::atomic<uint32_t> frameDrawnGeneration{0};
+struct PageScrollbar {
+  static PageScrollbar& instance() { static PageScrollbar scrollbar; return scrollbar; }
+  void activate(const void*) {}
+  template<class Renderer, class Input> bool renderIdleUpdate(const Renderer&, const Input&) { return false; }
+  void beginPaint() {}
+  void endPaint() {}
+  void cancelIdleRequest() {}
+};
 
 struct Activity {
+  ugly::icons::FrameState uglyIconFrame;
+  uint64_t uglyIconPageKey() { return 0; }
   std::atomic<int> paints{0};
+  bool renderIdleUpdate() { return false; }  // no idle-only repaint in this harness
   void render(RenderLock&&) {
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     ++paints;
@@ -72,6 +96,8 @@ class ActivityManager {
   SemaphoreHandle_t renderingMutex = nullptr;
   std::atomic<bool> requestedUpdate{false};
   bool sleepTransition = false;
+  uint32_t activityGeneration_ = 0;
+  int mappedInput = 0;
   std::unique_ptr<Activity> currentActivity;
   [[noreturn]] void renderTaskLoop();
   void requestUpdate(bool immediate = false);

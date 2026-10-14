@@ -13,11 +13,18 @@
 #include "GfxRenderer.h"
 #include "MappedInputManager.h"
 #include "MenuNavigationMemory.h"
+#include "components/FrontlightGesture.h"
+#include "components/X3NavigationPath.h"
 #include "util/ScreenshotInfo.h"
 
 class Activity;    // forward declaration
+namespace tenorchrome {
+enum class Zone : uint8_t;
+}
 class RenderLock;  // forward declaration
 
+// The values ride through a silent restart in RTC memory (main.cpp), so new items go last.
+// LIBRARY remains reserved for RTC compatibility after removal of the Library screen.
 enum class HomeMenuItem {
   NONE,
   FILE_BROWSER,
@@ -27,7 +34,9 @@ enum class HomeMenuItem {
   SETTINGS_MENU,
   STATS_TAB,
   FAVORITES_TAB,
-  RECENT_CONTINUE
+  RECENT_CONTINUE,
+  LIBRARY,
+  DESK  // tenor/ugly's desk; other shells read it as RECENTS
 };
 
 // A reader shortcut a quick action asks the foreground reader for (quickaction::Outcome).
@@ -81,8 +90,14 @@ class ActivityManager {
   std::atomic<bool> requestedUpdate{false};
   bool sleepTransition = false;
   bool homeAfterInput = false;
+  HomeMenuItem homeAfterInputTarget = HomeMenuItem::NONE;
+  bool toReaderPage = false;
   uint32_t activityGeneration_ = 0;
   MenuNavigationMemory navigationMemory;
+  FrontlightGesture lightGesture;
+  bool handleLightGesture();
+  bool applyLightLevel();
+  void deferLightGestureSave();
   void restoreNavigation();
   void saveNavigation(Activity& activity);
   void flushDeferredWrites();
@@ -96,8 +111,22 @@ class ActivityManager {
   ~ActivityManager() { assert(false); /* should never be called */ };
 
   MenuNavigationMemory& menuNavigationMemory() { return navigationMemory; }
+  // The name of the screen in front, for the one hook that draws the touch shell's dynamic bar.
+  const char* currentName() const;
+  HomeMenuItem homeKeyTarget() const;
+  void drawLightGesture(const GfxRenderer& renderer) const;
+  // The zone the screen in front belongs to, and where the bar's zone icon leads.
+  tenorchrome::Zone footZone() const;
+  std::vector<tenorchrome::X3PathNode> x3NavigationPath(const char* title) const;
+  bool x3NavigationIsFilePath() const;
+  void goZoneRoot();
+  // True while the zone icon closes the screens above the book: the book does not reopen its menu.
+  bool returningToReaderPage() const { return toReaderPage; }
 
   HomeMenuItem homeMenuOrigin() const;
+  // The Home card the zone icon of the dynamic bar leads to: homeMenuOrigin(), or on tenor/ugly the notebook
+  // page under the screen (NONE: the diary).
+  HomeMenuItem zoneOrigin() const;
   void begin();
   void loop();
 
@@ -111,7 +140,6 @@ class ActivityManager {
   // goi thang vao dung the, khoi bat nguoi ta nhay the lai tu dau.
   void goToSettings(int theBanDau = 0);
   void goToFileBrowser(std::string path = {});
-  void goToRecentBooks();
   void goToBrowser();
   void goToReader(std::string path, bool allowFastInitialRefresh = false);
   bool goToSleep(bool fromTimeout = false);
@@ -131,6 +159,8 @@ class ActivityManager {
 
   // This will move current activity to stack instead of deleting it
   void pushActivity(std::unique_ptr<Activity>&& activity);
+  // The top menu (the light panel): the status strip, the top-edge swipe and the reader's top band.
+  void openTopMenu();
 
   // Remove the currentActivity, returning the last one on stack
   // Note: if popActivity() on last activity on the stack, we will goHome()
@@ -150,9 +180,12 @@ class ActivityManager {
   bool isForegroundReaderActivity() const;
   bool isForegroundActivityManagingTiltSensor() const;
   bool isForegroundReaderReady() const;
+  // Home is in front and has painted a frame of its own (not one left from the screen before).
+  bool isForegroundHomePainted() const;
   bool foregroundReaderHoldsRadio() const;
-  // The foreground reader frees what it can before the radio starts (ReaderActivity::readyForRadio).
-  bool readyForegroundReaderForRadio();
+  bool foregroundReaderCoversPage() const;
+  // The foreground reader frees what it can before the radio starts (ReaderActivity::yieldForRadio).
+  bool yieldForegroundReaderForRadio();
   // Closes the foreground activity the way leaving it does and writes everything it deferred, so
   // a restart right after reopens the book on the page it showed. Waits out a paint in flight.
   void closeForRestart();

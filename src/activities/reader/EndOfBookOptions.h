@@ -1,4 +1,5 @@
 #pragma once
+#include "shells/ugly/UglyMarkSeed.h"
 
 #include <atomic>
 #include <string>
@@ -42,11 +43,14 @@ class EndOfBookOptions : private UiAppHost {
   void render(GfxRenderer& renderer, const MappedInputManager& input);
 
  private:
+  std::atomic<uint32_t> markSeed_{ugly::markSeed()};
   // The UiAppHost base hosts the suggestion list (themed rows, touch routing);
   // the title and button hints stay on the legacy UITheme calls.
   static void listScreen(UiScreen& screen, void* user);
   static void onRowEvent(const freeink::ui::ActionEvent& event, void* user);
   void buildListScreen(UiScreen& screen);
+  // tenor/ugly on the button readers: the same screen as a notebook page written by hand.
+  void renderUgly(GfxRenderer& renderer, const MappedInputManager& input);
 
   GfxRenderer& renderer;
   std::string folder;

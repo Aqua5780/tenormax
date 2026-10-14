@@ -1,7 +1,9 @@
 #pragma once
 #include <cstring>
+#include <array>
 #include "components/UIScale.h"
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -18,8 +20,14 @@ class GfxRenderer {
   mutable bool invalidUtf8Seen = false;
   int advancePerByte = 8;
   uint8_t uiTier = 0;
+  int screenWidth = 528, screenHeight = 792;
+  std::map<int, EpdFontFamily> fonts;
+  const std::map<int, EpdFontFamily>& getFontMap() const { return fonts; }
+  void insertFont(int font, const EpdFontFamily& family) { fonts[font] = family; }
   struct TextRun { int font, x, y; std::string text; };
   mutable std::vector<TextRun> runs;
+  struct KeyRun { int x, y, width, height; std::string text; };
+  mutable std::vector<KeyRun> keys;
   void inspectUtf8(const char* text) const {
     const auto* p = reinterpret_cast<const unsigned char*>(text);
     while (*p) {
@@ -42,16 +50,20 @@ class GfxRenderer {
     if (frameStarted) frameStarted();
     drawnText.clear();
     runs.clear();
+    keys.clear();
     invalidUtf8Seen = false;
   }
   void getOrientedViewableTRBL(int* top, int* right, int* bottom, int* left) const {
     *top = 9; *right = 7; *bottom = 7; *left = 7;
   }
-  int getScreenWidth() const { return 528; }
-  int getScreenHeight() const { return 792; }
+  int getScreenWidth() const { return screenWidth; }
+  int getScreenHeight() const { return screenHeight; }
   int getLineHeight(int font) const { return uiTier == 0 ? 20 : font == SMALL_FONT_ID ? uiTextSizeSpec(uiTier).captionLineHeight : uiTextSizeSpec(uiTier).bodyLineHeight; }
   int getTextAdvanceX(int, const char* s, EpdFontFamily::Style) const { inspectUtf8(s); return std::strlen(s) * advancePerByte; }
-  int getTextWidth(int, const char* s) const { inspectUtf8(s); return std::strlen(s) * advancePerByte; }
+  int getTextWidth(int, const char* s, EpdFontFamily::Style = EpdFontFamily::REGULAR) const { inspectUtf8(s); return std::strlen(s) * advancePerByte; }
+  std::array<int, 4> getTextInkBounds(int, const char* s, EpdFontFamily::Style) const {
+    return {0, 0, static_cast<int>(std::strlen(s)) * advancePerByte, 20};
+  }
   std::string truncatedText(int, const char* text, int width) const {
     std::string out(text);
     if (static_cast<int>(out.size()) * advancePerByte > width) out.resize(std::max(0, width / advancePerByte));

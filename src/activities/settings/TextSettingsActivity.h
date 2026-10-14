@@ -3,12 +3,15 @@
 #include <SdCardFontRegistry.h>
 
 #include <cstdint>
+#include <array>
+#include <atomic>
 #include <string>
 #include <vector>
 
 #include "TextSettingsPreview.h"
 #include "activities/UiTabListActivity.h"
 #include "components/OptionPopup.h"
+#include "shells/ugly/UglyQuestionSheet.h"
 #include "components/themes/BaseTheme.h"
 
 // Reader text settings with a shared live preview pane: tab bar
@@ -16,16 +19,23 @@
 // idiom as SettingsActivity. Family/Size rows apply on Confirm; Layout/Style
 // rows toggle or open an OptionPopup picker. (Tab::Family/Style are the enum
 // names for the Font/Style tabs.)
+struct SettingInfo;
+
 class TextSettingsActivity final : public UiTabListActivity {
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Reading; }
   static std::string layoutValueText(int row);
   static std::string styleValueText(int row);
-  enum class Tab : uint8_t { Family, Size, Layout, Style, Count };
+  enum class Tab : uint8_t { Family, Size, Layout, Style, Favorites, Count };
 
   TextSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const SdCardFontRegistry* registry,
                        Tab initialTab = Tab::Family);
 
   void onEnter() override;
+  void onPause() override;
+  void onResume() override;
+  bool handleHomeGesture() override;
+  void restoreNavigation(const MenuNavigationState& state) override;
   std::string navigationLabel() const override { return I18N.get(StrId::STR_TEXT_SETTINGS); }
   void render(RenderLock&&) override;
 
@@ -34,7 +44,9 @@ class TextSettingsActivity final : public UiTabListActivity {
   // silently confused with a StyleRow of equal value.
   // Layout order fixed by the approved plan: the four spacing kinds first, then
   // alignment, margin and paragraph indent. WordSpacing sits between letter and
-  // paragraph spacing.
+  // paragraph spacing. No CharacterSpacing row: that is upstream's #3528
+  // percent/pixel-offset redesign, not taken (see RESOLUTION.md) - Tenor's own
+  // LetterSpacing already covers inter-character spacing.
   enum class LayoutRow {
     LineSpacing,
     LetterSpacing,
@@ -49,29 +61,77 @@ class TextSettingsActivity final : public UiTabListActivity {
 
   // --- UiTabListActivity contract ---
   int listCount() const override;
-  int tabCount() const override { return static_cast<int>(Tab::Count); }
-  int activeTab() const override { return static_cast<int>(tab_); }
+  int tabCount() const override { return tenorchrome::x3ScreenLayoutEnabled() ? 5 : 4; }
+  int activeTab() const override { return displayIndex(tab_); }
+  int displayIndex(Tab tab) const;
+  Tab tabForIndex(int index) const;
+  freeink::ui::BitmapRef tabIcon(int index, bool bold) const override;
   const char* tabLabel(int index) const override;
   void buildScreen(UiScreen& screen) override;
   void activateIndex(int index) override;
+  void onRowLongPress(int index) override { activateIndex(index); }
   void onTabAction(int index) override;
   void stepTab(int direction) override { switchTab(direction); }
+  // Tenor's render() (settled-list preview pane, TENOR_PRESS_PROBE timing) fully
+  // replaces the base sequence, so drawChrome()/drawFooter() are not overridden
+  // here (see render() below and RESOLUTION.md).
   bool handleButtons() override;
   bool handleCustomInput() override;
+  void pollTilt() override;
+  int favoriteSelectedRow() override;
   bool allowsTiltTabNavigation() const override { return !optionPopup_.isActive(); }
+  bool framedOnButtons() const override { return true; }
+  ugly::QuestionSheet form_;
+  struct FormEvent {
+    enum class Type : uint8_t { Key, Tap, Hold, Pin, Strike } type = Type::Key;
+    ugly::QuestionSheet::Key key = ugly::QuestionSheet::Key::Confirm;
+    int16_t x = 0, y = 0;
+    uint32_t surface = 0;
+  };
+  std::array<FormEvent, 8> formQueue_{};
+  uint8_t formHead_ = 0, formCount_ = 0;
+  std::atomic<bool> formPaintReady_{false}, saveFailed_{false}, formPinFailed_{false};
+  uint32_t formSurface_ = 0;
+  std::atomic<uint32_t> formVisibleSurface_{0};
+  void queueForm(FormEvent event);
+  // The option a fresh device holds for question `row`, -1 when the question has no default to go back to.
+  int defaultOption(int row) const;
+  void bindForm();  // Caller owns RenderLock.
+  void focusForm(int row);  // Caller owns RenderLock.
+  void applyFormIntent(const ugly::QuestionSheet::Intent& intent, bool home = false);
+  void prepareFormQuip(int row, int candidate);
+  bool saveSettings(bool repaint = true);
+  static ugly::QuestionSheet::Row formRow(void* context, int row);
+  static void formLabel(void* context, int row, int option, char* out, size_t size);
+
   bool supportsFavorites() const override { return true; }
+  int settingsChoiceCount(int row) const override;
+  SettingsChoiceStyle rowChoiceStyle(int row) const override;
   std::string favoriteKey(int row) const override;
   int focusFavorite(const std::string& key) override;
+  const char* favoriteHintText() override;
+  const char* x3TipText();
+  std::string x3InfoText();
+  std::array<uint8_t, 32> favoritePins_{};
+  int favoriteCount_ = 0;
+  void refreshFavoriteRows();
+  std::string screenInfo_;
 
-  void applyFamily(int listIndex);
-  void applySize(int listIndex);
+  bool applyFamily(int listIndex);
+  bool applySize(int listIndex);
   // Repopulates sizes_ (and currentSizeIndex_) from the active family's
   // installed point sizes. Call after any family change.
   void rebuildSizeList();
   void confirmLayoutRow(int row);
   void confirmStyleRow(int row);
+  void confirmValueRow(Tab tab, int row);
   // Applies the row at the given list index for the active tab (Confirm and tap share this).
   void activateRow(int row);
+  bool applyChosenValue(Tab tab, int row, int option, bool repaint = true);
+  static int formIndex(Tab tab, int row);
+  static Tab formTab(int row);
+  static int formLocalRow(int row);
+  static const SettingInfo* formSetting(int row);
 
   // Button-hint label for Confirm at the current ring position.
   const char* confirmLabelText() const;
@@ -103,6 +163,7 @@ class TextSettingsActivity final : public UiTabListActivity {
 
   const SdCardFontRegistry* registry_;
   OptionPopup optionPopup_;
+  OptionPopup* tiltPopup() override { return &optionPopup_; }
   std::vector<FontEntry> fonts_;
   std::vector<SizeEntry> sizes_;
   textsettings::PreviewLayout previewLayout_;  // cached preview line layout; relaid only on setting/geometry change

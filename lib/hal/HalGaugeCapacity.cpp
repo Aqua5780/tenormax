@@ -61,17 +61,17 @@ const char* stageName(const Bq27220Capacity::Stage stage) {
 
 void HalGaugeCapacity::tick() {
   if (!started) {
-    const auto& gauge = BoardConfig::ACTIVE.batteryGauge;
-    const bool bq27220 = gauge.gaugeAddr != 0 && gauge.gaugeType == BoardConfig::GaugeType::Bq27220;
-    load = Bq27220Capacity(bq27220 ? gauge.designCapacityMah : 0);
+    const bool bq27220 = HalPowerManager::hasBq27220Gauge();
+    load = Bq27220Capacity(bq27220 ? BoardConfig::ACTIVE.batteryGauge.designCapacityMah : 0);
     started = true;
   }
   if (load.result() != Bq27220Capacity::Result::Pending || !powerManager.mayReadGauge()) return;
   WireGauge bus(BoardConfig::ACTIVE.batteryGauge.gaugeAddr);
   load.tick(bus, millis());
   if (load.result() != Bq27220Capacity::Result::Pending && BoardConfig::ACTIVE.batteryGauge.designCapacityMah != 0) {
-    LOG_INF("BAT", "Gauge capacity %s dc=%u detail=%u value=0x%04x", status(),
-            static_cast<unsigned>(load.designCapacity()), load.detail, load.detailValue);
+    LOG_INF("BAT", "Gauge capacity %s dc=%u detail=%u value=0x%04x op=0x%04x", status(),
+            static_cast<unsigned>(load.designCapacity()), load.detail, load.detailValue,
+            static_cast<unsigned>(load.statusAtCheck()));
   }
 }
 
@@ -91,6 +91,8 @@ const char* HalGaugeCapacity::status() const {
       return "not-needed";
     case Bq27220Capacity::Result::Loaded:
       return "loaded";
+    case Bq27220Capacity::Result::Resealed:
+      return "resealed";
     case Bq27220Capacity::Result::Failed:
       break;
   }

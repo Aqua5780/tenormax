@@ -15,6 +15,8 @@
 #include <HalTiltSensor.h>
 #include <SdCardFontRegistry.h>
 
+#include "components/UITheme.h"
+
 namespace settings_test_io {
 JsonDocument nextRead;
 int writes = 0;
@@ -77,12 +79,17 @@ HalGPIO gpio;
 InputManager::InputManager() {}
 
 #include "activities/settings/TextSettingsActivity.h"
-#include "activities/settings/DongHoSettingsActivity.h"
+#include "activities/settings/ClockSettingsActivity.h"
 std::string TextSettingsActivity::layoutValueText(int){return "layout-boundary";}
 std::string TextSettingsActivity::styleValueText(int){return "style-boundary";}
-std::string DongHoSettingsActivity::giaTriDong(int){return "clock-boundary";}
+std::string ClockSettingsActivity::giaTriDong(int){return "clock-boundary";}
 
 namespace tenorchrome {
 int tipLineCount(const GfxRenderer&, const char*, int) { return 0; }
 int tipHeight(const GfxRenderer&, const char*, int) { return 0; }
 }  // namespace tenorchrome
+
+// The File order row in Settings, System keeps its value in file-browser.json, not settings.json.
+#include "activities/home/FileBrowserState.h"
+filebrowser::SortMode filebrowser::settingsSort() { return SortMode::Name; }
+void filebrowser::chooseSettingsSort(SortMode) {}

@@ -1,4 +1,5 @@
 #include "EpubReaderChapterSelectionActivity.h"
+#include "activities/home/X3FileReaderChrome.h"
 
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
@@ -45,11 +46,10 @@ void EpubReaderChapterSelectionActivity::onEnter() {
   // Start with the current chapter at the top of the viewport; the first
   // screen build pulls the viewport to it (ListNav follow-on-build) and
   // materializes the row window there (refreshTocWindow in buildScreen).
-  int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
-  if (tocIndex == -1) {
-    tocIndex = 0;
-  }
-  nav.selected = tocIndex;
+  const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  // A page outside the table of contents (a cover, front matter) starts at the top and marks no row.
+  nav.selected = tocIndex < 0 ? 0 : tocIndex;
+  currentTocIndex = tocIndex;
 }
 
 // Materialize the ListItem/label window starting at `start` (clamped). TOC
@@ -80,6 +80,13 @@ void EpubReaderChapterSelectionActivity::refreshTocWindow(const int start) {
     fui::ListItem item;
     item.label = windowLabels[i].c_str();
     item.actionValue = static_cast<int16_t>(clamped + i);
+    if (!filterNumber && clamped + i == currentTocIndex) {
+      // Touch: the chapter being read is the chosen row (bold, a tick), no word.
+      if (tenorchrome::kTouchShell)
+        item.chosen = true;
+      else
+        item.value = tr(STR_NOW_READING);
+    }
     windowItems[i] = item;
   }
   windowStart = clamped;
@@ -163,18 +170,26 @@ bool EpubReaderChapterSelectionActivity::handleButtons() {
 
 void EpubReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false, UITheme::StatusBarScope::Reader);
-  // Content: the safe area minus the header band drawChrome paints the title in.
-  screen.setContentMarginFromScreen(fui::Insets{
-      static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-      static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-      static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)), static_cast<int16_t>(safe.x)});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  const bool x3 = tenorchrome::x3ScreenLayoutEnabled();
+  if (x3) {
+    const auto body = screenLayout().bodyRect;
+    screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(body.y), 0,
+                                                  static_cast<int16_t>(renderer.getScreenHeight() - body.bottom()), 0});
+  } else {
+    const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false, UITheme::StatusBarScope::Reader);
+    // Content: the safe area minus the header band drawChrome paints the title in.
+    screen.setContentMarginFromScreen(fui::Insets{
+        static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
+        static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
+        static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)), static_cast<int16_t>(safe.x)});
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   if (!epub) {
     return;
   }
   if (listCount() == 0) {
+    if (x3) return;
     screen.centeredText(I18N.get(searchFailed   ? StrId::STR_ERROR_GENERAL_FAILURE
                                  : searching    ? StrId::STR_CHAPTER_SEARCHING
                                  : filterNumber ? StrId::STR_CHAPTER_NOT_FOUND
@@ -183,7 +198,7 @@ void EpubReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
     return;
   }
 
-  if (!SETTINGS.globalStatusBarHidden()) {
+  if (!x3 && !SETTINGS.globalStatusBarHidden()) {
     const int bottom = screen.body().y + screen.body().height;
     const int tipTop = tenorchrome::tipY(renderer) - 2;
     if (bottom > tipTop) screen.takeBottom(static_cast<int16_t>(bottom - tipTop));
@@ -203,6 +218,10 @@ void EpubReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
 }
 
 void EpubReaderChapterSelectionActivity::drawChrome() {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    x3readerchrome::drawPath(renderer, screenLayout().barRect, icon_tenor_reader_position_40, tr(STR_SELECT_CHAPTER));
+    return;
+  }
   const auto& metrics = UITheme::getInstance().getMetrics();
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false, UITheme::StatusBarScope::Reader);
   GUI.drawHeader(renderer, Rect{safe.x, safe.y + metrics.topPadding, safe.width, metrics.headerHeight},
@@ -300,6 +319,25 @@ void EpubReaderChapterSelectionActivity::loop() {
   UiListActivity::loop();
 }
 void EpubReaderChapterSelectionActivity::drawFooter() {
-  tenorchrome::drawTip(renderer, tr(STR_CHAPTER_NUMBER_HINT));
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    drawX3Content();
+  } else
+    tenorchrome::drawTip(renderer, tr(STR_CHAPTER_NUMBER_HINT));
   UiListActivity::drawFooter();
+}
+
+tenorchrome::X3ScreenLayout EpubReaderChapterSelectionActivity::screenLayout() const {
+  return tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tr(STR_CHAPTER_NUMBER_HINT)));
+}
+
+void EpubReaderChapterSelectionActivity::drawX3Content() const {
+  const auto layout = screenLayout();
+  tenorchrome::drawTipInRect(renderer, tr(STR_CHAPTER_NUMBER_HINT), layout.tipRect);
+  if (listCount() == 0)
+    tenorchrome::drawInfoInRect(renderer,
+                                I18N.get(searchFailed   ? StrId::STR_ERROR_GENERAL_FAILURE
+                                         : searching    ? StrId::STR_CHAPTER_SEARCHING
+                                         : filterNumber ? StrId::STR_CHAPTER_NOT_FOUND
+                                                        : StrId::STR_NO_CHAPTERS),
+                                layout.bodyRect);
 }

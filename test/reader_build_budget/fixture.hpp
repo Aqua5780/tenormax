@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
+#include "activities/reader/ReaderPace.h"
 // Swallow the arguments instead of the whole call: values a log line is the only
 // consumer of (the idle prewarm timer) must still count as used under -Werror.
 template <class... A>
@@ -17,13 +18,17 @@ inline void logSink(A&&...) {}
 #define LOG_DBG(...) logSink(__VA_ARGS__)
 #define LOG_ERR(...) logSink(__VA_ARGS__)
 #define LOG_INF(...) logSink(__VA_ARGS__)
-#define STR_INDEXING 1
+#define HEAP_MARK(...) logSink(__VA_ARGS__)
+constexpr int STR_INDEXING = 1;
 #define STR_PAGE_LOAD_ERROR 2
 #define STR_MEMORY_ERROR 3
-#define STR_LOADING_POPUP 4
+constexpr int STR_LOADING_POPUP = 4;
 #define UI_12_FONT_ID 12
 struct EpdFontFamily { static constexpr int BOLD = 1; };
 int tr(int n) { return n; }
+// The indexing and loading notices come through the voice of the shell (readerugly::notice); here, the plain strings.
+namespace StrId { constexpr int STR_INDEXING = ::STR_INDEXING, STR_LOADING_POPUP = ::STR_LOADING_POPUP; }
+namespace readerugly { inline int notice(int id) { return tr(id); } }
 uint32_t clockMs = 1000;
 uint32_t millis() { return clockMs; }
 int popupCount = 0, buildErrors = 0;
@@ -58,6 +63,7 @@ struct Heap { size_t free = 80000, largest = 60000; size_t getFreeHeap() { retur
 struct ReaderRenderSpec {};
 struct Settings {
   bool blePageTurnerEnabled = false;
+  int saves = 0; void saveToFile() { ++saves; }
   int getReaderFontId() const { return 0; }
   ReaderRenderSpec readerRenderSpec(int, int) { return {}; }
 } SETTINGS;
@@ -66,7 +72,7 @@ struct StorageStub {
 } Storage;
 struct ThemeMetrics { int homeCoverHeight = 226; };
 // The tenor Recent card and the height it draws the cover at (components/HomeExcerptStyle.h).
-inline constexpr int HOME_CARD_COVER_H = 356;
+inline constexpr int HOME_CARD_COVER_H = 450;
 namespace tenorchrome {
 inline bool enabledState = true;
 inline bool enabled() { return enabledState; }
@@ -80,7 +86,13 @@ class UITheme {
   ThemeMetrics metrics_;
 };
 struct PrewarmScope { void endScanAndPrewarm() {} };
-struct FontCacheManager { PrewarmScope createPrewarmScope() { return {}; } };
+// Rebuildable font caches the reader may shed for a starved build; counts each shed.
+inline int fontSheds = 0;
+struct FontCacheManager {
+  PrewarmScope createPrewarmScope() { return {}; }
+  void releaseSdFontCaches() { ++fontSheds; }
+};
+inline FontCacheManager fontCaches;
 // Probe-only heap map; the release build compiles it away.
 inline void heapMapDump(const char*) {}
 
@@ -102,6 +114,38 @@ inline bool heldForBuildState = false;
 inline void setRadioHeldForBuild(bool held) { heldForBuildState = held; }
 }  // namespace freeink::ble
 inline void delay(uint32_t ms) { clockMs += ms; }
+// The page turner module's contract (lib/BlePageTurner) over the knobs above: the reader asks
+// it whether the radio holds the heap, to release the radio for a starved build, and whether a
+// start is in flight.
+namespace bleturner {
+enum class BuildRelease : uint8_t { NotHeld, Released, StillUp };
+struct Status { bool starting = false; };
+inline bool holdsHeap() {
+  return SETTINGS.blePageTurnerEnabled &&
+         (freeink::ble::busyState || freeink::ble::initializingState || freeink::ble::readerStartDeferredState);
+}
+inline Status status() { Status s; s.starting = freeink::ble::initializingState; return s; }
+inline void afterPaint() { freeink::ble::requestRearm(); freeink::ble::heldForBuildState = false; }
+// Waits up to 3 s for a start in flight, then stops the radio, trying again for up to 3 s.
+inline BuildRelease beforeChapterBuild() {
+  if (!SETTINGS.blePageTurnerEnabled || freeink::ble::idleStoppedState) return BuildRelease::NotHeld;
+  const uint32_t started = clockMs;
+  while (freeink::ble::initializingState && clockMs - started < 3000) delay(20);
+  if (freeink::ble::initializingState) return BuildRelease::NotHeld;
+  freeink::ble::heldForBuildState = true;
+  const uint32_t stopStarted = clockMs;
+  bool stopped = freeink::ble::stopForIdle();
+  while (!stopped && clockMs - stopStarted < 3000) {
+    delay(20);
+    stopped = freeink::ble::stopForIdle();
+  }
+  return stopped ? BuildRelease::Released : BuildRelease::StillUp;
+}
+// The status bar's link note: no remote in these cases, the title stays.
+enum class LinkNote : uint8_t { None, Connecting, Failed };
+inline LinkNote linkNote() { return LinkNote::None; }
+inline void acknowledgeLinkNote() {}
+}  // namespace bleturner
 // Thumbnails written when the last popup went up, so a case can tell a notice came first.
 int popupGenerated = -1;
 // The panel refreshing a frame the caller asked for without waiting (displayBufferAsync); layout
@@ -115,8 +159,10 @@ struct Gui {
     if (display) { require(!panelRefreshing, "a popup went up over a refresh still running"); ++blockingPopups; }
   }
 } GUI;
-struct PageReadState { int failures = 0, reads = 0, clears = 0, abandons = 0, errors = 0; } pageReads;
+struct PageReadState { bool corrupt = false; int failures = 0, reads = 0, clears = 0, abandons = 0, errors = 0; } pageReads;
 struct ReaderRenderer {
+  uint32_t frameBufferLoans = 0;
+  uint32_t frameBufferLoanCount() const { return frameBufferLoans; }
   operator int() const { return 0; }
   bool hasFrameBuffer() const { return true; }
   void clearScreen() { require(!panelRefreshing, "drew over a refresh still running"); }
@@ -124,20 +170,32 @@ struct ReaderRenderer {
   void waitRefreshComplete() { panelRefreshing = false; }
   void drawCenteredText(int, int, int message, bool, int) { if (message == STR_PAGE_LOAD_ERROR) ++pageReads.errors; }
   void displayBuffer() {}
-  FontCacheManager* getFontCacheManager() { return nullptr; }
+  FontCacheManager* getFontCacheManager() { return &fontCaches; }
   // The real loan hands the framebuffer bytes to a build phase and returns it
   // WHITE, so only a caller that redraws the whole screen may take one.
   class FrameBufferLoan {
    public:
-    explicit FrameBufferLoan(ReaderRenderer&) { ++thumbs.loans; }
+    explicit FrameBufferLoan(ReaderRenderer& renderer) { ++thumbs.loans; ++renderer.frameBufferLoans; }
   };
 };
 using GfxRenderer = ReaderRenderer;
+struct ReaderPaceStub {
+  void suspend() {}
+  template <class... Args> void turned(Args&&...) {}
+};
+struct Page {
+  enum class LoadFailure : uint8_t { Unknown, Allocation, Corrupt };
+  static inline LoadFailure loadFailure = LoadFailure::Unknown;
+  static void beginLoad() { loadFailure = LoadFailure::Unknown; }
+};
 struct Section {
   int currentPage = 4, pageCount = 19, oldPages = 19, builtPages = 4;
   bool building = true, partial = true, complete = false, parked = false, canPark = false;
   bool failStart = false, failTick = false, dropAfterTick = false, dropAfterStart = false;
   bool starveUntilRadioStopped = false, starved = false;
+  // Starved until the reader sheds its font caches (a remote linked, X3 02/10: 16,184 B free
+  // against the 16,384 B floor).
+  bool starveUntilFontsShed = false;
   bool buildStarved() const { return starved; }
   int starts = 0, ticks = 0, suspends = 0, parks = 0, resumes = 0, ticksPerPage = 0, ticksIntoPage = 0;
   int ticksWhileRefreshing = 0;
@@ -153,7 +211,7 @@ struct Section {
     require(RenderLock::busy, "load without render lock");
     require(page == currentPage, "read changed target");
     ++pageReads.reads;
-    if (pageReads.failures > 0) { --pageReads.failures; return nullptr; }
+    if (pageReads.failures > 0) { --pageReads.failures; ::Page::loadFailure = pageReads.corrupt ? ::Page::LoadFailure::Corrupt : ::Page::LoadFailure::Allocation; return nullptr; }
     return std::make_unique<Page>();
   }
   void abandonBuild() { ++pageReads.abandons; building = false; }
@@ -179,7 +237,8 @@ struct Section {
       ESP.free = ESP.free > parserFootprint ? ESP.free - parserFootprint : 0;
     }
     if (failTick) return false;
-    starved = starveUntilRadioStopped && !freeink::ble::idleStoppedState;
+    starved = (starveUntilRadioStopped && !freeink::ble::idleStoppedState) ||
+              (starveUntilFontsShed && fontSheds == 0);
     if (starved) { parked = canPark; return false; }
     // The real tick yields after about 20 ms of parsing (Section::buildSomeMore), so on the X3 one
     // page takes dozens of ticks. ticksPerPage > 0 models that: a page lands every that many ticks.
@@ -240,7 +299,10 @@ struct CoverThumbCapture : ImageBlock::ThumbHook {
 };
 template <class T, class... A>
 std::unique_ptr<T> makeUniqueNoThrow(A&&... args) { return std::make_unique<T>(std::forward<A>(args)...); }
+struct HalPowerManager { struct Lock {}; };
 struct Gpio {
+  bool wasTouchActivity() const { return false; }
+  bool rawInputActive() const { return false; }
   bool usbChanged = false;
   bool wasUsbStateChanged() const { return usbChanged; }
 } gpio;
@@ -276,6 +338,8 @@ struct ReadingStats {
   bool saveToFile() { ++openWrites.statsSaves; return true; }
 } READING_STATS;
 struct ReaderActivity {
+  readerstatus::Pace readingPace;
+  virtual readerstatus::Pace::Position pacePosition() const { return {}; }
   int pendingExternalTurn = 0, requests = 0, trangDaLat = 0;
   uint32_t pendingExternalGeneration = 0;
   bool pendingTurnIsLocal = false, pendingExternalChapter = false, preview = false;
@@ -288,6 +352,8 @@ struct ReaderActivity {
   bool pauseKeepsStatsInRam = false;
   uint32_t statsLastMs = 0, statsSavedMs = 0, statsDayPollMs = 0, statsDay = 0;
   std::atomic<bool> pageReady{false};
+  // A laid-out page (or the end screen) reached the panel; an error screen sets only pageReady.
+  std::atomic<bool> pageRendered{false};
   std::string getBookTitle() const { return "Tieu de"; }
   std::string getBookAuthor() const { return "Tac gia"; }
   std::string getBookThumbBmpPath() const { return "/thumb_[HEIGHT].bmp"; }
@@ -296,6 +362,9 @@ struct ReaderActivity {
   bool readingPageVisible() const { return true; }
   void updateReadingTime(bool); void chotSoLieuDoc(); void onPause();
   void openTail(); void onTick(); void commitOpen();
+  bleturner::LinkNote linkNoteDrawn = bleturner::LinkNote::None;
+  bool linkNoteInTitle = false;
+  void redrawLinkNote() { requestUpdate(); }
   std::unique_ptr<EndMenu> endOfBookOptions = std::make_unique<EndMenu>();
   virtual ~ReaderActivity() = default;
   virtual bool latTrangThat(bool) = 0;
@@ -312,7 +381,34 @@ struct ReaderActivity {
   void queuePageTurn(bool, bool, const char*);
 };
 struct EpubReaderActivity : ReaderActivity {
+  enum class Overlay { None, Text };
+  Overlay overlay = Overlay::None;
+  bool toolbarMenu = true;
+  bool usesToolbarMenu() const { return toolbarMenu; }
   std::unique_ptr<Section> section = std::make_unique<Section>();
+  bool xemTruoc = false, xemTruocTrenMan = false, textSettingsDirty = false;
+  int8_t xemTruocLat = 0;
+  std::unique_ptr<Section> catchUp;
+  std::atomic<uint8_t> textCloseFrame{0};
+  std::atomic<bool> pageFrameShown{false};
+  class BackgroundBuildFrameGuard {
+   public:
+    explicit BackgroundBuildFrameGuard(EpubReaderActivity& activity) : activity(activity), loanCount(activity.renderer.frameBufferLoanCount()) {}
+    ~BackgroundBuildFrameGuard() {
+      if (activity.renderer.frameBufferLoanCount() != loanCount &&
+          activity.pageFrameShown.exchange(false, std::memory_order_acq_rel))
+        activity.requestUpdate();
+    }
+    BackgroundBuildFrameGuard(const BackgroundBuildFrameGuard&) = delete;
+    BackgroundBuildFrameGuard& operator=(const BackgroundBuildFrameGuard&) = delete;
+   private:
+    EpubReaderActivity& activity;
+    uint32_t loanCount;
+  };
+  // Preview catch-up is covered by the simulator; reject active preview in this projection.
+  void catchUpTick(bool) { require(!xemTruoc, "preview catch-up needs the simulator"); }
+  bool catchUpCanTick() const { return xemTruoc; }
+  void flushTextSettingsLocked();
   std::unique_ptr<Epub> epub = std::make_unique<Epub>();
   std::unique_ptr<ImageBlock::ThumbHook> coverThumbs;
 @@FIELDS@@
@@ -332,11 +428,11 @@ struct EpubReaderActivity : ReaderActivity {
   int currentSpineIndex = 0, nextPageNumber = 0, pendingPageJump = 0;
   uint32_t lastPageTurnTime = 0;
   std::atomic<bool> deferredClearPending{false};
-  bool deferBackgroundBuildForBle() const; bool buildTickHeapGate(); bool backgroundBuildStartHeapGate(); bool backgroundBuildCanTick(); void suspendBackgroundBuild();
+  bool deferBackgroundBuildForBle() const; bool buildTickHeapGate(); bool backgroundBuildStartHeapGate(); bool backgroundBuildCanTick(); bool backgroundBuildWanted() const; void suspendBackgroundBuild();
   bool indexStepDue() const { return false; } void runIndexStep() {}
   // The next chapter's early layout (EpubReaderActivity::prepareNextChapter) is covered by the simulator.
   bool nextChapterDue(bool) { return false; } void prepareNextChapter() {}
-  bool releaseRadioForBuild(); bool readyForRadio(); void showMemoryError(); void settleBuildPopup(); void generatePendingThumb(); void writePendingThumbs();
+  bool releaseHeapForBuild(); bool startBuildFreeingHeap(const ReaderRenderSpec& spec, const std::function<void()>& popupFn = nullptr); bool yieldForRadio(); void showMemoryError(); void settleBuildPopup(); void generatePendingThumb(); void writePendingThumbs();
   void backgroundTick(); void foreground(); bool skipLoopDelay(); bool latTrangThat(bool);
   // loadBook()'s cover-thumbnail tail and loop()'s idle region, projected verbatim.
   void openThumbStep(); void idleStep();

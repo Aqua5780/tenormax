@@ -2,6 +2,7 @@
 
 #include <BuildScratch.h>
 #include <HalMemory.h>
+#include <HeapFloor.h>
 #include <Logging.h>
 
 #include <cstdlib>
@@ -24,6 +25,8 @@ void logAllocationFailure(const char* allocation, size_t bytes) {
 
 InflateStream::~InflateStream() { deinit(); }
 
+size_t InflateStream::streamingBytes() { return STATE_ALIGNED + WINDOW_SIZE; }
+
 bool InflateStream::init(const bool streaming) {
   // Every consumer constructs a fresh stream per operation, so acquire storage
   // from scratch each init (releasing any prior backing first).
@@ -41,13 +44,13 @@ bool InflateStream::init(const bool streaming) {
     // Raw malloc (not makeUniqueNoThrow): the header keeps tinfl_decompressor
     // an incomplete type so consumers never include miniz; both blocks are
     // freed in deinit()/the destructor.
-    state = static_cast<tinfl_decompressor*>(malloc(sizeof(tinfl_decompressor)));
+    state = static_cast<tinfl_decompressor*>(heapfloor::take(sizeof(tinfl_decompressor), "inflate-state"));
     if (!state) {
       logAllocationFailure("state", sizeof(tinfl_decompressor));
       return false;
     }
     if (streaming) {
-      window = static_cast<uint8_t*>(malloc(WINDOW_SIZE));
+      window = static_cast<uint8_t*>(heapfloor::take(WINDOW_SIZE, "inflate-window"));
       if (!window) {
         logAllocationFailure("window", WINDOW_SIZE);
         deinit();

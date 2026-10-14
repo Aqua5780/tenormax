@@ -1,4 +1,5 @@
 #pragma once
+#include "activities/X3ActivityLayout.h"
 
 #include <functional>
 #include <memory>
@@ -29,6 +30,9 @@ enum class WebServerActivityState {
  * - Cleans up the server and shuts down WiFi on exit
  */
 class CrossPointWebServerActivity final : public Activity {
+  x3activity::InfoPages x3Info;
+  int x3Step = 0;
+
   WebServerActivityState state = WebServerActivityState::MODE_SELECTION;
 
   // Network mode
@@ -63,6 +67,7 @@ class CrossPointWebServerActivity final : public Activity {
   int lastWifiBars = 0;
 
   void renderServerRunning() const;
+  void renderUgly() const;
   void renderWifiIndicator(int subHeaderTop) const;
 
   void onNetworkModeSelected(NetworkMode mode);
@@ -73,6 +78,8 @@ class CrossPointWebServerActivity final : public Activity {
   void startWebServer();
 
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Network; }
+  std::string x3NavigationLabel() const override { return I18N.get(isApMode ? StrId::STR_HOTSPOT_MODE : StrId::STR_FILE_TRANSFER); }
 #ifdef TENOR_UI_ACCEPTANCE
   void requestAutoJoinForTest() { autoJoinForTest = true; }
 #endif

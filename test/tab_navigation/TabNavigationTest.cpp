@@ -1,5 +1,6 @@
 #include <HalDisplay.h>
 #include <HalGPIO.h>
+#include <BlePageTurnerJson.h>
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -28,6 +29,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, size_t) noexcept { std::free(p); }
 #include "MenuFavorites.h"
 #include "activities/UiTabListActivity.h"
+#include "components/OptionPopup.h"
 #include "util/ButtonNavigator.h"
 
 namespace faketest {
@@ -95,9 +97,11 @@ class FakeTabScreen final : public UiTabListActivity {
   bool queueTilt(const bool forward, const bool backward) { return queueTiltTabNavigation(forward, backward); }
   bool acceptsTiltRows() const { return acceptsTiltMenuNavigation(); }
   bool queueTiltRow(const bool up, const bool down) { return queueTiltMenuNavigation(up, down); }
+  OptionPopup popup;
 
  protected:
-  bool allowsTiltTabNavigation() const override { return !modalActive; }
+  bool allowsTiltTabNavigation() const override { return !modalActive && !popup.isActive(); }
+  OptionPopup* tiltPopup() override { return &popup; }
 
  public:
 
@@ -108,6 +112,16 @@ class FakeTabScreen final : public UiTabListActivity {
     event.value = index;
     onRowAction(event);
   }
+};
+
+// A list without tabs: a sub-screen such as the Bluetooth page or a reader's chapter list.
+class FakePlainScreen final : public UiListActivity {
+ public:
+  FakePlainScreen(GfxRenderer& renderer, MappedInputManager& input) : UiListActivity("FakePlain", renderer, input) {}
+  int listCount() const override { return kRowCount; }
+  void buildScreen(UiScreen&) override {}
+  void activateIndex(int) override {}
+  int selected() { return activeNav().selected; }
 };
 
 struct TabScreenFixture : public ::testing::Test {
@@ -329,6 +343,41 @@ TEST_F(TabScreenFixture, ModalChanNghiengDoc) {
   EXPECT_EQ(screen.ring(), before);
 }
 
+// A value list open over the rows takes the row tilt, as its own up and down buttons would.
+TEST_F(TabScreenFixture, NghiengDocDiTrongPopupChonGiaTri) {
+  SETTINGS.tiltMenuNavigation = CrossPointSettings::TILT_NORMAL;
+  const StrId options[3] = {StrId::STR_STATE_OFF, StrId::STR_STATE_ON, StrId::STR_STATE_OFF};
+  screen.popup.show(StrId::STR_STATE_OFF, options, 3, 0, [](int) {});
+  const int before = screen.ring();
+
+  tiltfixture::reset();
+  tiltfixture::injectPhysicalVertical();
+  screen.loop();
+  EXPECT_TRUE(tiltfixture::lastVerticalTargetActive) << "the open popup arms the row tilt";
+  EXPECT_EQ(screen.popup.selected(), 1) << "Normal steps one option down, as in the list";
+  EXPECT_EQ(screen.ring(), before) << "the rows under the popup stay put";
+
+  SETTINGS.tiltMenuNavigation = CrossPointSettings::TILT_NVERTED;
+  tiltfixture::reset();
+  tiltfixture::injectPhysicalVertical();
+  screen.loop();
+  EXPECT_EQ(screen.popup.selected(), 0);
+}
+
+// Deeper screens are lists without tabs; the row tilt walks them too.
+TEST_F(TabScreenFixture, NghiengDocDiDongOManKhongCoThe) {
+  SETTINGS.tiltMenuNavigation = CrossPointSettings::TILT_NORMAL;
+  FakePlainScreen plain{renderer, input};
+  plain.onEnter();
+  const int before = plain.selected();
+  tiltfixture::reset();
+  tiltfixture::injectPhysicalVertical();
+  plain.loop();
+  EXPECT_TRUE(tiltfixture::lastVerticalTargetActive);
+  EXPECT_EQ(plain.selected(), before + 1);
+  EXPECT_EQ(tiltfixture::lastMode, CrossPointSettings::TILT_OFF) << "no tab flick on a screen without tabs";
+}
+
 TEST_F(TabScreenFixture, ManKhongCoDongThiNghiengDocDungYen) {
   SETTINGS.tiltMenuNavigation = CrossPointSettings::TILT_NORMAL;
   screen.rows = 0;
@@ -361,6 +410,32 @@ TEST_F(TabScreenFixture, NutMatTruocQuayTrongCacDongKhongVaoThanhThe) {
 
   tap(HalGPIO::BTN_LEFT);
   EXPECT_EQ(screen.ring(), kRowCount) << "hang dau lui lai phai quay ve hang cuoi";
+}
+
+// v1.0.52: the tab lists (Home File tab, Settings...) flip by whole pages too; they have no page button.
+TEST_F(TabScreenFixture, RowStepPastPageEdgeFlipsWholePage) {
+  screen.rows = 30;
+  screen.state().visibleRows = 10;
+  screen.state().drawnRows = 10;
+  screen.state().drawnCount = 30;
+  screen.state().top = 0;
+  screen.state().followOnBuild = false;
+  for (int i = 1; i < 10; ++i) tap(HalGPIO::BTN_RIGHT);
+  ASSERT_EQ(screen.ring(), 10);  // row 9, last row of page 1
+  EXPECT_EQ(screen.state().top, 0);
+  tap(HalGPIO::BTN_RIGHT);
+  EXPECT_EQ(screen.ring(), 11);  // row 10 opens page 2
+  EXPECT_EQ(screen.state().top, 10);
+  tap(HalGPIO::BTN_LEFT);
+  EXPECT_EQ(screen.ring(), 10);  // back to the last row of page 1
+  EXPECT_EQ(screen.state().top, 0);
+  tap(HalGPIO::BTN_LEFT);
+  tap(HalGPIO::BTN_LEFT);
+  EXPECT_EQ(screen.state().top, 0);
+  for (int i = 0; i < 7; ++i) tap(HalGPIO::BTN_LEFT);  // row 7 down to row 0
+  tap(HalGPIO::BTN_LEFT);  // row 0 wraps to row 29: last page, full, selection on its last row
+  EXPECT_EQ(screen.ring(), 30);
+  EXPECT_EQ(screen.state().top, 20);
 }
 
 TEST_F(TabScreenFixture, ChonSauBoundaryKichHoatHangDau) {
@@ -516,6 +591,60 @@ TEST_F(PagedListFixture, FrontTapMovesOneRowAndHoldJumpsOnceToBoundary) {
   release(HalGPIO::BTN_LEFT);
   EXPECT_EQ(screen.state().selected, 100);
   EXPECT_EQ(screen.state().top, 100);
+}
+// v1.0.52: a front-button step past the page edge flips the whole page (no row-by-row crawl).
+TEST_F(PagedListFixture, StepPastLastRowFlipsToNextPageWithSelectionOnItsFirstRow) {
+  screen.state().top = 100;
+  screen.state().selected = 111;
+  release(HalGPIO::BTN_RIGHT);
+  EXPECT_EQ(screen.state().selected, 112);
+  EXPECT_EQ(screen.state().top, 100);  // still the last row of the page
+  release(HalGPIO::BTN_RIGHT);
+  EXPECT_EQ(screen.state().selected, 113);
+  EXPECT_EQ(screen.state().top, 113);
+}
+TEST_F(PagedListFixture, StepBeforeFirstRowFlipsBackWithSelectionOnItsLastRow) {
+  screen.state().top = 113;
+  screen.state().selected = 113;
+  release(HalGPIO::BTN_LEFT);
+  EXPECT_EQ(screen.state().selected, 112);
+  EXPECT_EQ(screen.state().top, 100);
+}
+TEST_F(PagedListFixture, StepInsideThePageKeepsTheViewport) {
+  screen.state().top = 100;
+  screen.state().selected = 104;
+  release(HalGPIO::BTN_RIGHT);
+  release(HalGPIO::BTN_LEFT);
+  release(HalGPIO::BTN_LEFT);
+  EXPECT_EQ(screen.state().selected, 103);
+  EXPECT_EQ(screen.state().top, 100);
+}
+TEST_F(PagedListFixture, WrapKeepsPageFlipAtBothEnds) {
+  screen.state().top = 0;
+  screen.state().selected = 0;
+  release(HalGPIO::BTN_LEFT);
+  EXPECT_EQ(screen.state().selected, 2087);
+  EXPECT_EQ(screen.state().top, 2075);  // last page full, selection on its last row
+  release(HalGPIO::BTN_RIGHT);
+  EXPECT_EQ(screen.state().selected, 0);
+  EXPECT_EQ(screen.state().top, 0);
+}
+TEST_F(PagedListFixture, FlipUsesRowsTheLastBuildDrewNotTheEstimate) {
+  screen.state().drawnRows = 7;  // wrapped names: 7 of the 13 estimated rows fit
+  screen.state().top = 0;
+  screen.state().selected = 6;
+  release(HalGPIO::BTN_RIGHT);
+  EXPECT_EQ(screen.state().selected, 7);
+  EXPECT_EQ(screen.state().top, 7);
+}
+TEST_F(PagedListFixture, ShortListNeverFlips) {
+  screen.count = 9;
+  screen.state().drawnCount = 9;
+  screen.state().top = 0;
+  screen.state().selected = 8;
+  release(HalGPIO::BTN_RIGHT);
+  EXPECT_EQ(screen.state().selected, 0);
+  EXPECT_EQ(screen.state().top, 0);
 }
 TEST_F(PagedListFixture, PageAtBoundaryClampsInsteadOfWrapping) {
   release(HalGPIO::BTN_UP);
@@ -717,14 +846,27 @@ TEST(MenuFavoritesCompatibility, LegacyStatusPinsShowCurrentLabels) {
 }
 
 TEST(MenuFavoritesCompatibility, MissingRtcKeepsSystemTimePinsReachable) {
-  const auto originalTheme = SETTINGS.uiTheme;
-  SETTINGS.uiTheme = CrossPointSettings::TENOR_UI;
   ASSERT_FALSE(halClock.isAvailable());
   EXPECT_EQ(menufavorites::label("status/statusBarClock", {}), StrId::STR_STATUS_CORNERS);
   EXPECT_EQ(menufavorites::label("action/2", {}), StrId::STR_STATUS_CORNERS);
   EXPECT_EQ(menufavorites::label("clock/clockFormat", {}), StrId::STR_CLOCK_FORMAT);
   EXPECT_EQ(menufavorites::label("action/14", {}), StrId::STR_CLOCK);
-  SETTINGS.uiTheme = originalTheme;
+}
+
+TEST(MenuFavoritesCompatibility, UglinessPinFollowsTheSelectedShell) {
+  const auto savedShell = SETTINGS.uiShell;
+  const std::vector<SettingInfo> settings = {
+      SettingInfo::Enum(StrId::STR_SHELL_LEVEL, &CrossPointSettings::uiUglyLevel, {}, "uiUglyLevel"),
+  };
+  SETTINGS.uiShell = 1;
+  EXPECT_EQ(menufavorites::label("settings/uiUglyLevel", settings), StrId::STR_SHELL_LEVEL);
+  SETTINGS.uiShell = 0;
+  EXPECT_EQ(menufavorites::label("settings/uiUglyLevel", settings), StrId::STR_NONE_OPT);
+  SETTINGS.uiShell = 255;
+  EXPECT_EQ(menufavorites::label("settings/uiUglyLevel", settings), StrId::STR_NONE_OPT);
+  SETTINGS.uiShell = 1;
+  EXPECT_EQ(menufavorites::label("settings/uiUglyLevel", settings), StrId::STR_SHELL_LEVEL);
+  SETTINGS.uiShell = savedShell;
 }
 
 
@@ -739,6 +881,7 @@ TEST(SettingsSaveAllocation, SavingDoesNotAskForOneLargeContiguousBlock) {
   alloctest::recording = true;
   SETTINGS.toJson(doc);
   alloctest::recording = false;
+  RecordProperty("largestAllocationBytes", static_cast<int>(alloctest::largest));
 
   // 8 KB la nguong rong rai: bang cai dat that xin 16.560 byte.
   EXPECT_LT(alloctest::largest, 8u * 1024u)
@@ -755,7 +898,100 @@ TEST(SettingsSaveAllocation, LoadingDoesNotAskForOneLargeContiguousBlock) {
   alloctest::recording = true;
   SETTINGS.fromJson(doc);
   alloctest::recording = false;
+  RecordProperty("largestAllocationBytes", static_cast<int>(alloctest::largest));
 
   EXPECT_LT(alloctest::largest, 8u * 1024u)
       << "doc cai dat xin mot khoi " << alloctest::largest << " byte lien nhau";
+}
+
+namespace {
+template <size_t N>
+void linkedSettingsFieldRoundTrip(const char* key, char (&field)[N]) {
+  const std::string original(field);
+  strcpy(field, "Linked settings value");
+  field[N - 1] = '!';
+  JsonDocument doc;
+  SETTINGS.toJson(doc);
+  // Keep the unrelated font copy owned so each test reaches its selected field.
+  if (&field[0] != SETTINGS.sdFontFamilyName) doc["sdFontFamilyName"] = std::string(SETTINGS.sdFontFamilyName);
+  ASSERT_EQ(doc[key].as<const char*>(), field) << "exercise the real toJson linked string";
+  alloctest::reset();
+  alloctest::recording = true;
+  const bool loaded = SETTINGS.fromJson(doc);
+  alloctest::recording = false;
+  testing::Test::RecordProperty("largestAllocationBytes", static_cast<int>(alloctest::largest));
+  EXPECT_TRUE(loaded);
+  EXPECT_STREQ(field, "Linked settings value");
+  EXPECT_EQ(field[N - 1], '\0');
+  EXPECT_LT(alloctest::largest, 8u * 1024u);
+  strcpy(field, original.c_str());
+}
+}  // namespace
+
+TEST(SettingsStringAlias, FontRoundTripKeepsLinkedName) {
+  linkedSettingsFieldRoundTrip("sdFontFamilyName", SETTINGS.sdFontFamilyName);
+}
+
+TEST(SettingsStringAlias, DictionaryRoundTripKeepsLinkedName) {
+  linkedSettingsFieldRoundTrip("dictionaryName", SETTINGS.dictionaryName);
+}
+
+TEST(SettingsStringAlias, OwnedFontNamesKeepTruncationAndTermination) {
+  const std::string original(SETTINGS.sdFontFamilyName);
+  JsonDocument warm;
+  SETTINGS.toJson(warm);  // Match the existing allocation gate: warm the settings catalog first.
+  size_t largest = 0;
+  for (const std::string name : {std::string(63, 'a'), std::string(64, 'b'),
+                                 std::string("SP3 - Traveling Typewriter-BOLD1"),
+                                 std::string("SP3 - Traveling Typewriter-BOLD2"), std::string("short"), std::string()}) {
+    JsonDocument doc;
+    doc["sdFontFamilyName"] = name;
+    memset(SETTINGS.sdFontFamilyName, '?', sizeof(SETTINGS.sdFontFamilyName));
+    alloctest::reset();
+    alloctest::recording = true;
+    const bool loaded = SETTINGS.fromJson(doc);
+    alloctest::recording = false;
+    largest = std::max(largest, alloctest::largest);
+    EXPECT_TRUE(loaded);
+    EXPECT_STREQ(SETTINGS.sdFontFamilyName, name.substr(0, sizeof(SETTINGS.sdFontFamilyName) - 1).c_str());
+    EXPECT_EQ(SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1], '\0');
+    EXPECT_LT(alloctest::largest, 8u * 1024u);
+  }
+  RecordProperty("largestAllocationBytes", static_cast<int>(largest));
+  strcpy(SETTINGS.sdFontFamilyName, original.c_str());
+}
+
+TEST(SettingsStringAlias, BleRoundTripKeepsLinkedPeerAndOwnedLimits) {
+  for (const bool paired : {false, true}) {
+    bleturner::Config config;
+    config.enabled = 1;
+    config.prevKeyUsage = bleturner::kUsageLeft;
+    config.nextKeyUsage = bleturner::kUsageRight;
+    if (paired) {
+      strcpy(config.peerAddr, "00:11:22:33:44:55");
+      strcpy(config.peerName, "Linked remote");
+    }
+    config.peerName[31] = '!';
+    JsonDocument doc;
+    bleturner::writeJson(config, doc);
+    ASSERT_EQ(doc["blePeerAddr"].as<const char*>(), config.peerAddr);
+    ASSERT_EQ(doc["blePeerName"].as<const char*>(), config.peerName);
+    alloctest::reset();
+    alloctest::recording = true;
+    const bool loaded = bleturner::readJson(config, doc);
+    alloctest::recording = false;
+    EXPECT_TRUE(loaded);
+    EXPECT_STREQ(config.peerAddr, paired ? "00:11:22:33:44:55" : "");
+    EXPECT_STREQ(config.peerName, paired ? "Linked remote" : "");
+    EXPECT_EQ(config.peerName[31], '\0');
+    EXPECT_EQ(alloctest::largest, 0u);
+    doc["blePeerAddr"] = std::string(40, 'a');
+    doc["blePeerName"] = std::string(40, 'b');
+    ASSERT_TRUE(bleturner::readJson(config, doc));
+    EXPECT_STREQ(config.peerAddr, std::string(17, 'a').c_str());
+    EXPECT_STREQ(config.peerName, std::string(31, 'b').c_str());
+    EXPECT_EQ(config.enabled, 1);
+    EXPECT_EQ(config.prevKeyUsage, bleturner::kUsageLeft);
+    EXPECT_EQ(config.nextKeyUsage, bleturner::kUsageRight);
+  }
 }

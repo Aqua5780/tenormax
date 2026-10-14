@@ -11,6 +11,13 @@
 
 class EpubReaderMenuActivity final : public UiTabListActivity {
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override {
+    static constexpr tenorchrome::X3PathIcon icons[] = {
+        tenorchrome::X3PathIcon::Favorites, tenorchrome::X3PathIcon::Position, tenorchrome::X3PathIcon::Recent,
+        tenorchrome::X3PathIcon::More, tenorchrome::X3PathIcon::Reading};
+    return textOnly ? tenorchrome::X3PathIcon::Reading : icons[activeTab()];
+  }
+  std::string x3NavigationLabel() const override { return tabLabel(activeTab()); }
   // The grouping itself lives in ReaderMenuLayout, which stays clear of device
   // headers so it can be exercised on the host. These aliases keep the names
   // EpubReaderActivity already switches on.
@@ -20,7 +27,8 @@ class EpubReaderMenuActivity final : public UiTabListActivity {
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
                                   const int currentPage, const int totalPages, const int bookProgressPercent,
-                                  const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks);
+                                  const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks,
+                                  bool textOnly = false);
 
   void render(RenderLock&&) override;
   bool handleHomeGesture() override;
@@ -36,17 +44,28 @@ class EpubReaderMenuActivity final : public UiTabListActivity {
   uint8_t rowToItem[MAX_MENU_ITEMS]{};
   int rowCount = 0;
   void rebuildRows();
+  void paintUglyMenu();
+  freeink::ui::Rect skinTab_{}, skinProgress_{}, skinHint_{};
+  freeink::ui::TextStyle pinLabelStyle_{};
+  int16_t pinTextPad_ = 0;
 
   // --- UiTabListActivity contract ---
-  int tabCount() const override { return readermenu::TAB_COUNT; }
-  int activeTab() const override { return static_cast<int>(activeTabId); }
+  int tabCount() const override {
+    return textOnly ? 1 : tenorchrome::x3ScreenLayoutEnabled() ? readermenu::X3_TAB_COUNT : readermenu::TAB_COUNT;
+  }
+  int activeTab() const override { return textOnly ? 0 : static_cast<int>(activeTabId); }
   const char* tabLabel(int index) const override;
-  freeink::ui::BitmapRef tabIcon(int index) const override;
+  freeink::ui::BitmapRef tabIcon(int index, bool bold) const override;
   void onTabAction(int index) override;
   void stepTab(int direction) override;
 
   int listCount() const override { return rowCount; }
   void buildScreen(UiScreen& screen) override;
+  bool ownsX3Chrome() const override { return true; }
+  tenorchrome::X3ScreenLayout screenLayout() const;
+  bool infoOverBar() const;
+  std::string progressText() const;
+  void drawX3Content() const;
   void activateIndex(int index) override;
   // Popup input runs before any button or touch handling.
   bool handleCustomInput() override;
@@ -55,6 +74,9 @@ class EpubReaderMenuActivity final : public UiTabListActivity {
   bool handleButtons() override;
   bool allowsTiltTabNavigation() const override { return !optionPopup.isActive(); }
   bool rowIsPinned(int row) const override;
+  bool pinMarkAfterName() const override { return framedByDesign(); }
+  void drawPinMarks() override;
+  bool framedOnButtons() const override { return true; }
   // Giu cap nut di-dong: trong tab Yeu thich thi day dong dang chon di mot bac.
   bool giuNutDiDong(int huong) override;
   // Header via GUI.drawHeader inside the safe area for the battery indicator.
@@ -64,8 +86,8 @@ class EpubReaderMenuActivity final : public UiTabListActivity {
   void selectTab(MenuTab tab);
   // Dong menu voi viec da chon; coChu va hoFont mang lua chon tai cho (0 va -1 nghia la mo man).
   void dongVoi(MenuAction viec, uint8_t coChu, int8_t hoFont);
-  void chonCoChu();
-  void chonHoFont();
+  void chonCoChu(int row);
+  void chonHoFont(int row);
 
   // --- tab Yeu thich ---------------------------------------------------------------
   // Giu nut Chon tren mot dong bat ky la ghim dong do vao Yeu thich, giu lan nua la go
@@ -80,10 +102,11 @@ class EpubReaderMenuActivity final : public UiTabListActivity {
   void napGhim();
 
   // Nhip giu, tinh bang mili giay. Bang nguong cua trinh duyet tep, de ca may mot tay.
-  static constexpr unsigned long GIU_MS = 1000;
+  static constexpr unsigned long GIU_MS = readermenu::GIU_GHIM_MS;
 
   // Every row of every tab, built once in the constructor.
   std::vector<MenuItem> menuItems;
+  bool textOnly = false;
   // The menu opens on Favorites: it is the one tab whose contents the reader
   // chose, so it is the cheapest place to land.
   MenuTab activeTabId = MenuTab::FAVORITES;
@@ -91,7 +114,10 @@ class EpubReaderMenuActivity final : public UiTabListActivity {
   // readermenu::DEFAULT_FAVORITES until the reader pins their own.
   std::vector<MenuAction> favorites;
 
+  int settingsChoiceCount(int row) const override;
+  SettingsChoiceStyle rowChoiceStyle(int row) const override;
   OptionPopup optionPopup;
+  OptionPopup* tiltPopup() override { return &optionPopup; }
   std::string title = "Reader Menu";
   uint8_t pendingOrientation = 0;
   uint8_t selectedPageTurnOption = 0;

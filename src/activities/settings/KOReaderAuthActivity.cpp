@@ -1,5 +1,7 @@
 #include "KOReaderAuthActivity.h"
 
+#include "activities/X3ActivityLayout.h"
+
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -13,6 +15,8 @@
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyNote.h"
 
 void KOReaderAuthActivity::onWifiSelectionComplete(const bool success) {
   if (!success) {
@@ -92,6 +96,35 @@ void KOReaderAuthActivity::onExit() {
 }
 
 void KOReaderAuthActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* status = state == WIFI_SELECTION ? tr(STR_WIFI_NETWORKS) : state == CONNECTING ? tr(STR_CONNECTING) :
+        state == AUTHENTICATING ? statusMessage.c_str() :
+        state == SUCCESS ? (mode == Mode::SIGN_UP ? tr(STR_ACCOUNT_CREATED) : tr(STR_AUTH_SUCCESS)) :
+        mode == Mode::SIGN_UP ? tr(STR_SIGNUP_FAILED) : tr(STR_AUTH_FAILED);
+    const char* detail = state == SUCCESS ? tr(STR_SYNC_READY) : state == FAILED ? errorMessage.c_str() : nullptr;
+    const char* tip = nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip, 8));
+    renderer.clearScreen();
+    x3Info.draw(renderer, layout.bodyRect, {status, detail});
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect, 8);
+    x3activity::drawBar(renderer, layout.barRect, tr(STR_KOREADER_AUTH), navigationPrefix.c_str());
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+    renderer.displayBuffer();
+    return;
+  }
+
+  if (shell::uglyParts()) {
+    const char* line = state == SUCCESS  ? tr(STR_UGLY_KOSYNC_OK)
+                       : state == FAILED ? tr(STR_UGLY_KOSYNC_FAILED)
+                                         : statusMessage.c_str();
+    ugly::Hints hints;
+    hints.back = true;
+    ugly::notePage(renderer, mappedInput, mode == Mode::SIGN_UP ? tr(STR_SIGN_UP) : tr(STR_KOREADER_AUTH), line,
+                   state == FAILED && !errorMessage.empty() ? errorMessage.c_str() : nullptr, -1, hints);
+    return;
+  }
   renderer.clearScreen();
 
   const auto& metrics = UITheme::getInstance().getMetrics();
@@ -122,6 +155,13 @@ void KOReaderAuthActivity::render(RenderLock&&) {
 }
 
 void KOReaderAuthActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() &&
+      x3Info.turn(mappedInput.wasReleased(MappedInputManager::Button::Up) ? -1 :
+                  mappedInput.wasReleased(MappedInputManager::Button::Down) ? 1 : 0)) {
+    requestUpdate();
+    return;
+  }
+
   if (state == SUCCESS || state == FAILED) {
     int x = 0;
     int y = 0;

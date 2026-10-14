@@ -33,7 +33,12 @@ void reset() {
 }
 unsigned long millis() { return fake::ms; }
 void delay(unsigned long ms) { fake::ms += ms; }
-void configTzTime(const char*, const char*, const char*) { ++fake::ntpCalls; }
+// Like the ESP32 core, the SNTP setup writes its zone into the process TZ.
+void configTzTime(const char* tz, const char*, const char*) {
+  ++fake::ntpCalls;
+  setenv("TZ", tz, 1);
+  tzset();
+}
 int sntp_get_sync_status() {
   if (!fake::ntpResponds) return 0;
   fake::epoch = fake::ntpEpoch;
@@ -65,7 +70,12 @@ void testLog(const char*, const char* format, ...) {
   va_end(args);
   fake::logs += std::string(text) + '\n';
 }
+struct FakeEsp {
+  uint32_t getFreeHeap() const { return 0; }
+  uint32_t getMaxAllocHeap() const { return 0; }
+} ESP;
 struct HttpDownloader {
+  static constexpr uint32_t PINNED_CA_TIMEOUT_MS = 10000;
   using ProgressCallback = std::function<void(size_t, size_t)>;
   enum DownloadError { OK, HTTP_ERROR, FILE_ERROR, ABORTED };
 };
@@ -78,6 +88,7 @@ namespace freeink {
 class SecureHttpClient {
  public:
   void setTimeout(int) {}
+  void setReuse(bool) {}
   void setCACert(const char* ca) { fake::caConfigured = ca && *ca; }
   bool begin(const std::string&) { ++fake::tlsBegins; return fake::caConfigured; }
   void setUserAgent(const char*) {}
@@ -165,8 +176,20 @@ void noRtcDisplayAfterNtp() {
   ++cases; fake::reset(); halClock.begin();
   CHECK(halClock.syncFromNTP());
   expectDate(2026, 9, 19, 12, 0);
+  // formatTime() has no offset parameter since #3562: the display timezone is
+  // state, set via setTimezone() (POSIX TZ sign is inverted from UTC+N).
+  halClock.setTimezone("UTC-7");
   char text[9] = {};
-  CHECK(halClock.formatTime(text, sizeof(text), 76));
+  CHECK(halClock.formatTime(text, sizeof(text)));
+  CHECK(std::string(text) == "19:00");
+}
+void noRtcSyncKeepsDisplayZone() {
+  ++cases; fake::reset(); halClock.begin();
+  // The zone is set at boot, before any sync; NTP runs in UTC and must hand it back.
+  halClock.setTimezone("UTC-7");
+  CHECK(halClock.syncFromNTP());
+  char text[9] = {};
+  CHECK(halClock.formatTime(text, sizeof(text)));
   CHECK(std::string(text) == "19:00");
 }
 void offlineMidnightAndRetainedWake() {
@@ -269,7 +292,7 @@ void failedSyncRetainsWorkingClock() {
 int main() {
   noRtcColdBoot(); failedRtcReadAndWrite(); goodRtcWrite(); ntpTimeout(); wifiDisconnected();
   invalidCompletedEpoch(); alreadyValidEpoch();
-  noRtcDisplayAfterNtp(); offlineMidnightAndRetainedWake(); fullPowerLossStaysUnknown();
+  noRtcDisplayAfterNtp(); noRtcSyncKeepsDisplayZone(); offlineMidnightAndRetainedWake(); fullPowerLossStaysUnknown();
   failedRtcWriteUsesFreshSystemTime(); rtcReadFailureKeepsTimeAdvancing();
   invalidRtcCalendarIsNotNormalized(); systemClockUpperBound();
   invalidRtcTimeAndLeapDates(); retainedSystemBeatsStaleRtc();

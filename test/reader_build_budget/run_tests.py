@@ -44,7 +44,9 @@ idle = 'void EpubReaderActivity::idleStep() {\n' + loop[idle_start:start] + '\n}
 # Cover-thumbnail tail of loadBook(), up to its final return.
 load_book = function('loadBook')
 thumb_start = load_book.index('  // The GAN DAY card only ever READS a thumbnail bitmap')
-open_thumb = 'void EpubReaderActivity::openThumbStep() {\n' + load_book[thumb_start:load_book.rindex('  return true;')] + '\n}'
+# The touch shell's tap-zone tip opens after the thumbnail; the budget is the thumbnail's.
+open_thumb = ('void EpubReaderActivity::openThumbStep() {\n'
+              + load_book[thumb_start:load_book.index('  // Touch shell: the tap-zone map over the first page')] + '\n}')
 render = function('renderBook')
 start = render.index('  if (section->isPartial() && section->currentPage >=')
 end = render.index('  renderer.clearScreen();', start)
@@ -79,20 +81,20 @@ while depth:
     depth += (render[anchor_end] == '{') - (render[anchor_end] == '}')
     anchor_end += 1
 anchor_landing = 'void EpubReaderActivity::anchorLanding() {\n' + render[anchor_start:anchor_end] + '\n}'
-start = render.index('    auto p = section->loadPage(section->currentPage);')
+start = render.index('    Page::beginLoad();') if '    Page::beginLoad();' in render else render.index('    auto p = section->loadPage(section->currentPage);')
 end = render.index('    currentPageVisibleOffset = p->visibleTextOffset;', start)
 page_load = ('void EpubReaderActivity::loadPageForRender() {\n'
              ' auto showPendingSyncSaveError=[]{};\n' + render[start:end] + '\n}')
 # Constants and state declarations come from the real header, avoiding a second policy.
 declarations = []
 for line in header.splitlines():
-    if re.match(r'  (?:static constexpr (?:size_t|int) (?:BACKGROUND_BUILD|BUILD_WINDOW|BUILD_PAGES|PARTIAL_REBUILD|RENDER_MIN_FREE_HEAP|THUMB_IDLE|LOOK_AHEAD_PAGES)|static constexpr unsigned long (?:BUILD_POPUP_DEADLINE_MS|RADIO_RELEASE_TIMEOUT_MS)|static constexpr uint8_t MAX_PAGE_LOAD_RETRIES|uint8_t (?:pageLoadRetryCount|pendingThumbCount)|size_t parkedParserFootprint|unsigned long (?:lastRenderCompleteMs|radioSettledMs)|int (?:idlePrewarmSpine|idlePrewarmPage|pendingThumbHeight|lookAheadPage)|bool (?:buildHeapPaused|backgroundBuildSuspended|backgroundBuildFailed|partialRebuildStartFailed|buildPopupPending|buildPopupRefreshing|radioReleasedForBuild|pendingThumbGeneration|coverRefPending)|uint16_t buildViewport)', line):
+    if re.match(r'  (?:static constexpr (?:size_t|int) (?:BACKGROUND_BUILD|BUILD_WINDOW|BUILD_PAGES|PARTIAL_REBUILD|RENDER_MIN_FREE_HEAP|THUMB_IDLE|LOOK_AHEAD_PAGES)|static constexpr unsigned long (?:BUILD_POPUP_DEADLINE_MS|RADIO_RELEASE_TIMEOUT_MS)|static constexpr uint8_t MAX_PAGE_LOAD_RETRIES|uint8_t (?:pageLoadRetryCount|pendingThumbCount)|size_t parkedParserFootprint|unsigned long (?:lastRenderCompleteMs|radioSettledMs|lookAheadStartedMs)|int (?:idlePrewarmSpine|idlePrewarmPage|pendingThumbHeight|lookAheadPage|lookAheadWorkPage)|bool (?:buildHeapPaused|backgroundBuildSuspended|backgroundBuildFailed|partialRebuildStartFailed|buildPopupPending|buildPopupRefreshing|radioReleasedForBuild|fontsShedForBuild|pendingThumbGeneration|coverRefPending)|uint16_t buildViewport)', line):
         declarations.append(line)
 fixture = pathlib.Path(__file__).with_name('fixture.hpp').read_text().replace('@@FIELDS@@', '\n'.join(declarations))
 layout_hook = 'EpubReaderActivity::pageAwaitsLayout(' in cpp
 fixture = fixture.replace('@@LAYOUT@@', '  bool pageAwaitsLayout() const;' if layout_hook else '')
 functions = [function('buildTickHeapGate'), function('latTrangThat'), function('skipLoopDelay'), function('showBuildPopup')]
-for name in ['stayAfterStarvedJump', 'saveProgressIfMoved', 'pageAwaitsLayout', 'deferBackgroundBuildForBle', 'backgroundBuildStartHeapGate', 'backgroundBuildCanTick', 'suspendBackgroundBuild', 'releaseRadioForBuild', 'readyForRadio', 'settleBuildPopup', 'showMemoryError', 'generatePendingThumb', 'writePendingThumbs']:
+for name in ['startBuildFreeingHeap', 'stayAfterStarvedJump', 'saveProgressIfMoved', 'pageAwaitsLayout', 'deferBackgroundBuildForBle', 'backgroundBuildStartHeapGate', 'backgroundBuildCanTick', 'backgroundBuildWanted', 'suspendBackgroundBuild', 'releaseHeapForBuild', 'yieldForRadio', 'settleBuildPopup', 'showMemoryError', 'generatePendingThumb', 'writePendingThumbs', 'flushTextSettingsLocked']:
     if 'EpubReaderActivity::' + name + '(' in cpp:
         functions.append(function(name))
 # A reader before round 4 has no step after a starved jump.
@@ -102,8 +104,8 @@ if 'EpubReaderActivity::stayAfterStarvedJump(' not in cpp:
 if 'EpubReaderActivity::settleBuildPopup(' not in cpp:
     functions.append('void EpubReaderActivity::settleBuildPopup() {}')
 # A reader before v1.0.17 let the radio start with whatever it held.
-if 'EpubReaderActivity::readyForRadio(' not in cpp:
-    functions.append('bool EpubReaderActivity::readyForRadio() { return true; }')
+if 'EpubReaderActivity::yieldForRadio(' not in cpp:
+    functions.append('bool EpubReaderActivity::yieldForRadio() { return true; }')
 # A reader without the exit step (the previous release) writes nothing as it closes.
 if 'EpubReaderActivity::writePendingThumbs(' not in cpp:
     functions.append('void EpubReaderActivity::writePendingThumbs() {}')
@@ -134,7 +136,7 @@ hash_sources = {
     'src/activities/reader/ReaderActivity.cpp': reader_source,
 }
 (a.output / 'source-hashes.json').write_text(json.dumps({str(path): hashlib.sha256((root / path).read_bytes()).hexdigest() for path, root in hash_sources.items()}, indent=2))
-cmd = [a.compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-fsanitize=address,undefined', '-g', str(a.output / 'projection.cpp'), '-o', str(a.output / 'projection')]
+cmd = [a.compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-fsanitize=address,undefined', '-g', '-I' + str(a.source / 'src'), str(a.output / 'projection.cpp'), '-o', str(a.output / 'projection')]
 if a.ble_capability != 'absent':
     cmd.insert(1, '-DFREEINK_CAP_BLE_HID_HOST=' + a.ble_capability)
 (a.output / 'compile-command.json').write_text(json.dumps(cmd, indent=2))

@@ -11,6 +11,9 @@
 #include "SdCardFontSystem.h"
 #include "SdFontBootMemo.h"
 #include "fontIds.h"
+#include "ReaderInkWeight.h"
+
+void readerInk::apply(GfxRenderer&) {}
 
 namespace {
 
@@ -61,6 +64,43 @@ TEST_F(SdFontBoot, ColdBootWalksTheCardOnceAndLoadsTheSavedFamily) {
   EXPECT_EQ(hostLoads, std::vector<std::string>{"/.fonts/Bokerlam/Bokerlam-SD_14.cpfont"});
   EXPECT_EQ(system.registry().getFamilyCount(), 2);
   EXPECT_EQ(hostDiscoveries, 1);
+}
+
+TEST_F(SdFontBoot, ReaderInkLoadsVariantsAndKeepsLayoutIdentity) {
+  SdCardFontSystem system;
+  GfxRenderer renderer;
+  boot(ESP_RST_POWERON, system, renderer);
+  const auto fontId = system.resolveFontId("Bokerlam", 14);
+  const size_t loads = hostLoads.size();
+  EXPECT_EQ(system.availableWeightMask(), 0x3f);
+  for (int level = 0; level < 6; ++level) {
+    SETTINGS.readerInkWeight = level;
+    system.ensureLoaded(renderer);
+    EXPECT_EQ(system.resolveFontId("Bokerlam", 14), fontId);
+    EXPECT_EQ(hostLoads.size(), loads + level);
+    EXPECT_EQ(system.effectiveWeight(), 0);
+  }
+}
+
+TEST_F(SdFontBoot, LongVariantNamesStaySelectedAfterWake) {
+  for (const char* name : {"SP3 - Traveling Typewriter-BOLD1", "SP3 - Traveling Typewriter-BOLD2"}) {
+    SdCardFontFamilyInfo info;
+    info.name = name;
+    info.stems = {"R"};
+    info.files = {{14, 0, 0}};
+    putOnCard(info);
+    std::strcpy(hostSettings.sdFontFamilyName, name);
+    SdCardFontSystem cold;
+    GfxRenderer r1;
+    boot(ESP_RST_POWERON, cold, r1);
+    ASSERT_STREQ(hostSettings.sdFontFamilyName, name);
+    SdCardFontSystem wake;
+    GfxRenderer r2;
+    boot(ESP_RST_DEEPSLEEP, wake, r2);
+    EXPECT_EQ(hostDiscoveries, 0);
+    EXPECT_EQ(hostLoads, std::vector<std::string>{std::string("/.fonts/") + name + "/R_14.cpfont"});
+    EXPECT_STREQ(hostSettings.sdFontFamilyName, name);
+  }
 }
 
 TEST_F(SdFontBoot, WithoutAnSdFamilyTheCatalogWaitsForItsFirstUse) {
@@ -274,6 +314,28 @@ TEST(SdFontMemo, KeepsOneFamilyExactly) {
   EXPECT_FALSE(sdfontmemo::restore(memo, true, "Bokerlamm", back));
 }
 
+TEST(SdFontMemo, KeepsLongNamesAndRejectsThePreviousLayout) {
+  for (const auto& name : {std::string("SP3 - Traveling Typewriter-BOLD1"),
+                           std::string("SP3 - Traveling Typewriter-BOLD2"), std::string(63, 'n')}) {
+    SdCardFontFamilyInfo info;
+    info.name = name;
+    info.stems = {"R"};
+    info.files = {{14, 0, 0}};
+    sdfontmemo::Memo memo{};
+    ASSERT_TRUE(sdfontmemo::save(info, memo));
+    SdCardFontFamilyInfo back;
+    ASSERT_TRUE(sdfontmemo::restore(memo, true, name.c_str(), back));
+    EXPECT_EQ(back.name, name);
+    EXPECT_EQ(back.stems, info.stems);
+    // Layout 1 had a 32-byte name. Layout 2 has a 64-byte name.
+    memo.magic = 0x53464D31u;
+    SdCardFontFamilyInfo old;
+    EXPECT_FALSE(sdfontmemo::restore(memo, true, name.c_str(), old));
+    EXPECT_TRUE(old.name.empty());
+    EXPECT_TRUE(old.files.empty());
+  }
+}
+
 // The memo is only read on a wake from deep sleep, after the boot before it rewrote it, so it is
 // not checksummed. Whatever it says is checked where it matters: the tag, the family name and the
 // bounds here, the file names by the load itself (MemoOfAFileGoneFromTheCardFallsBackToTheWalk).
@@ -316,7 +378,7 @@ TEST(SdFontMemo, FamiliesItCannotDescribeAreNotKept) {
   many.stems = {"M"};
   for (uint8_t size = 1; size <= sdfontmemo::MAX_SIZES + 1; ++size) many.files.push_back({size, 0, 0});
   SdCardFontFamilyInfo longName;
-  longName.name = std::string(40, 'n');
+  longName.name = std::string(64, 'n');
   longName.stems = {"L"};
   longName.files = {{14, 0, 0}};
   SdCardFontFamilyInfo none;
@@ -418,4 +480,59 @@ TEST(SdFontCatalogMemo, CatalogBeyondItsSpaceIsNotKept) {
   EXPECT_FALSE(sdfontmemo::saveCatalog(many, memo));
   std::vector<SdCardFontFamilyInfo> back;
   EXPECT_FALSE(sdfontmemo::restoreCatalog(memo, true, back));
+}
+
+// A book has no use for the catalog list. Released when the book opens, the next registry use
+// (a font menu) brings it back from the RTC memo the walk left, without walking the card again.
+TEST_F(SdFontBoot, ReleasedCatalogComesBackWithoutWalkingTheCard) {
+  SdCardFontSystem system;
+  GfxRenderer renderer;
+  boot(ESP_RST_POWERON, system, renderer);
+  ASSERT_EQ(hostDiscoveries, 1);
+  EXPECT_TRUE(system.releaseCatalog());
+  EXPECT_EQ(system.registry().getFamilyCount(), 2);
+  const auto* family = system.registry().findFamily("Bokerlam");
+  ASSERT_NE(family, nullptr);
+  EXPECT_EQ(family->files.size(), 6u);
+  EXPECT_EQ(hostDiscoveries, 1);
+  system.ensureLoaded(renderer);
+  EXPECT_EQ(system.resolveFontId("Bokerlam", hostSettings.fontPointSize), 42);
+}
+
+// A catalog the memo cannot bring back stays: fonts changed in the app, or never read yet.
+TEST_F(SdFontBoot, CatalogTheMemoCannotBringBackIsKept) {
+  SdCardFontSystem system;
+  GfxRenderer renderer;
+  boot(ESP_RST_POWERON, system, renderer);
+  system.markRegistryDirty();
+  EXPECT_FALSE(system.releaseCatalog());
+
+  hostSettings.sdFontFamilyName[0] = '\0';
+  SdCardFontSystem unread;
+  GfxRenderer r2;
+  boot(ESP_RST_POWERON, unread, r2);
+  EXPECT_FALSE(unread.releaseCatalog());
+  EXPECT_EQ(unread.registry().getFamilyCount(), 2);
+  EXPECT_EQ(hostDiscoveries, 1);
+}
+
+// After a wake the boot memo's family answered for the catalog until its first read. A released
+// catalog must not bring that old family back: a size added since the wake would snap away.
+TEST_F(SdFontBoot, ReleasedCatalogDoesNotAnswerWithTheWakeFamily) {
+  SdCardFontSystem cold, wake;
+  GfxRenderer r1, renderer;
+  boot(ESP_RST_POWERON, cold, r1);
+  boot(ESP_RST_DEEPSLEEP, wake, renderer);
+  hostCatalog[0].files.push_back({20, 0, 0});
+  hostCardFiles.insert("/.fonts/Bokerlam/Bokerlam-SD_20.cpfont");
+  wake.markRegistryDirty();
+  wake.refreshIfDirty();
+  hostSettings.fontPointSize = 20;
+  wake.ensureLoaded(renderer);
+  ASSERT_EQ(hostLoads.back(), "/.fonts/Bokerlam/Bokerlam-SD_20.cpfont");
+  ASSERT_TRUE(wake.releaseCatalog());
+  hostLoads.clear();
+  wake.ensureLoaded(renderer);
+  EXPECT_EQ(hostSettings.fontPointSize, 20) << "the released catalog answered with the wake's family";
+  EXPECT_TRUE(hostLoads.empty() || hostLoads.back() == "/.fonts/Bokerlam/Bokerlam-SD_20.cpfont");
 }

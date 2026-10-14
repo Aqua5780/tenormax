@@ -17,12 +17,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <string>
 
 #include "FirmwareBoardTag.h"
 #include "FirmwareFlasher.h"
 #include "OtaPolicy.h"
 #include "OtaTrust.h"
+#include "TlsRecordSlot.h"
 
 namespace {
 #ifdef TENOR_OTA_ACCEPTANCE
@@ -30,21 +32,118 @@ constexpr char latestReleaseUrl[] = "https://cross.tenor.vn/firmware/acceptance-
 #else
 constexpr char latestReleaseUrl[] = "https://cross.tenor.vn/firmware/stable.json";
 #endif
+
+class ProductVersionScanner {
+ public:
+  explicit ProductVersionScanner(const char* expected) : expected(expected) {
+    // Reuse the embedded marker so the image still contains exactly one product tag.
+    prefix = std::strchr(board_tag::TAG, ';') + 1;
+    prefixLen = std::strchr(prefix, ':') - prefix + 1;
+  }
+  void feed(const uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len && !bad; ++i) {
+      const char c = static_cast<char>(data[i]);
+      if (capturing) {
+        if (c == ';') {
+          value[valueLen] = '\0';
+          bad = std::strcmp(value, expected) != 0;
+          capturing = false;
+          found = !bad;
+        } else if (c > 0x20 && c < 0x7f && valueLen < sizeof(value) - 1) {
+          value[valueLen++] = c;
+        } else {
+          bad = true;
+        }
+      } else if (c == prefix[prefixMatched]) {
+        if (++prefixMatched == prefixLen) {
+          bad = found;  // A second product tag makes the image ambiguous.
+          capturing = true;
+          valueLen = prefixMatched = 0;
+        }
+      } else {
+        prefixMatched = c == prefix[0] ? 1 : 0;
+      }
+    }
+  }
+  bool rejected() const { return bad; }
+  bool matched() const { return found && !bad && !capturing; }
+
+ private:
+  const char* expected;
+  const char* prefix;
+  size_t prefixLen = 0, prefixMatched = 0, valueLen = 0;
+  char value[32] = {};
+  bool capturing = false, found = false, bad = false;
+};
+
+const char* errorName(const OtaUpdater::OtaUpdaterError err) {
+  static const char* const names[] = {"OK",
+                                      "NO_UPDATE",
+                                      "HTTP_ERROR",
+                                      "JSON_PARSE_ERROR",
+                                      "UPDATE_OLDER_ERROR",
+                                      "INTERNAL_UPDATE_ERROR",
+                                      "OOM_ERROR",
+                                      "WRONG_DEVICE_ERROR",
+                                      "INTEGRITY_ERROR",
+                                      "CANCELLED_ERROR",
+                                      "NO_CABLE_ERROR"};
+  return static_cast<size_t>(err) < sizeof(names) / sizeof(names[0]) ? names[err] : "?";
+}
+
+void recordTransfer(ota_log::Attempt& attempt, const HttpDownloader::TransferStats& transfer) {
+  attempt.http = transfer.status;
+  attempt.bytes = transfer.bytes;
+  attempt.total = transfer.total;
+  attempt.xferMs = transfer.elapsedMs;
+  attempt.idleMs = transfer.idleMs;
+  attempt.heap = transfer.heap;
+  attempt.largest = transfer.largest;
+  attempt.largestMin = transfer.largestMin;
+}
+
+// A transfer that failed: where it stopped, and whether the TLS client's idle deadline ended it.
+const char* failedTransfer(ota_log::Attempt& attempt, const HttpDownloader::TransferStats& transfer) {
+  attempt.wd = ota_log::watchdog(false, transfer.idleMs, HttpDownloader::PINNED_CA_TIMEOUT_MS);
+  return ota_log::transferStep(transfer.status, transfer.headers);
+}
 }  // namespace
 
+void OtaUpdater::startAttempt() {
+  attempt = {};
+  attemptStartMs = millis();
+}
+
+OtaUpdater::OtaUpdaterError OtaUpdater::endAttempt(const OtaUpdaterError err, const char* step) {
+  attempt.ok = err == OK;
+  attempt.err = errorName(err);
+  attempt.step = step;
+  attempt.ms = millis() - attemptStartMs;
+  if (!attempt.heap) {
+    attempt.heap = ESP.getFreeHeap();
+    attempt.largest = ESP.getMaxAllocHeap();
+  }
+  wifi_ap_record_t ap{};
+  attempt.rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+  return err;
+}
+
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
+  startAttempt();
+  const char* manifestUrl = dryRunManifest;
   updateAvailable = false;
   latestVersion.clear();
   otaUrl.clear();
   otaSize = totalSize = processedSize = 0;
-  if (time(nullptr) < 1735689600 && !halClock.syncFromNTP()) return HTTP_ERROR;
+  if (manifestUrl && !ota_policy::manifestUrlAllowed(manifestUrl)) return endAttempt(HTTP_ERROR, "url");
+  if (time(nullptr) < 1735689600 && !halClock.syncFromNTP()) return endAttempt(HTTP_ERROR, "ntp");
   if (ESP.getFreeHeap() < HttpDownloader::MIN_TLS_FREE_HEAP ||
       ESP.getMaxAllocHeap() < HttpDownloader::MIN_TLS_MAX_ALLOC)
-    return OOM_ERROR;
+    return endAttempt(OOM_ERROR, "heap");
 
   // The parser owns fixed token/asset buffers. Keep them off the activity stack.
   auto release = makeUniqueNoThrow<ReleaseJsonParser>();
-  if (!release) return OOM_ERROR;
+  if (!release) return endAttempt(OOM_ERROR, "heap");
   const bool combined = board_tag::boardNameLen() == 2 && memcmp(board_tag::boardName(), "x4", 2) == 0;
   char name[48];
   if (combined)
@@ -54,30 +153,42 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
              board_tag::boardName());
   release->setFirmwareAssetName(name);
   size_t received = 0;
+  bool cancelled = false;
+  HttpDownloader::TransferStats transfer;
   const bool ok = HttpDownloader::fetchUrl(
-      latestReleaseUrl,
+      manifestUrl ? manifestUrl : latestReleaseUrl,
       [&](const uint8_t* data, size_t len) {
+        if (cancelCheck && cancelCheck(cancelCtx)) {
+          cancelled = true;
+          return false;
+        }
         if (len > 8192 - received) return false;
         received += len;
         release->feed(reinterpret_cast<const char*>(data), len);
         return true;
       },
-      "", "", ota_trust::ROOT_CA, false);
-  if (!ok) return HTTP_ERROR;
-  if (!release->complete() || !release->foundTag()) return JSON_PARSE_ERROR;
+      "", "", ota_trust::ROOT_CA, false,
+      [&](size_t, size_t) {
+        if (cancelCheck && cancelCheck(cancelCtx)) cancelled = true;
+      },
+      &cancelled, &transfer);
+  recordTransfer(attempt, transfer);
+  if (cancelled) return endAttempt(CANCELLED_ERROR, "manifest");
+  if (!ok) return endAttempt(HTTP_ERROR, failedTransfer(attempt, transfer));
+  if (!release->complete() || !release->foundTag()) return endAttempt(JSON_PARSE_ERROR, "parse");
   ota_policy::Version version;
-  if (!ota_policy::parseVersion(release->getTagName(), version, true)) return JSON_PARSE_ERROR;
-  if (!release->foundFirmware()) return NO_UPDATE;
+  if (!ota_policy::parseVersion(release->getTagName(), version, true)) return endAttempt(JSON_PARSE_ERROR, "parse");
+  if (!release->foundFirmware()) return endAttempt(NO_UPDATE, "parse");
   if (!ota_policy::firmwareUrlAllowed(release->getFirmwareUrl()) ||
       !ota_policy::decodeDigest(release->getFirmwareDigest(), otaDigest) || release->getFirmwareSize() < 24)
-    return JSON_PARSE_ERROR;
+    return endAttempt(JSON_PARSE_ERROR, "parse");
 
   latestVersion = release->getTagName();
   otaUrl = release->getFirmwareUrl();
   otaSize = totalSize = release->getFirmwareSize();
   updateAvailable = true;
   LOG_INF("OTA", "Offered %s, %zu bytes", latestVersion.c_str(), otaSize);
-  return OK;
+  return endAttempt(OK, "done");
 }
 
 bool OtaUpdater::isUpdateNewer() const {
@@ -87,8 +198,11 @@ bool OtaUpdater::isUpdateNewer() const {
 const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; }
 
 OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgress, void* ctx) {
-  if (!isUpdateNewer()) {
-    return UPDATE_OLDER_ERROR;
+  startAttempt();
+  const bool dryRun = isDryRun();
+  // The dry run skips only the version rule; everything it writes is still checked below.
+  if (dryRun ? !updateAvailable : !isUpdateNewer()) {
+    return endAttempt(UPDATE_OLDER_ERROR, "version");
   }
 
   // esp_https_ota is hardwired to esp-tls/mbedTLS, whose precompiled build on this
@@ -99,17 +213,17 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   const esp_partition_t* updatePartition = esp_ota_get_next_update_partition(nullptr);
   if (!updatePartition || otaSize > updatePartition->size || otaSize < 24) {
     LOG_ERR("OTA", "No OTA partition available");
-    return INTERNAL_UPDATE_ERROR;
+    return endAttempt(INTERNAL_UPDATE_ERROR, "begin");
   }
 
   if (ESP.getFreeHeap() < HttpDownloader::MIN_TLS_FREE_HEAP ||
       ESP.getMaxAllocHeap() < HttpDownloader::MIN_TLS_MAX_ALLOC)
-    return OOM_ERROR;
+    return endAttempt(OOM_ERROR, "heap");
   esp_ota_handle_t otaHandle = 0;
   esp_err_t esp_err = esp_ota_begin(updatePartition, otaSize, &otaHandle);
   if (esp_err != ESP_OK) {
     LOG_ERR("OTA", "esp_ota_begin failed: %s", esp_err_to_name(esp_err));
-    return INTERNAL_UPDATE_ERROR;
+    return endAttempt(INTERNAL_UPDATE_ERROR, "begin");
   }
 
   /* For better timing and connectivity, we disable power saving for WiFi */
@@ -134,58 +248,95 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   // the inactive OTA slot, but esp_ota_abort() below means it never becomes
   // the boot target.
   board_tag::Scanner tagScanner;
+  ProductVersionScanner versionScanner(latestVersion.c_str());
   bool cancelled = false;
-  const bool fetchOk = HttpDownloader::fetchUrl(
-      otaUrl,
-      [&](const uint8_t* data, size_t len) {
-        if (len > otaSize - processedSize) {
-          sizeOk = false;
-          return false;
-        }
-        if (hdrLen < sizeof(hdr)) {
-          const size_t take = std::min(len, sizeof(hdr) - hdrLen);
-          std::memcpy(hdr + hdrLen, data, take);
-          hdrLen += take;
-          if (hdrLen == sizeof(hdr)) {
-            uint16_t imageChip;
-            std::memcpy(&imageChip, hdr + 12, sizeof(imageChip));
-            const uint16_t deviceChip = firmware_flash::runningPartitionChipId();
-            if (hdr[0] != 0xE9 || deviceChip == 0xFFFF || imageChip != deviceChip) {
-              LOG_ERR("OTA", "wrong chip: image=0x%04X device=0x%04X", imageChip, deviceChip);
-              wrongChip = true;
-              return false;  // abort the transfer
-            }
-          }
-        }
-        tagScanner.feed(data, len);
-        if (tagScanner.mismatch()) {
-          LOG_ERR("OTA", "wrong board: image=%s device=%.*s", tagScanner.foundName(),
-                  static_cast<int>(board_tag::boardNameLen()), board_tag::boardName());
+  HttpDownloader::TransferStats transfer;
+  // One block serves every 16 KB record of the image: re-allocating it per record let the heap
+  // fall to pieces mid-download (TlsRecordSlot.h). With the image in parts no record is that big;
+  // the slot stays for a server that sends the whole body.
+  std::optional<tls_slot::Scope> recordSlot;
+  recordSlot.emplace();
+  const HttpDownloader::DataCallback write = [&](const uint8_t* data, size_t len) {
+    if (len > otaSize - processedSize) {
+      sizeOk = false;
+      return false;
+    }
+    if (hdrLen < sizeof(hdr)) {
+      const size_t take = std::min(len, sizeof(hdr) - hdrLen);
+      std::memcpy(hdr + hdrLen, data, take);
+      hdrLen += take;
+      if (hdrLen == sizeof(hdr)) {
+        uint16_t imageChip;
+        std::memcpy(&imageChip, hdr + 12, sizeof(imageChip));
+        const uint16_t deviceChip = firmware_flash::runningPartitionChipId();
+        if (hdr[0] != 0xE9 || deviceChip == 0xFFFF || imageChip != deviceChip) {
+          LOG_ERR("OTA", "wrong chip: image=0x%04X device=0x%04X", imageChip, deviceChip);
+          wrongChip = true;
           return false;  // abort the transfer
         }
-        if (esp_ota_write(otaHandle, data, len) != ESP_OK) {
-          flashOk = false;
-          return false;  // abort the transfer
-        }
-        mbedtls_sha256_update(&sha, data, len);
-        processedSize += len;
-        // Fire the callback only on whole-percent change. Per-chunk updates wake the
-        // render task, whose framebuffer work contends with TLS on the internal arena,
-        // and e-ink can't repaint faster than a percent tick anyway.
-        if (onProgress && totalSize > 0) {
-          const int pct = static_cast<int>(static_cast<uint64_t>(processedSize) * 100 / totalSize);
-          if (pct != lastReportedPct) {
-            lastReportedPct = pct;
-            onProgress(ctx);
-          }
-        }
-        return true;
-      },
-      "", "", ota_trust::ROOT_CA, false,
-      [&](size_t, size_t) {
-        if (cancelCheck && cancelCheck(cancelCtx)) cancelled = true;
-      },
-      &cancelled);
+      }
+    }
+    tagScanner.feed(data, len);
+    if (tagScanner.mismatch()) {
+      LOG_ERR("OTA", "wrong board: image=%s device=%.*s", tagScanner.foundName(),
+              static_cast<int>(board_tag::boardNameLen()), board_tag::boardName());
+      return false;  // abort the transfer
+    }
+    versionScanner.feed(data, len);
+    if (versionScanner.rejected()) return false;
+    if (esp_ota_write(otaHandle, data, len) != ESP_OK) {
+      flashOk = false;
+      return false;  // abort the transfer
+    }
+    mbedtls_sha256_update(&sha, data, len);
+    processedSize += len;
+    // Fire the callback only on whole-percent change. Per-chunk updates wake the
+    // render task, whose framebuffer work contends with TLS on the internal arena,
+    // and e-ink can't repaint faster than a percent tick anyway.
+    if (onProgress && totalSize > 0) {
+      const int pct = static_cast<int>(static_cast<uint64_t>(processedSize) * 100 / totalSize);
+      if (pct != lastReportedPct) {
+        lastReportedPct = pct;
+        onProgress(ctx);
+      }
+    }
+    return true;
+  };
+  // The server sends each new connection's first ~220 KB in 1.4 and 4.2 KB TLS records and 16 KB
+  // records after that; a 16 KB record needs a ~16.4 KB buffer in one piece, and on the X3 the
+  // update boot did not have it at the first such record in 10 dry runs of 10 (all stopped at
+  // 219-254 KB). So the image comes in parts of PART_BYTES, each over a connection of its own, and
+  // every record stays small. A part that breaks is asked again from the byte it reached.
+  uint32_t elapsedMs = 0;
+  uint32_t largestMin = 0;
+  HttpDownloader::RangeSession rangeSession;
+  const bool fetchOk = http_range::transfer(otaSize, processedSize, cancelled,
+      [&](size_t first, size_t last, bool& whole, bool& stop) {
+    HttpDownloader::TransferStats part;
+    const bool ok = HttpDownloader::fetchRange(
+        otaUrl, first, last, write, ota_trust::ROOT_CA,
+        [&](size_t, size_t) {
+          if (cancelCheck && cancelCheck(cancelCtx)) cancelled = true;
+        },
+        &cancelled, &part, &whole, &rangeSession);
+    elapsedMs += part.elapsedMs;
+    if (part.largestMin && (!largestMin || part.largestMin < largestMin)) largestMin = part.largestMin;
+    transfer = part;
+    stop = recordSlot->failed() || wrongChip || tagScanner.mismatch() || versionScanner.rejected() || !flashOk || !sizeOk;
+    if (!ok && !cancelled && !stop && !whole && retries < MAX_PART_RETRIES) {
+      LOG_INF("OTA", "Part from %u broke at %u, asking again (%u)", static_cast<unsigned>(first),
+              static_cast<unsigned>(processedSize), static_cast<unsigned>(retries + 1));
+    }
+    return ok;
+  }, parts, retries);
+  transfer.bytes = processedSize;
+  transfer.total = otaSize;
+  transfer.elapsedMs = elapsedMs;
+  transfer.largestMin = largestMin;
+  const bool allocationFailed = recordSlot->failed();
+  recordSlot.reset();
+  recordTransfer(attempt, transfer);
+  if (!attempt.total) attempt.total = otaSize;
   uint8_t digest[32];
   mbedtls_sha256_finish(&sha, digest);
   mbedtls_sha256_free(&sha);
@@ -197,40 +348,59 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
     // The partly written slot is released; the boot partition was never touched.
     LOG_INF("OTA", "Firmware install cancelled at %zu bytes", processedSize);
     esp_ota_abort(otaHandle);
-    return CANCELLED_ERROR;
+    attempt.wd = ota_log::watchdog(true, transfer.idleMs, HttpDownloader::PINNED_CA_TIMEOUT_MS);
+    return endAttempt(CANCELLED_ERROR, ota_log::transferStep(transfer.status, transfer.headers));
+  }
+
+  if (allocationFailed) {
+    esp_ota_abort(otaHandle);
+    return endAttempt(OOM_ERROR, "heap");
   }
 
   if (wrongChip || tagScanner.mismatch()) {
     LOG_ERR("OTA", "Firmware install aborted: wrong device");
     esp_ota_abort(otaHandle);
-    return WRONG_DEVICE_ERROR;
+    return endAttempt(WRONG_DEVICE_ERROR, "verify");
+  }
+
+  if (versionScanner.rejected()) {
+    esp_ota_abort(otaHandle);
+    return endAttempt(INTEGRITY_ERROR, "verify");
   }
 
   if (!fetchOk || !flashOk) {
     LOG_ERR("OTA", "Firmware install failed (%s)", flashOk ? "download" : "flash write");
     esp_ota_abort(otaHandle);
-    return flashOk ? HTTP_ERROR : INTERNAL_UPDATE_ERROR;
+    if (!flashOk) return endAttempt(INTERNAL_UPDATE_ERROR, "flash");
+    return endAttempt(HTTP_ERROR, sizeOk ? failedTransfer(attempt, transfer) : "verify");
   }
 
   if (!sizeOk || processedSize != otaSize || hdrLen != sizeof(hdr) || memcmp(digest, otaDigest, sizeof(digest)) != 0 ||
-      !tagScanner.matched()) {
+      !tagScanner.matched() || !versionScanner.matched()) {
     LOG_ERR("OTA", "Integrity check failed: received=%zu expected=%zu tagged=%d", processedSize, otaSize,
             tagScanner.matched());
     esp_ota_abort(otaHandle);
-    return INTEGRITY_ERROR;
+    return endAttempt(INTEGRITY_ERROR, "verify");
+  }
+  if (board_tag::dropsCable(tagScanner)) {
+    LOG_ERR("OTA", "Offered image has no cable flash channel");
+    esp_ota_abort(otaHandle);
+    return endAttempt(NO_CABLE_ERROR, "verify");
   }
   esp_err = esp_ota_end(otaHandle);  // verifies the written image
   if (esp_err != ESP_OK) {
     LOG_ERR("OTA", "esp_ota_end failed: %s", esp_err_to_name(esp_err));
-    return INTERNAL_UPDATE_ERROR;
+    return endAttempt(INTERNAL_UPDATE_ERROR, "end");
   }
+  // The verified image stays in the spare slot; the running firmware keeps booting.
+  if (dryRun) return endAttempt(OK, "done");
 
   esp_err = esp_ota_set_boot_partition(updatePartition);
   if (esp_err != ESP_OK) {
     LOG_ERR("OTA", "esp_ota_set_boot_partition failed: %s", esp_err_to_name(esp_err));
-    return INTERNAL_UPDATE_ERROR;
+    return endAttempt(INTERNAL_UPDATE_ERROR, "set_boot");
   }
 
   LOG_INF("OTA", "Update completed");
-  return OK;
+  return endAttempt(OK, "done");
 }

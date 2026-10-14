@@ -1,9 +1,12 @@
 #pragma once
 
 #include <EpdFontFamily.h>
+#include <DropCap.h>
+#include <Utf8.h>
 #include <HalDisplay.h>
 
 namespace BidiUtils {
+bool isTransparentMark(uint32_t cp);
 // Paragraph base direction for the Unicode BiDi algorithm (UAX#9).
 // AUTO: scan text for first strong directional character (P2/P3 rules)
 // LTR:  force left-to-right paragraph embedding level
@@ -13,14 +16,20 @@ enum class BidiBaseDir : signed char { AUTO = -1, LTR = 0, RTL = 1 };
 
 class FontCacheManager;
 class SdCardFont;
+class TtfEpdFont;
 
+#include <algorithm>
+#include <array>
 #include <cstring>
-#include <deque>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "Bitmap.h"
+
+namespace glyphBitmap {
+struct Frame;
+}
 
 // Color representation: uint8_t mapped to 4x4 Bayer matrix dithering levels
 // 0 = transparent, 1-16 = gray levels (white to black)
@@ -39,7 +48,7 @@ class GfxRenderer {
   };
 
  private:
-  static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;  // 8KB chunks to allow for non-contiguous memory
+  static constexpr size_t BW_BUFFER_CHUNK_SIZE = 4000;  // 4KB chunks to allow for non-contiguous memory
   // `count` pixels of a packed 1-bit row from bit `from` (a set bit white) to screen row y from x:
   // black clears the pixel, white sets it only when `opaque`.
   void drawBitRow(const uint8_t* bits, int from, int count, int x, int y, bool opaque) const;
@@ -53,6 +62,7 @@ class GfxRenderer {
   Orientation orientation;
   bool fadingFix;
   uint8_t* frameBuffer = nullptr;
+  uint32_t frameBufferLoans = 0;
   uint16_t panelWidth = HalDisplay::DISPLAY_WIDTH;
   uint16_t panelHeight = HalDisplay::DISPLAY_HEIGHT;
   uint16_t panelWidthBytes = HalDisplay::DISPLAY_WIDTH_BYTES;
@@ -64,7 +74,11 @@ class GfxRenderer {
   // allocation inside the SdCardFont objects. Same pragmatic compromise as
   // fontCacheManager_ below.
   mutable std::map<int, SdCardFont*> sdCardFonts_;
+  int builtinRasterId_ = 0;
   mutable std::map<int, uint16_t> sdCardFontScales_;  // fontId -> 8.8 fixed point scale (256=1.0x)
+  // TTF (vector) fonts: rebuilt per page by ensureSdCardFontReady(). Mutable for
+  // the same reason as sdCardFonts_ (const layout path triggers a rebuild).
+  mutable std::map<int, TtfEpdFont*> ttfFonts_;
 
   // Mutable because drawText() is const but needs to delegate scan-mode
   // recording to the (non-const) FontCacheManager. Same pragmatic compromise
@@ -80,9 +94,10 @@ class GfxRenderer {
   // Set while the controller's previous frame does not say what the glass shows (see
   // redriveNextRefresh). Mutable for the same reason as the promotion above.
   mutable bool redrivePending_ = false;
+  mutable HalDisplay::RefreshMode redriveRefresh_ = HalDisplay::FULL_REFRESH;
   bool diffOnlyPanel_ = false;
   // On a diff-only panel, with a redrive pending: make the frame's inverse the controller's
-  // previous frame, so the refresh drives every pixel, and ask for a full refresh. Clears the flag.
+  // previous frame, so the refresh drives every pixel. Clears the flag.
   HalDisplay::RefreshMode applyRedrive(HalDisplay::RefreshMode refreshMode) const;
 
   // Tiled grayscale strip target. When active, drawPixel()/clearScreen()
@@ -96,6 +111,10 @@ class GfxRenderer {
   mutable int _stripY0 = 0;
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
+  mutable int clipLeft_ = 0;
+  mutable int clipTop_ = 0;
+  mutable int clipRight_ = 32767;
+  mutable int clipBottom_ = 32767;
 
   // CJK UI font fallback map: primary (built-in, Latin-only) UI font id -> a
   // size-matched SD-card font id that carries CJK glyphs. When a string drawn
@@ -154,6 +173,7 @@ class GfxRenderer {
   // Coupled to avoid dangling SdCardFont* in sdCardFonts_ when callers free
   // the underlying SdCardFont and forget the SD-side unregister.
   void removeFont(int fontId) {
+    if (fontId == builtinRasterId_) builtinRasterId_ = 0;
     fontMap.erase(fontId);
     sdCardFonts_.erase(fontId);
     sdCardFontScales_.erase(fontId);
@@ -178,8 +198,13 @@ class GfxRenderer {
   bool isFontCacheScanning() const;
   const std::map<int, EpdFontFamily>& getFontMap() const { return fontMap; }
   void registerSdCardFont(int fontId, SdCardFont* font) { sdCardFonts_[fontId] = font; }
+  void registerBuiltinRaster(int fontId, SdCardFont* font) {
+    registerSdCardFont(fontId, font);
+    builtinRasterId_ = fontId;
+  }
   void unregisterSdCardFont(int fontId) { removeFont(fontId); }
   void clearSdCardFonts() {
+    builtinRasterId_ = 0;
     sdCardFonts_.clear();
     sdCardFontScales_.clear();
   }
@@ -191,16 +216,30 @@ class GfxRenderer {
   }
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
+  // TTF (vector) fonts rendered via TtfEpdFont/FreeInkFont. Registered like an
+  // ordinary EpdFontFamily (insertFont), plus tracked here so ensureSdCardFontReady()
+  // rebuilds their per-page glyph set on demand - the eager analogue of the SD
+  // font prewarm. The TtfEpdFont is owned by the caller (SdCardFontSystem).
+  void registerTtfFont(int fontId, TtfEpdFont* font) { ttfFonts_[fontId] = font; }
+  void unregisterTtfFont(int fontId) { ttfFonts_.erase(fontId); }
+  const std::map<int, TtfEpdFont*>& getTtfFonts() const { return ttfFonts_; }
   // Register/clear size-matched CJK UI fallbacks (see fallbackFontMap_).
   // setFallbackFont maps a primary UI font id to an SD font id of the same size.
   void setFallbackFont(int primaryFontId, int fallbackFontId) { fallbackFontMap_[primaryFontId] = fallbackFontId; }
   void clearFallbackFonts() { fallbackFontMap_.clear(); }
+  bool hasFallbackFont(int fontId) const {
+    return std::any_of(fallbackFontMap_.begin(), fallbackFontMap_.end(),
+                       [fontId](const auto& entry) { return entry.second == fontId; });
+  }
   // Ensure SD card font glyph data is loaded for the given text. Called from layout code
   // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).
   // styleMask: bitmask of styles to prepare (bit 0=regular, 1=bold, 2=italic, 3=bold-italic).
   void ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F) const;
-  void ensureSdCardFontReady(int fontId, const std::deque<std::string>& words, bool includeHyphen,
-                             uint8_t styleMask = 0x0F) const;
+  // Packed variant for the paragraph layout path: each segment holds
+  // consecutive NUL-terminated words (WordStore chunks), so a whole paragraph
+  // is scanned without materializing per-word strings.
+  void ensureSdCardFontReady(int fontId, const char* const* segments, const size_t* segmentLens, size_t segmentCount,
+                             bool includeSpace, bool includeHyphen, uint8_t styleMask = 0x0F) const;
 
   // Orientation control (affects logical width/height and coordinate transforms)
   void setOrientation(const Orientation o) { orientation = o; }
@@ -214,6 +253,12 @@ class GfxRenderer {
   int getScreenHeight() const;
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  void displayWindow(int x, int y, int width, int height) const;
+  // Called with the frame just before it goes to the panel (displayBuffer and displayBufferAsync): the
+  // touch shell draws the foot back button there, so every screen gets it from one place.
+  static inline void (*preDisplayHook)(const GfxRenderer&) = nullptr;
+  // Monochrome overlays also mask the gray planes before their upload.
+  static inline void (*preGrayUploadHook)(const GfxRenderer&) = nullptr;
   // One-shot: the next displayBuffer()/displayBufferAsync() call uses `mode`
   // instead of what its caller asked for, then the override clears itself.
   // Lets a closing overlay (the control center's refresh tile) hand a
@@ -232,7 +277,11 @@ class GfxRenderer {
   // panel. Armed by a start that restored no frame and by a gray pass (its levels have no B/W
   // name); a cleanup that re-describes the glass (cleanupGrayscaleWithFrameBuffer, restoreBwBuffer
   // with a resync) disarms it.
-  void redriveNextRefresh() const { redrivePending_ = true; }
+  // A fast request keeps any stronger refresh chosen by the caller or an overlay.
+  void redriveNextRefresh(const HalDisplay::RefreshMode mode = HalDisplay::FULL_REFRESH) const {
+    redrivePending_ = true;
+    redriveRefresh_ = mode;
+  }
   // False while a redrive is pending: the controller's previous frame, and the framebuffer that
   // went with it, are not what the glass shows.
   bool panelFrameKnown() const { return !redrivePending_; }
@@ -243,6 +292,7 @@ class GfxRenderer {
   // support. See HalDisplay::displayBufferAsync for the baseline contract.
   void displayBufferAsync(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
   void waitRefreshComplete() const;
+  bool refreshBusy() const { return display.refreshBusy(); }
   // True when displayBufferAsync() genuinely overlaps: panel defers and
   // fadingFix isn't forcing the blocking path. Callers can skip overlap
   // scaffolding (e.g. whole-plane grayscale buffers) when false.
@@ -274,6 +324,94 @@ class GfxRenderer {
   // skip an expensive bitmap decode. Returns true when no strip is active.
   // Corners are rotated to physical, so it is orientation-aware.
   bool glyphIntersectsStrip(int x0, int y0, int x1, int y1) const;
+  bool isStripTargetActive() const { return _stripActive; }
+
+  // Metadata only. Unstable or transformed text keeps the full render path.
+  bool extendTextBounds(std::array<int, 4>& box, int fontId, int x, int y, const char* text,
+                        EpdFontFamily::Style style, BidiUtils::BidiBaseDir baseDir, int spacing = 0,
+                        int capHeight = 0) const {
+    if (!text || !*text) return true;
+    if (baseDir == BidiUtils::BidiBaseDir::RTL) return false;
+    for (const auto* q = reinterpret_cast<const unsigned char*>(text); *q; ++q)
+      if (*q >= 0xD6 && *q <= 0xDB) return false;
+    const int resolved = resolveTextFontId(fontId, text, style);
+    const auto it = fontMap.find(resolved);
+    if (it == fontMap.end()) return false;
+    const auto& font = it->second;
+    const auto* data = font.getData(style);
+    if (!data || data->kernHandler || data->vectorBitmapHandler) return false;
+    const auto include = [&](int left, int top, int width, int height) {
+      if (!width || !height) return;
+      box[0] = std::min(box[0], left); box[1] = std::min(box[1], top);
+      box[2] = std::max(box[2], left + width - 1); box[3] = std::max(box[3], top + height - 1);
+    };
+    const auto resident = [](const EpdFontData* face, uint32_t cp) {
+      if (!face->glyphMissHandler) return true;
+      const auto* begin = face->intervals;
+      if (!begin || !face->intervalCount) return false;
+      const auto* end = begin + face->intervalCount;
+      const auto* pos = std::upper_bound(begin, end, cp,
+          [](uint32_t value, const EpdUnicodeInterval& range) { return value < range.first; });
+      return pos != begin && cp <= (pos - 1)->last;
+    };
+    if (capHeight) {
+      const auto initial = dropcap::initial(text);
+      if (initial.codepoint) {
+        const auto original = fontMap.find(fontId);
+        if (original == fontMap.end()) return false;
+        const auto capStyle = static_cast<EpdFontFamily::Style>((style & 3) | EpdFontFamily::BOLD);
+        const auto* capData = original->second.getData(capStyle);
+        if (!capData || !resident(capData, initial.codepoint)) return false;
+        const auto* glyph = original->second.getGlyph(initial.codepoint, capStyle);
+        if (glyph && glyph->width && glyph->height) {
+          const int capWidth = (glyph->width * capHeight + glyph->height / 2) / glyph->height;
+          char prefix[16] = {};
+          memcpy(prefix, text, initial.prefixBytes);
+          const int capX = x + getTextAdvanceX(fontId, prefix, style, spacing);
+          const int advance = getDropCapAdvance(fontId, text, style, capHeight, spacing);
+          include(capX, y + 2, capWidth, capHeight);
+          return extendTextBounds(box, fontId, x, y, prefix, style, BidiUtils::BidiBaseDir::AUTO, spacing) &&
+                 extendTextBounds(box, fontId, x + advance, y, text + initial.endBytes, style,
+                                  BidiUtils::BidiBaseDir::AUTO, spacing);
+        }
+      }
+    }
+    int baseline = y + getFontAscenderSize(resolved);
+    if (resolved != fontId) baseline += (getLineHeight(fontId) - getLineHeight(resolved)) / 2;
+    int pen = x, lastLeft = 0, lastWidth = 0, lastTop = 0;
+    int32_t advance = 0;
+    uint32_t previous = 0;
+    while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
+      // Inline controls and handwritten aliases can draw beyond font metrics.
+      if ((cp >= 0xE100 && cp < 0xE110) || (cp >= 0x2190 && cp <= 0x2193) ||
+          cp == 0x2713 || cp == 0x2605 || cp == 0x2665 || cp == 0x2764) return false;
+      const bool mark = utf8IsCombiningMark(cp) || BidiUtils::isTransparentMark(cp);
+      if (!mark) cp = font.applyLigatures(cp, text, style);
+      if (!resident(data, cp)) return false;
+      const auto* glyph = font.getGlyph(cp, style);
+      if (mark) {
+        if (!glyph) continue;
+        const auto anchor = combiningMark::anchorFor(cp);
+        const int raised = combiningMark::raiseAboveBase(anchor, glyph->top, glyph->height, lastTop);
+        const int markX = combiningMark::anchorOver(anchor, pen, lastLeft, lastWidth, glyph->left, glyph->width);
+        include(markX + glyph->left, baseline - raised - glyph->top, glyph->width, glyph->height);
+        continue;
+      }
+      if (previous) pen += fp4::toPixel(advance + font.getKerning(previous, cp, style)) + spacing;
+      lastLeft = glyph ? glyph->left : 0; lastWidth = glyph ? glyph->width : 0;
+      lastTop = glyph ? glyph->top : 0; advance = glyph ? glyph->advanceX : 0;
+      const bool small = (style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
+      if (small) advance = (advance + 1) / 2;
+      if (glyph) {
+        const int scale = small ? 2 : 1;
+        include(pen + glyph->left / scale, baseline - glyph->top / scale,
+                (glyph->width + scale - 1) / scale, (glyph->height + scale - 1) / scale);
+      }
+      previous = cp;
+    }
+    return true;
+  }
+
 
   // Active pixel-write target for raw writers (DirectPixelWriter) that bypass
   // drawPixel for speed. When a strip target is active these return the band
@@ -285,7 +423,20 @@ class GfxRenderer {
   int getWriteRows() const { return _stripActive ? _stripRows : panelHeight; }
 
   // Drawing
+  // UI drawing clip in logical coordinates; independent of panel orientation.
+  std::array<int, 4> getClipRect() const {
+    return {clipLeft_, clipTop_, clipRight_ - clipLeft_, clipBottom_ - clipTop_};
+  }
+  void setClipRect(int x, int y, int width, int height) const {
+    clipLeft_ = x;
+    clipTop_ = y;
+    clipRight_ = x + width;
+    clipBottom_ = y + height;
+  }
   void drawPixel(int x, int y, bool state = true) const;
+  // Draw glyph ink with clipping and orientation resolved once per glyph.
+  void drawGlyphBitmap(const uint8_t* bitmap, int width, int height, const glyphBitmap::Frame& frame, bool twoBit,
+                       RenderMode mode, bool state) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const;
   void drawRect(int x, int y, int width, int height, bool state = true) const;
@@ -305,8 +456,14 @@ class GfxRenderer {
   // With `levelRows`, every pixel of the image is written black or white by its level's ordered
   // pattern: bit (7 - panel x & 7) of levelRows[level][panel y & 3], set for white. One decode then
   // gives the dithered frame the absolute LSB and MSB planes would fold into.
+  // `whiteAsTransparent` leaves the framebuffer under the image's white pixels as it is (a sleep
+  // overlay drawn over the page).
   bool drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX = 0,
-                  float cropY = 0, const uint8_t (*levelRows)[4] = nullptr) const;
+                  float cropY = 0, const uint8_t (*levelRows)[4] = nullptr, bool whiteAsTransparent = false) const;
+  bool drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX, float cropY,
+                  bool whiteAsTransparent) const {
+    return drawBitmap(bitmap, x, y, maxWidth, maxHeight, cropX, cropY, nullptr, whiteAsTransparent);
+  }
   bool drawBitmap1Bit(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
   // A packed 1-bit picture in RAM (MSB first, a set bit white): its region [srcX, srcX + w) x
   // [srcY, srcY + h) goes 1:1 to (x, y), every pixel written.
@@ -326,6 +483,8 @@ class GfxRenderer {
   void writeFramebufferRegion(int x, int y, int w, int h, const uint8_t* src);
 
   // Text
+  // Layout may use advance-only SD font tables; rendered measurement includes kerning and ligatures.
+  enum class TextMeasureMode { Layout, Rendered };
   int getTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR,
                    BidiUtils::BidiBaseDir baseDir = BidiUtils::BidiBaseDir::AUTO, int letterSpacing = 0) const;
   void drawCenteredText(int fontId, int y, const char* text, bool black = true,
@@ -348,12 +507,25 @@ class GfxRenderer {
   /// x-position builder all measure one gap.
   int getSpaceAdvance(int fontId, uint32_t leftCp, uint32_t rightCp, EpdFontFamily::Style style,
                       uint8_t wordSpacing = 0) const;
-  /// Returns the kerning adjustment between two adjacent codepoints.
-  int getKerning(int fontId, uint32_t leftCp, uint32_t rightCp, EpdFontFamily::Style style) const;
+  /// Returns the kerning adjustment between two adjacent codepoints, plus \p tracking pixels
+  /// unless either side is a space (or there is no left codepoint).
+  int getKerning(int fontId, uint32_t leftCp, uint32_t rightCp, EpdFontFamily::Style style, int8_t tracking = 0) const;
   /// Whole-string advance. \p wordSpacing applies the U+0020 delta to every
   /// space in \p text (TXT layout measures and draws whole lines).
   int getTextAdvanceX(int fontId, const char* text, EpdFontFamily::Style style, int letterSpacing = 0,
                       uint8_t wordSpacing = 0) const;
+  /// The same advance for a given bidi base direction; Rendered mode skips the SD advance-table
+  /// fast path so kerning and ligatures count, as drawText draws them. \p tracking is the
+  /// letterSpacing above.
+  int getTextAdvanceX(int fontId, const char* text, EpdFontFamily::Style style, int8_t tracking,
+                      BidiUtils::BidiBaseDir baseDir, TextMeasureMode mode = TextMeasureMode::Layout) const;
+
+ private:
+  // Both getTextAdvanceX spellings measure here, so they can never disagree.
+  int textAdvanceX(int fontId, const char* text, EpdFontFamily::Style style, int letterSpacing, uint8_t wordSpacing,
+                   BidiUtils::BidiBaseDir baseDir, TextMeasureMode mode) const;
+
+ public:
   int getDropCapAdvance(int fontId, const char* text, EpdFontFamily::Style style, int height,
                         int letterSpacing = 0) const;
   int getDropCapWordWidth(int fontId, const char* text, EpdFontFamily::Style style, int height,
@@ -384,6 +556,8 @@ class GfxRenderer {
   int getTextHeight(int fontId) const;
   int getTextInkTop(int fontId, const char* text, EpdFontFamily::Style style) const;
   int getTextInkBottom(int fontId, const char* text, EpdFontFamily::Style style) const;
+  // Half-open bitmap ink rectangle relative to drawText's origin, with the same glyph steps.
+  std::array<int, 4> getTextInkBounds(int fontId, const char* text, EpdFontFamily::Style style) const;
   bool drawBitmapCover(const Bitmap& bitmap, int x, int y, int width, int height) const;
 
   // Grayscale functions
@@ -441,6 +615,7 @@ class GfxRenderer {
   void releaseFrameBufferForBuild();
   bool restoreFrameBufferAfterBuild();
   bool hasFrameBuffer() const { return frameBuffer != nullptr; }
+  uint32_t frameBufferLoanCount() const { return frameBufferLoans; }
 
   // RAII form of the loan above, for blocking build regions with early-return
   // error paths: restores on scope exit (or explicitly via end()). Display the

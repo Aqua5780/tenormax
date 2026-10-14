@@ -18,6 +18,10 @@ class XtcReaderChapterSelectionActivity final : public UiListActivity {
 
   int listCount() const override { return xtc ? static_cast<int>(xtc->getChapters().size()) : 0; }
   void buildScreen(UiScreen& screen) override;
+  bool ownsX3Chrome() const override { return true; }
+  tenorchrome::X3ScreenLayout screenLayout() const;
+  void drawX3Content() const;
+  void drawFooter() override;
   void activateIndex(int index) override;
   // Back cancels with a result and Confirm activates on RELEASE here; a `!xtc`
   // guard consumes the pass after Back so nothing else runs without a book.
@@ -26,6 +30,8 @@ class XtcReaderChapterSelectionActivity final : public UiListActivity {
   int findChapterIndexForPage(uint32_t page) const;
 
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Position; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_SELECT_CHAPTER); }
   explicit XtcReaderChapterSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                              const std::shared_ptr<Xtc>& xtc, uint32_t currentPage);
   void onEnter() override;

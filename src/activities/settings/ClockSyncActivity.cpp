@@ -1,5 +1,7 @@
 #include "ClockSyncActivity.h"
 
+#include "activities/X3ActivityLayout.h"
+
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalClock.h>
@@ -17,6 +19,8 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/TimezoneLookup.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyNote.h"
 
 void ClockSyncActivity::onEnter() {
   runtimeStarted = false;
@@ -98,7 +102,7 @@ void ClockSyncActivity::runSync() {
 
   // Read the freshly synced time back for the user-facing confirmation.
   char buf[9];
-  if (halClock.formatTime(buf, sizeof(buf), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1)) {
+  if (halClock.formatTime(buf, sizeof(buf), SETTINGS.clockFormat == 1)) {
     snprintf(syncedTime, sizeof(syncedTime), "%s", buf);
   }
   state = timezoneOk ? SUCCESS : TIMEZONE_FAILED;
@@ -113,6 +117,13 @@ bool ClockSyncActivity::idleExitDue(const unsigned long now, const bool interact
 }
 
 void ClockSyncActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() &&
+      x3Info.turn(mappedInput.wasReleased(MappedInputManager::Button::Up) ? -1 :
+                  mappedInput.wasReleased(MappedInputManager::Button::Down) ? 1 : 0)) {
+    requestUpdate();
+    return;
+  }
+
   const bool interaction = mappedInput.wasAnyPressed() || mappedInput.wasAnyReleased() ||
                            mappedInput.wasScreenTouchReleased();
   if (idleExitDue(millis(), interaction)) {
@@ -135,7 +146,42 @@ void ClockSyncActivity::loop() {
   }
 }
 
+void ClockSyncActivity::renderUgly() {
+  static constexpr StrId LINES[] = {StrId::STR_UGLY_CLOCK_SYNCING, StrId::STR_UGLY_CLOCK_OK, StrId::STR_UGLY_CLOCK_NO_WIFI,
+                                    StrId::STR_UGLY_CLOCK_FAILED, StrId::STR_UGLY_CLOCK_TZ_FAILED};
+  char now[64] = "";
+  if ((state == SUCCESS || state == TIMEZONE_FAILED) && syncedTime[0] != '\0')
+    snprintf(now, sizeof(now), "%s %s", tr(STR_CURRENT_TIME), syncedTime);
+  ugly::Hints hints;
+  hints.back = state != SYNCING;
+  ugly::notePage(renderer, mappedInput, tr(STR_CLOCK_SYNC), I18N.get(LINES[state]), now[0] ? now : nullptr, -1, hints);
+}
+
 void ClockSyncActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* status = state == SYNCING ? tr(STR_CLOCK_SYNCING) :
+        state == SUCCESS || state == TIMEZONE_FAILED ? tr(STR_CLOCK_SYNC_OK) :
+        state == NO_WIFI ? tr(STR_CLOCK_SYNC_NO_WIFI) : tr(STR_CLOCK_SYNC_FAIL);
+    const char* detail = state == TIMEZONE_FAILED ? tr(STR_CLOCK_TIMEZONE_FAILED) :
+        state == NO_WIFI ? tr(STR_CLOCK_SYNC_NO_WIFI_HINT) : state == FAILED ? tr(STR_CHECK_SERIAL_OUTPUT) :
+        state == SUCCESS ? tr(STR_CURRENT_TIME) : nullptr;
+    const char* tip = nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip, 8));
+    renderer.clearScreen();
+    x3Info.draw(renderer, layout.bodyRect, {status, detail, syncedTime});
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect, 8);
+    x3activity::drawBar(renderer, layout.barRect, tr(STR_CLOCK_SYNC), navigationPrefix.c_str());
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+    renderer.displayBuffer();
+    return;
+  }
+
+  if (shell::uglyParts()) {
+    renderUgly();
+    return;
+  }
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();

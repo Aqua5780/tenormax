@@ -25,28 +25,37 @@ class EpubReaderBookmarksActivity final : public UiListActivity {
   void rebuildBookmarkRowItems();
   bool confirmingDelete = false;
   OptionPopup confirmPopup;
+  OptionPopup* tiltPopup() override { return &confirmPopup; }
 
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Favorites; }
   explicit EpubReaderBookmarksActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                        const std::shared_ptr<Epub>& epub, const std::string& epubPath);
   void onEnter() override;
   void render(RenderLock&&) override;
+  // The title the hand-drawn list writes (render() paints its own otherwise).
+  const char* headerTitle() const override;
 
  private:
   int listCount() const override { return static_cast<int>(bookmarks.size()); }
   void buildScreen(UiScreen& screen) override;
+  bool ownsX3Chrome() const override { return true; }
+  tenorchrome::X3ScreenLayout screenLayout() const;
+  void drawX3Content() const;
   void activateIndex(int index) override;
   void onRowLongPress(int index) override;
   // Popup handling runs before everything else each pass.
   bool handleCustomInput() override;
-  // Back cancels with a result; Confirm opens on RELEASE (a hold is "delete").
+  // Back cancels with a result; Confirm opens on release and a hold shows actions.
   bool handleButtons() override;
 
   // Open the selected bookmark: finishes with a ProgressChangeResult for the reader.
   void openSelectedBookmark();
 
-  // Opens the Cancel/Delete confirmation for the selected bookmark; shared by
-  // the physical Confirm hold and the touch row long-press.
+  void startRename();
+  void showBookmarkActions();
+
+  // Opens the Cancel/Delete confirmation for the selected bookmark.
   void showDeleteConfirmation();
 
   // Delete the currently selected bookmark and persist the list

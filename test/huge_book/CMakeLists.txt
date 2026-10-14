@@ -17,6 +17,10 @@ target_include_directories(HugeBookIndexTest PRIVATE
 )
 target_link_libraries(HugeBookIndexTest PRIVATE GTest::gtest_main expat)
 gtest_discover_tests(HugeBookIndexTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)
+add_test(NAME BackgroundIndex.ReaderRetryPolicy
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/index_retry.py)
+add_test(NAME BackgroundIndex.TocStepKeepsTheFloor
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/toc_step_floor.py)
 
 add_executable(HugeBookSectionTest
   HugeBookSectionTest.cpp ../section_cache/ParserLinkStubs.cpp
@@ -28,6 +32,7 @@ add_executable(HugeBookSectionTest
   ${REPO_ROOT}/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
   ${REPO_ROOT}/lib/Epub/Epub/css/CssParser.cpp
   ${REPO_ROOT}/lib/Epub/Epub/ParsedText.cpp
+  ${REPO_ROOT}/lib/Epub/Epub/WordStore.cpp
   ${REPO_ROOT}/lib/Epub/Epub/converters/ImageDimsProbe.cpp
   ${REPO_ROOT}/lib/Utf8/Utf8.cpp
 )
@@ -40,6 +45,7 @@ target_include_directories(HugeBookSectionTest PRIVATE
   ${REPO_ROOT}/lib/EpdFont ${REPO_ROOT}/lib/Utf8 ${REPO_ROOT}/lib/Memory
   ${REPO_ROOT}/lib/Serialization ${REPO_ROOT}/lib/MiniBidi ${REPO_ROOT}/lib/FsHelpers
   ${REPO_ROOT}/lib/XmlParserUtils
+  ${REPO_ROOT}/lib/BlePageTurner/include ${REPO_ROOT}/lib/BlePageTurner/src
   ${REPO_ROOT}/freeink-sdk/libs/hardware/SDCardManager/include)
 target_link_libraries(HugeBookSectionTest PRIVATE GTest::gtest_main expat)
 gtest_discover_tests(HugeBookSectionTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)

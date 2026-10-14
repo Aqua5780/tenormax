@@ -1,4 +1,5 @@
 #include "ClearCacheActivity.h"
+#include "X3SettingsLayout.h"
 
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -6,28 +7,54 @@
 #include <Logging.h>
 
 #include "MappedInputManager.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyInk.h"
+#include "shells/ugly/UglySwitch.h"
+#include "shells/ugly/UglyWords.h"
 #include "util/BookCacheUtils.h"
+
+namespace {
+// tenor/ugly on the button readers writes the lines of this screen by hand, centred; S22 when S30 is too wide.
+void sayCentred(const GfxRenderer& r, const int baseline, const char* text) {
+  const ugly::Size size = ugly::width(r, ugly::Size::S30, text) <= r.getScreenWidth() - 24 ? ugly::Size::S30 : ugly::Size::S22;
+  ugly::text(r, size, (r.getScreenWidth() - ugly::width(r, size, text)) / 2, baseline, text);
+}
+}  // namespace
 
 void ClearCacheActivity::onEnter() {
   Activity::onEnter();
 
   state = WARNING;
+  // Touch: the warning goes inside the question, which offers its one action; "<" on the bar cancels.
   const char* options[] = {tr(STR_CANCEL), tr(STR_CLEAR_BUTTON)};
-  confirmPopup.show(tr(STR_CLEAR_READING_CACHE), options, 2, 0, [this](int idx) {
-    if (idx == 1) {
+  constexpr int skip = tenorchrome::kTouchShell ? 1 : 0;
+  const auto onSelect = [this](int idx) {
+    if (idx + skip == 1) {
       beginClear();
     } else {
       goBack();
     }
-  });
+  };
+  if (tenorchrome::kTouchShell) {
+    const std::string warning = std::string(tr(STR_CLEAR_CACHE_WARNING_1)) + " " + tr(STR_CLEAR_CACHE_WARNING_2) + " " +
+                                tr(STR_CLEAR_CACHE_WARNING_3) + " " + tr(STR_CLEAR_CACHE_WARNING_4);
+    confirmPopup.show(tr(STR_CLEAR_READING_CACHE), warning.c_str(), options + skip, 2 - skip, -1, onSelect);
+  } else {
+    confirmPopup.show(tr(STR_CLEAR_READING_CACHE), options, 2, 0, onSelect);
+  }
   requestUpdate();
 }
 
 void ClearCacheActivity::onExit() { Activity::onExit(); }
 
 void ClearCacheActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    renderX3();
+    return;
+  }
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -36,7 +63,23 @@ void ClearCacheActivity::render(RenderLock&&) {
 
   drawNavigationHeader(tr(STR_CLEAR_READING_CACHE));
 
+  const bool handwritten = shell::uglyParts();
+  if (state == WARNING && handwritten) {
+    // The question box of the shell: the warning is its note, the circle follows the popup that takes the keys.
+    const std::string note = std::string(tr(STR_CLEAR_CACHE_WARNING_1)) + " " + tr(STR_CLEAR_CACHE_WARNING_2) + " " +
+                             tr(STR_CLEAR_CACHE_WARNING_3) + " " + tr(STR_CLEAR_CACHE_WARNING_4);
+    const char* answers[2] = {tr(STR_CANCEL), tr(STR_CLEAR_BUTTON)};
+    ugly::Box drawn[2];
+    ugly::askBox(renderer, mappedInput, tr(STR_CLEAR_READING_CACHE), note.c_str(), answers, confirmPopup.selected(), drawn,
+                 confirmPopup.selectionSeed());
+    renderer.displayBuffer();
+#ifdef UGLY_FRAME_LOG
+    LOG_INF("UGLY", "part=ask sel=%d", confirmPopup.selected());
+#endif
+    return;
+  }
   if (state == WARNING) {
+    if (tenorchrome::kTouchShell && confirmPopup.processRender(renderer, mappedInput)) return;
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 60, tr(STR_CLEAR_CACHE_WARNING_1), true);
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 30, tr(STR_CLEAR_CACHE_WARNING_2), true,
                               EpdFontFamily::BOLD);
@@ -52,18 +95,27 @@ void ClearCacheActivity::render(RenderLock&&) {
   }
 
   if (state == CLEARING) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_CLEARING_CACHE));
+    if (handwritten) {
+      sayCentred(renderer, pageHeight / 2 + 10, tr(STR_CLEARING_CACHE));
+    } else {
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_CLEARING_CACHE));
+    }
     renderer.displayBuffer();
     return;
   }
 
   if (state == SUCCESS) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_CACHE_CLEARED), true, EpdFontFamily::BOLD);
     std::string resultText = std::to_string(clearedCount) + " " + std::string(tr(STR_ITEMS_REMOVED));
     if (failedCount > 0) {
       resultText += ", " + std::to_string(failedCount) + " " + std::string(tr(STR_FAILED_LOWER));
     }
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, resultText.c_str());
+    if (handwritten) {
+      sayCentred(renderer, pageHeight / 2 - 10, ugly::words::cacheDone());
+      sayCentred(renderer, pageHeight / 2 + 34, resultText.c_str());
+    } else {
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_CACHE_CLEARED), true, EpdFontFamily::BOLD);
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, resultText.c_str());
+    }
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -72,15 +124,65 @@ void ClearCacheActivity::render(RenderLock&&) {
   }
 
   if (state == FAILED) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_CLEAR_CACHE_FAILED), true,
-                              EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, tr(STR_CHECK_SERIAL_OUTPUT));
+    if (handwritten) {
+      sayCentred(renderer, pageHeight / 2 - 10, ugly::words::cacheFail());
+      sayCentred(renderer, pageHeight / 2 + 34, tr(STR_CHECK_SERIAL_OUTPUT));
+    } else {
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_CLEAR_CACHE_FAILED), true,
+                                EpdFontFamily::BOLD);
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, tr(STR_CHECK_SERIAL_OUTPUT));
+    }
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();
     return;
   }
+}
+
+std::string ClearCacheActivity::x3InfoText() const {
+  if (state == WARNING)
+    return std::string(tr(STR_CLEAR_CACHE_WARNING_1)) + "\n" + tr(STR_CLEAR_CACHE_WARNING_2) + "\n" +
+           tr(STR_CLEAR_CACHE_WARNING_3) + "\n" + tr(STR_CLEAR_CACHE_WARNING_4);
+  if (state == CLEARING) return tr(STR_CLEARING_CACHE);
+  if (state == FAILED) return std::string(tr(STR_CLEAR_CACHE_FAILED)) + "\n" + tr(STR_CHECK_SERIAL_OUTPUT);
+  std::string result = std::string(tr(STR_CACHE_CLEARED)) + "\n" + std::to_string(clearedCount) + " " + tr(STR_ITEMS_REMOVED);
+  if (failedCount > 0) result += ", " + std::to_string(failedCount) + " " + tr(STR_FAILED_LOWER);
+  return result;
+}
+
+void ClearCacheActivity::renderX3() {
+  renderer.clearScreen();
+  const auto layout = tenorchrome::x3ScreenLayout(renderer);
+  auto info = layout.bodyRect;
+  const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
+  info.height -= state == WARNING ? 3 * lineHeight + 8 : lineHeight + 8;
+  const std::string text = x3InfoText();
+  infoPages_ = x3settings::infoPageCount(renderer, text.c_str(), info);
+  infoPage_ = std::clamp(infoPage_, 0, infoPages_ - 1);
+  x3settings::drawInfoPage(renderer, text.c_str(), info, infoPage_);
+  auto row = layout.bodyRect;
+  row.y = info.bottom() + 8;
+  row.height = lineHeight;
+  if (state == WARNING) {
+    const std::string cancel = std::string(confirmPopup.selected() == 0 ? "> " : "  ") + tr(STR_CANCEL);
+    const std::string clear = std::string(confirmPopup.selected() == 1 ? "> " : "  ") + tr(STR_CLEAR_BUTTON);
+    tenorchrome::drawInfoInRect(renderer, cancel.c_str(), row, 1);
+    row.y += lineHeight;
+    tenorchrome::drawInfoInRect(renderer, clear.c_str(), row, 1);
+    row.y += lineHeight;
+  }
+  if (infoPages_ > 1) {
+    const std::string position = std::to_string(infoPage_ + 1) + "/" + std::to_string(infoPages_);
+    tenorchrome::drawInfoInRect(renderer, position.c_str(), row, 1);
+  }
+  x3settings::drawPath(renderer, tr(STR_CLEAR_READING_CACHE));
+  const auto labels = mappedInput.mapLabels(state == WARNING ? tr(STR_CANCEL) : state == CLEARING ? "" : tr(STR_BACK),
+                                             state == WARNING ? tr(STR_SELECT) : "",
+                                             state == WARNING || infoPages_ > 1 ? tr(STR_DIR_UP) : "",
+                                             state == WARNING || infoPages_ > 1 ? tr(STR_DIR_DOWN) : "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  renderer.displayBuffer();
 }
 
 void ClearCacheActivity::beginClear() {
@@ -141,8 +243,25 @@ void ClearCacheActivity::clearCache() {
 }
 
 void ClearCacheActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() && infoPages_ > 1) {
+    const bool previous = mappedInput.wasPressed(state == WARNING ? MappedInputManager::Button::Left
+                                                                  : MappedInputManager::Button::Up);
+    const bool next = mappedInput.wasPressed(state == WARNING ? MappedInputManager::Button::Right
+                                                              : MappedInputManager::Button::Down);
+    if (previous || next) {
+      RenderLock lock(*this);
+      infoPage_ = std::clamp(infoPage_ + (next ? 1 : -1), 0, infoPages_ - 1);
+      requestUpdate();
+      return;
+    }
+  }
   if (state == WARNING) {
     if (confirmPopup.handleInput(mappedInput, [this] { requestUpdate(); })) return;
+    // Touch: the question closed without its action ("<" on the bar, a tap outside): back.
+    if (tenorchrome::kTouchShell) {
+      goBack();
+      return;
+    }
 
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       beginClear();

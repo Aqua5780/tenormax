@@ -1,9 +1,12 @@
 #pragma once
+#include "activities/X3ActivityLayout.h"
+#include "activities/X3OptionPopup.h"
 
 #include <cstdint>
 
 #include "activities/Activity.h"
 #include "components/OptionPopup.h"
+#include "network/UpdateBoot.h"
 #include "network/OtaUpdater.h"
 #include "util/FileTransferBackLatch.h"
 
@@ -26,6 +29,9 @@ inline bool idleExitDue(const uint32_t now, const bool waiting, const bool radio
 }  // namespace ota_power
 
 class OtaUpdateActivity : public Activity {
+  x3activity::InfoPages x3Info;
+  freeink::ui::Rect x3PopupFrame() const;
+
   enum State {
     WIFI_SELECTION,
     CHECKING_FOR_UPDATE,
@@ -53,16 +59,44 @@ class OtaUpdateActivity : public Activity {
   // Cancel/Update confirmation over the version info (replaces the old
   // hand-rolled bottom tap rects).
   OptionPopup confirmPopup;
+  x3activity::TwoChoicePopup x3Popup;
   // The download holds the loop; a Back tap is sampled on its own task meanwhile.
   FileTransferBackLatch backLatch;
+  // Set when this screen was restarted into (the user already chose Update, or a dry run): it
+  // installs without asking again and restarts on its way out, whatever happened.
+  const update_boot::Request boot;
+  // The user chose Update: onExit restarts into the update boot instead of Home.
+  bool restartIntoInstall = false;
 
   void onWifiSelectionComplete(bool success);
   void runUpdateInstall();
+  bool renderUglyNote(int percent, bool firstProgressFrame) const;
+  // One line in the card's OTA log, after the result screen is drawn (now: it already is).
+  void recordAttempt(const char* op, bool now = false);
   bool idleExitDue(unsigned long now, bool interaction);
+#ifdef TENOR_PRESS_PROBE
+  uint32_t progressFrameCount = 0;
+  static constexpr size_t PROBE_LINE_BYTES = 640;
+  // Free heap and largest block when this screen came up, after Wi-Fi started, at install start.
+  struct {
+    uint32_t bootHeap, bootLargest, wifiHeap, wifiLargest, installHeap, installLargest;
+  } probeStages = {};
+  std::string dryRunUrl;
+  // Dry runs still to do after this boot's; the next boot does the next one.
+  uint8_t dryRunsAfter = 0;
+  void runDryRun();
+#endif
 
  public:
-  explicit OtaUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-      : Activity("OtaUpdate", renderer, mappedInput), updater() {}
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::System; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_UPDATE); }
+  explicit OtaUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                             const update_boot::Request& bootRequest = {})
+      : Activity("OtaUpdate", renderer, mappedInput), updater(), boot(bootRequest) {}
+#ifdef TENOR_PRESS_PROBE
+  // CMD:OTA_DRYRUN, in the update boot: after Wi-Fi joins, check and download from manifestUrl once.
+  void setDryRun(const char* manifestUrl) { dryRunUrl = manifestUrl; }
+#endif
   void onEnter() override;
   void onExit() override;
   void loop() override;

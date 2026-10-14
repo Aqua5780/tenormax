@@ -1,4 +1,6 @@
 #pragma once
+#include "activities/X3ActivityLayout.h"
+#include "shells/ugly/UglyMarkSeed.h"
 #include <I18n.h>
 
 #include <string>
@@ -7,7 +9,10 @@
 #include "components/UiAppHost.h"
 
 class ButtonRemapActivity final : public Activity, private UiAppHost {
+  x3activity::InfoPages x3Info;
+
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Controls; }
   explicit ButtonRemapActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : Activity("ButtonRemap", renderer, mappedInput), UiAppHost(renderer) {}
 
@@ -17,6 +22,7 @@ class ButtonRemapActivity final : public Activity, private UiAppHost {
   void render(RenderLock&&) override;
 
  private:
+  mutable ugly::MarkState mark_;
   // Rendering task state.
 
   // Index of the logical role currently awaiting input.

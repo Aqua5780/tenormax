@@ -1,4 +1,5 @@
 #pragma once
+#include "activities/X3ActivityLayout.h"
 
 #include <functional>
 #include <memory>
@@ -22,6 +23,8 @@ enum class CalibreConnectState { WIFI_SELECTION, SERVER_STARTING, SERVER_RUNNING
  * but renders Calibre-specific instructions instead of the web transfer UI.
  */
 class CalibreConnectActivity final : public Activity {
+  x3activity::InfoPages x3Info;
+
   CalibreConnectState state = CalibreConnectState::WIFI_SELECTION;
 
   std::unique_ptr<CrossPointWebServer> webServer;
@@ -37,12 +40,15 @@ class CalibreConnectActivity final : public Activity {
   bool exitRequested = false;
 
   void renderServerRunning() const;
+  void renderUgly() const;
 
   void onWifiSelectionComplete(bool connected);
   void startWebServer();
   void stopWebServer();
 
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Network; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_CALIBRE_WIRELESS); }
   explicit CalibreConnectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : Activity("CalibreConnect", renderer, mappedInput) {}
   void onEnter() override;

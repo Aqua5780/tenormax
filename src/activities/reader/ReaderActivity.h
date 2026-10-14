@@ -1,11 +1,14 @@
 #pragma once
 
+#include <BlePageTurner.h>
+
 #include <atomic>
 #include <memory>
 #include <string>
 #include <utility>
 
 #include "EndOfBookOptions.h"
+#include "ReaderPace.h"
 #include "activities/Activity.h"
 
 // Page-turn and paint trace lines (RDR_TRACE, ERS_TRACE). Acceptance builds carry them,
@@ -25,9 +28,27 @@ class ReaderActivity : public Activity {
   void drawPreviewFooter() const;
   uint8_t readerStatusBarHeight() const;
   void readingMargins(int& top, int& right, int& bottom, int& left) const;
+  readerstatus::Pace readingPace;
+  virtual readerstatus::Pace::Position pacePosition() const { return {}; }
+  virtual uint32_t paceLayoutKey() const { return 0; }
 
   std::unique_ptr<EndOfBookOptions> endOfBookOptions;
   std::atomic<bool> endOfBookOptionsReady{false};
+  // Set by the render task once a laid-out page (or the end-of-book screen) is on the panel;
+  // commitOpen() remembers the book only then.
+  std::atomic<bool> pageRendered{false};
+  void markPageRendered() { pageRendered.store(true, std::memory_order_release); }
+
+  // The page turner's link note (bleturner::linkNote) in place of the status bar's title. Called
+  // where the title is about to be drawn: true when `title` now holds the note. It remembers the
+  // note it drew, so onTick redraws the status bar when the note changes.
+  bool linkNoteTitle(std::string& title) const;
+  // The note the status bar last drew and whether it drew the title slot at all. Under RenderLock.
+  mutable bleturner::LinkNote linkNoteDrawn = bleturner::LinkNote::None;
+  mutable bool linkNoteInTitle = false;
+  // The note changed since the status bar showed it: paint the page again. EPUB redraws its status
+  // bar alone where the panel allows it.
+  virtual void redrawLinkNote() { requestUpdate(); }
 
   explicit ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
                           std::string bookPath, bool allowFastInitialRefresh);
@@ -136,7 +157,11 @@ class ReaderActivity : public Activity {
   // Asked on the main task right before the page-turner radio starts: frees what the reader can
   // build again, so the radio's stack does not split the heap around it. False while it cannot yet
   // (its page is painting); the radio waits for a later pass.
-  virtual bool readyForRadio() { return true; }
+  virtual bool yieldForRadio() { return true; }
+
+  // True while a sheet (the reader menu) covers the page: the page-turner radio stopped before it was
+  // drawn and stays off until the page is back in front.
+  virtual bool coversPage() const { return false; }
 
   static std::unique_ptr<ReaderActivity> create(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                 std::string path, bool allowFastInitialRefresh, bool preview = false);

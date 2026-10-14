@@ -3,10 +3,15 @@
 #include <BoardConfig.h>
 #include <Memory.h>
 
+#include <cstdlib>
+#include <cstring>
+
 #include "MenuCustomization.h"
 #include "SdCardFontSystem.h"
 #include "SettingsList.h"
-#include "activities/settings/DongHoSettingsActivity.h"
+#include "shells/ugly/UglyLevel.h"
+#include "activities/settings/ClockSettingsActivity.h"
+#include "activities/settings/InfoUpdateActivity.h"
 #include "activities/settings/KOReaderSettingsActivity.h"
 #include "activities/settings/OpdsServerListActivity.h"
 #include "activities/settings/StatusBarSettingsActivity.h"
@@ -14,10 +19,14 @@
 namespace menufavorites {
 namespace {
 constexpr Descriptor ITEMS[] = {
-    {"clock/clockFormat", StrId::STR_CLOCK_FORMAT, "clock", 0, 0},
-    {"clock/clockUtcOffsetQ", StrId::STR_CLOCK_UTC_OFFSET, "clock", 0, 1},
-    {"clock/sync", StrId::STR_CLOCK_SYNC_NOW, "clock", 0, 2},
-    {"clock/clockAutoTimezone", StrId::STR_CLOCK_AUTO_TIMEZONE, "clock", 0, 3},
+    // Row indices match ClockSettingsActivity's MenuItem enum (#3562 replaced
+    // the old UTC-offset picker with a named timezone + DST picker).
+    {"clock/clockTimezone", StrId::STR_TIMEZONE, "clock", 0, 0},
+    {"clock/clockDst", StrId::STR_CLOCK_DST, "clock", 0, 1},
+    {"clock/clockFormat", StrId::STR_CLOCK_FORMAT, "clock", 0, 2},
+    {"clock/clockShowInHeader", StrId::STR_CLOCK_IN_HEADER, "clock", 0, 3},
+    {"clock/sync", StrId::STR_CLOCK_SYNC_NOW, "clock", 0, 4},
+    {"clock/clockAutoTimezone", StrId::STR_CLOCK_AUTO_TIMEZONE, "clock", 0, 5},
     {"status/statusBarChapterPageCount", StrId::STR_CHAPTER_PAGE_COUNT, "status", 0, 0},
     {"status/statusBarBookProgressPercentage", StrId::STR_BOOK_PROGRESS_PERCENTAGE, "status", 0, 1},
     {"status/statusBarProgressBar", StrId::STR_PROGRESS_BAR, "status", 0, 2},
@@ -89,28 +98,21 @@ StrId label(const std::string& key, const std::vector<SettingInfo>& settings) {
   if (key.rfind("settings/", 0) == 0) {
     for (const auto& info : settings) {
       if (settingHiddenOnThisBoard(info) || !info.key || key.compare(9, std::string::npos, info.key) != 0) continue;
-      if (SETTINGS.uiTheme == CrossPointSettings::TENOR_UI &&
-          info.valuePtr == &CrossPointSettings::hideBatteryPercentage)
+      if (info.valuePtr == &CrossPointSettings::uiUglyLevel && !ugly::logic::levelRowShown(SETTINGS.uiShell))
         return StrId::STR_NONE_OPT;
       if (info.valuePtr == &CrossPointSettings::fadingFix && (BoardConfig::isX4Pro() || BoardConfig::isX4Classic()))
         return StrId::STR_NONE_OPT;
       if (info.valuePtr == &CrossPointSettings::pwrBtnFootnoteBack &&
           SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::FOOTNOTES)
         return StrId::STR_NONE_OPT;
-      if ((info.valuePtr == &CrossPointSettings::tenorButtonSymbols ||
-           info.valuePtr == &CrossPointSettings::tenorSideArrows) &&
-          SETTINGS.uiTheme != CrossPointSettings::TENOR_UI)
-        return StrId::STR_NONE_OPT;
-      if (SETTINGS.uiTheme == CrossPointSettings::TENOR_UI && info.valuePtr == &CrossPointSettings::statusBarClock)
-        return StrId::STR_STATUS_CORNERS;
+      if (info.valuePtr == &CrossPointSettings::statusBarClock) return StrId::STR_STATUS_CORNERS;
       return info.nameId;
     }
   }
-  if (SETTINGS.uiTheme == CrossPointSettings::TENOR_UI && key == "action/2")
-    return StrId::STR_STATUS_CORNERS;
+  if (key == "action/2") return StrId::STR_STATUS_CORNERS;
   const auto* item = find(key);
   if (!item) return StrId::STR_NONE_OPT;
-  if (SETTINGS.uiTheme == CrossPointSettings::TENOR_UI && strcmp(item->screen, "status") == 0)
+  if (strcmp(item->screen, "status") == 0)
     return key == "status/statusBarClock" ? StrId::STR_STATUS_CORNERS : StrId::STR_NONE_OPT;
   if (key == "action/1" && BoardConfig::hasTouch()) return StrId::STR_NONE_OPT;
   return item->label;
@@ -119,14 +121,13 @@ std::string value(const std::string& key, const std::vector<SettingInfo>& settin
   const char* canonical = menucustom::canonicalPinKey(key.c_str());
   if (canonical != key.c_str()) return value(canonical, settings);
   const auto* item = find(key);
-  if (SETTINGS.uiTheme == CrossPointSettings::TENOR_UI &&
-      (key == "status/statusBarClock" || key == "settings/statusBarClock" || key == "action/2")) {
+  if (key == "status/statusBarClock" || key == "settings/statusBarClock" || key == "action/2") {
     for (const auto& info : settings) {
       if (info.valuePtr == &CrossPointSettings::statusBarClock)
         return SettingsActivity::settingValueText(buildTenorClockPlacementSetting(info));
     }
   }
-  if (item && strcmp(item->screen, "clock") == 0) return DongHoSettingsActivity::giaTriDong(item->row);
+  if (item && strcmp(item->screen, "clock") == 0) return ClockSettingsActivity::giaTriDong(item->row);
   if (item && strcmp(item->screen, "text") == 0) {
     if (item->tab == 2) return TextSettingsActivity::layoutValueText(item->row);
     if (item->tab == 3) return TextSettingsActivity::styleValueText(item->row);
@@ -162,16 +163,15 @@ std::unique_ptr<UiListActivity> open(const std::string& key, GfxRenderer& render
   const auto* item = find(key);
   std::unique_ptr<UiListActivity> result;
   bool activate = true;
-  std::string launchKey = key;
-  if (key == "settings/statusBarClock" && SETTINGS.uiTheme != CrossPointSettings::TENOR_UI) {
-    result = makeUniqueNoThrow<StatusBarSettingsActivity>(renderer, input);
-    launchKey = "status/statusBarClock";
+  if (key.rfind("action/", 0) == 0 &&
+      infoupdate::holds(static_cast<settingstabs::Action>(atoi(key.c_str() + strlen("action/"))))) {
+    result = makeUniqueNoThrow<InfoUpdateActivity>(renderer, input);
   } else if (key.rfind("settings/", 0) == 0 || key.rfind("action/", 0) == 0) {
     result = makeUniqueNoThrow<SettingsActivity>(renderer, input);
   } else if (!item) {
     return nullptr;
   } else if (strcmp(item->screen, "clock") == 0) {
-    result = makeUniqueNoThrow<DongHoSettingsActivity>(renderer, input);
+    result = makeUniqueNoThrow<ClockSettingsActivity>(renderer, input);
   } else if (strcmp(item->screen, "kosync") == 0) {
     result = makeUniqueNoThrow<KOReaderSettingsActivity>(renderer, input);
   } else if (strcmp(item->screen, "status") == 0) {
@@ -183,7 +183,7 @@ std::unique_ptr<UiListActivity> open(const std::string& key, GfxRenderer& render
   } else if (strcmp(item->screen, "opds") == 0) {
     result = makeUniqueNoThrow<OpdsServerListActivity>(renderer, input);
   }
-  if (result) result->launchFavorite(launchKey, activate);
+  if (result) result->launchFavorite(key, activate);
   return result;
 }
 }  // namespace menufavorites

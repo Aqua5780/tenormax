@@ -1,3 +1,4 @@
+#include "activities/reader/ReaderPace.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
@@ -31,6 +32,8 @@ struct Heap {
   unsigned getMaxAllocHeap() const { return 60000; }
   unsigned getMinFreeHeap() const { return 48000; }
 } ESP;
+// The settings catalog (SettingsList.h): nothing to return in this projection.
+inline void releaseBaseSettingsList() {}
 struct RenderLock {
   struct TryTake {};
   static inline bool busy = false;
@@ -42,6 +45,8 @@ struct RenderLock {
 };
 struct ActivityManager {
   uint32_t generation = 1;
+  bool toReaderPage = false;
+  bool returningToReaderPage() const { return toReaderPage; }
   uint32_t activityGeneration() const { return generation; }
   // Writes left for the next screen's first frame (deferWrite); nextScreenFramed runs them.
   std::vector<void (*)()> deferred;
@@ -77,11 +82,19 @@ PageTurns detectPageTurn(MappedInput&) {
   return turns;
 }
 }  // namespace ReaderUtils
+// The tap tip only draws over a page; the exit closes it.
+namespace readertip { inline void close() {} }
 struct Settings {
   enum { FONT_SIZE_STEP = 1, CHAPTER_SKIP = 2 };
   uint8_t longPressButtonBehavior = 0;
 } SETTINGS;
+// The page turner module: a page turn gives a Failed link note back to the title.
+namespace bleturner {
+inline void acknowledgeLinkNote() {}
+}  // namespace bleturner
 struct ReaderActivity {
+  readerstatus::Pace readingPace;
+  virtual readerstatus::Pace::Position pacePosition() const { return {}; }
   static constexpr int8_t MAX_QUEUED_TURNS = 8;
   int8_t pendingExternalTurn = 0;
   bool pendingTurnIsLocal = false;
@@ -199,6 +212,10 @@ struct EpubReaderActivity : ReaderActivity {
   void drainThenInput(bool prevTriggered, bool prevPageTriggered, bool touchTriggered, bool fromTilt);
   void externalThenInput(bool prevTriggered, bool prevPageTriggered, bool touchTriggered, bool fromTilt);
   void cancelManualForReaderMenu();
+  bool xemTruoc = false;
+  void panelClosedLocked(bool,bool) {}
+  void panelClosed(bool leaving = false, bool frameUp = false) {}
+  void dropCatchUp() {}
 @@EPUB_ON_PAUSE@@
   void onExit() override;
 };

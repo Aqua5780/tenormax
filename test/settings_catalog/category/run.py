@@ -46,7 +46,7 @@ def method_slice(text, signature):
 include_paths = [
     'test/host_stubs', 'src', '.pio/libdeps/gh_release/ArduinoJson/src',
     'lib/Epub', 'lib/Logging', 'lib/EpdFont', 'lib/Serialization',
-    'lib/KOReaderSync', 'freeink-sdk/libs/hardware/BoardConfig/include',
+    'lib/KOReaderSync', 'freeink-sdk/libs/hardware/BoardConfig/include', 'lib/BlePageTurner/include',
     'freeink-sdk/libs/ui/FreeInkUI/include',
 ]
 includes = ['-I' + str(I18N), *['-I' + str(ROOT / path) for path in include_paths]]
@@ -103,13 +103,30 @@ for mode in modes:
     descriptor = header[header.index('enum class SettingType'):
                         header.index('class SettingsActivity final')]
     (output / 'activities/settings/SettingsActivity.h').write_text(
-        '#pragma once\n#include <functional>\n#include <string>\n#include <vector>\n'
+        '#pragma once\n#include <functional>\n#include <span>\n#include <string>\n#include <vector>\n'
         '#include <I18n.h>\n#include "CrossPointSettings.h"\n'
-        '#include "activities/settings/SettingsTabs.h"\n' + descriptor)
+        '#include "activities/settings/SettingsTabs.h"\n'
+        '#include "components/SettingsChoiceStyle.h"\n'
+        'namespace tenorchrome {\n'
+        '#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO\n'
+        'constexpr bool kTouchShell = true;\n'
+        '#else\n'
+        'constexpr bool kTouchShell = false;\n'
+        '#endif\n}\n' + descriptor)
     methods = method_slice(sources[paths[2]],
                            'std::vector<SettingInfo>& SettingsActivity::danhSachCuaThe')
-    methods += method_slice(sources[paths[2]], 'void SettingsActivity::rebuildSettingsLists()')
+    methods += method_slice(sources[paths[2]], 'bool SettingsActivity::listedAsRow(')
+    methods += method_slice(sources[paths[2]], 'void SettingsActivity::rebuildSettingsLists(')
     (output / 'CategoryMethods.inc').write_text(methods)
+    settings = read('src/CrossPointSettings.cpp')
+    status_marker = 'namespace {\n// What each reader status bar mode shows'
+    if status_marker in settings:
+        status_start = settings.index(status_marker)
+        status_end = settings.index('ReaderRenderSpec CrossPointSettings::readerRenderSpec')
+        status_items = settings[status_start:status_end]
+    else:
+        status_items = ''
+    (output / 'StatusItems.inc').write_text(status_items)
     for name in ['HalTiltSensor', 'HalClock']:
         instance = name[0].lower() + name[1:]
         (output / f'{name}.h').write_text(
@@ -139,14 +156,13 @@ for mode in modes:
 fixture = json.loads((HERE / 'expected-rows.json').read_text())
 updated_fixture = {}
 results = []
-for board, tenor, rtc, footnotes, dictionaries in itertools.product(
-        ['x3', 'x4', 'pro'], [0, 1], [0, 1], [0, 1], [0, 1]):
+for board, rtc, footnotes, dictionaries in itertools.product(
+        ['x3', 'x4', 'pro'], [0, 1], [0, 1], [0, 1]):
     pair = {}
-    case = '-'.join(map(str, [board, tenor, rtc, footnotes, dictionaries]))
+    case = '-'.join(map(str, [board, rtc, footnotes, dictionaries]))
     for mode in modes:
         binary = OUT / mode / ('pro' if board == 'pro' else 'c3')
-        command = [str(binary), '--enforce', board, str(tenor), str(rtc),
-                   str(footnotes), str(dictionaries)]
+        command = [str(binary), '--enforce', board, str(rtc), str(footnotes), str(dictionaries)]
         run = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         (OUT / mode / (case + '.stderr')).write_text(run.stderr)
         (OUT / mode / (case + '.json')).write_text(run.stdout)

@@ -52,12 +52,6 @@ bool HalClock::hasValidTime() const {
   return readSystemTime(utc);
 }
 
-bool HalClock::getTime(uint8_t& hour, uint8_t& minute) const {
-  uint16_t year;
-  uint8_t month, day;
-  return getDateTime(year, month, day, hour, minute);
-}
-
 bool HalClock::getDateTime(uint16_t& year, uint8_t& month, uint8_t& day, uint8_t& hour, uint8_t& minute) const {
   struct tm utc = {};
   if (!readSystemTime(utc)) return false;
@@ -69,29 +63,55 @@ bool HalClock::getDateTime(uint16_t& year, uint8_t& month, uint8_t& day, uint8_t
   return true;
 }
 
-bool HalClock::formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased, bool use12Hour) const {
+bool HalClock::utcOffsetMinutes(int& minutes) const {
+  struct tm utc = {};
+  if (!readSystemTime(utc)) return false;
+  const time_t now = time(nullptr);
+  struct tm local = {};
+  localtime_r(&now, &local);
+  int days = local.tm_yday - utc.tm_yday;
+  if (days > 1) days = -1;  // local is still on 31 Dec while UTC reached 1 Jan
+  if (days < -1) days = 1;  // local reached 1 Jan while UTC is still on 31 Dec
+  minutes = days * 1440 + (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
+  return true;
+}
+
+void HalClock::setTimezone(const char* posixTz) {
+  setenv("TZ", posixTz && posixTz[0] != '\0' ? posixTz : "UTC0", 1);
+  tzset();
+}
+
+// The system clock is the one time source: begin() seeds it from the RTC and
+// syncFromNTP() sets it, so a board without an RTC shows the time after NTP,
+// and reading it keeps the RTC bus quiet.
+bool HalClock::localTime(struct tm& out) const {
+  struct tm utc = {};
+  if (!readSystemTime(utc)) return false;
+  const time_t now = time(nullptr);
+  localtime_r(&now, &out);
+  return true;
+}
+
+bool HalClock::getTime(uint8_t& hour, uint8_t& minute) const {
+  struct tm local;
+  if (!localTime(local)) return false;
+  hour = static_cast<uint8_t>(local.tm_hour);
+  minute = static_cast<uint8_t>(local.tm_min);
+  return true;
+}
+
+bool HalClock::formatTime(char* buf, size_t bufSize, bool use12Hour) const {
   if (bufSize < (use12Hour ? 9u : 6u)) return false;
-  uint8_t h, m;
-  if (!getTime(h, m)) return false;
+  struct tm local;
+  if (!localTime(local)) return false;
 
-  // Apply UTC offset: convert biased value to signed quarter-hours.
-  // Clamp against corrupted persisted values so display time can't drift outside [-12:00, +14:00].
-  if (utcOffsetQuarterHoursBiased > 104) utcOffsetQuarterHoursBiased = 104;
-  int offsetQuarterHours = static_cast<int>(utcOffsetQuarterHoursBiased) - 48;
-  int totalMinutes = static_cast<int>(h) * 60 + static_cast<int>(m) + offsetQuarterHours * 15;
-
-  // Wrap around 24 hours
-  totalMinutes = ((totalMinutes % 1440) + 1440) % 1440;
-
-  const int hour24 = totalMinutes / 60;
-  const int min = totalMinutes % 60;
   if (use12Hour) {
-    const bool pm = hour24 >= 12;
-    int hour12 = hour24 % 12;
+    const bool pm = local.tm_hour >= 12;
+    int hour12 = local.tm_hour % 12;
     if (hour12 == 0) hour12 = 12;
-    snprintf(buf, bufSize, "%d:%02d %s", hour12, min, pm ? "PM" : "AM");
+    snprintf(buf, bufSize, "%d:%02d %s", hour12, local.tm_min, pm ? "PM" : "AM");
   } else {
-    snprintf(buf, bufSize, "%02d:%02d", hour24, min);
+    snprintf(buf, bufSize, "%02d:%02d", local.tm_hour, local.tm_min);
   }
   return true;
 }
@@ -103,6 +123,11 @@ bool HalClock::syncFromNTP() {
   }
 
   LOG_INF("CLK", "Starting NTP sync...");
+  // configTzTime overwrites the process TZ with UTC0 for the SNTP exchange;
+  // remember the display timezone so it can be restored below.
+  const char* tzBefore = getenv("TZ");
+  char savedTz[64] = {0};
+  if (tzBefore) snprintf(savedTz, sizeof(savedTz), "%s", tzBefore);
   configTzTime("UTC0", "pool.ntp.org", "time.nist.gov");
 
   // Wait for SNTP sync to complete (up to 5 seconds)
@@ -117,7 +142,10 @@ bool HalClock::syncFromNTP() {
         return false;
       }
       LOG_INF("CLK", "System time synced from NTP");
-      if (!_available) return true;
+      if (!_available) {
+        setTimezone(savedTz);
+        return true;
+      }
 
       Rtc::DateTime dt;
       dt.year = static_cast<uint16_t>(timeinfo.tm_year + 1900);
@@ -133,11 +161,15 @@ bool HalClock::syncFromNTP() {
       } else {
         LOG_ERR("CLK", "RTC write failed; system time remains synced");
       }
+      // A failed RTC write does not fail the sync: system time (used by HTTPS
+      // and by readSystemTime()/getDateTime() above) is already usable.
+      setTimezone(savedTz);
       return true;
     }
     delay(100);
   }
 
   LOG_ERR("CLK", "NTP sync timed out");
+  setTimezone(savedTz);
   return false;
 }

@@ -1,26 +1,35 @@
 #include "ActivityManager.h"
 
+#include <BlePageTurner.h>
 #include <BoardConfig.h>
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <HalDisplay.h>
 #include <HalMemory.h>
+#include <HalFrontlight.h>
 #include <HalPowerManager.h>
 #include <Memory.h>
+#include <VectorFontSupport.h>
 
 #include <algorithm>
+#include <cstring>
 
 #include "CrossPointSettings.h"
+#include "shells/ugly/UglyIconInk.h"
+#include "shells/ugly/UglyMarkSeed.h"
 #include "CrossPointState.h"
-#include "BlePageTurnerRuntime.h"
 #include "OpdsServerStore.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
+#include "components/HeaderBackTapTarget.h"
+#include "components/PageScrollbar.h"
+#include "components/ReaderTapTip.h"
+#include "components/TenorMenuChrome.h"
 #include "home/CrashActivity.h"
 #include "home/FileBrowserActivity.h"
 #include "home/HomeActivity.h"
-#include "home/RecentBooksActivity.h"
+#include "shells/Shell.h"
 #include "network/CrossPointWebServerActivity.h"
 #include "network/UsbDriveActivity.h"
 #include "reader/ReaderActivity.h"
@@ -48,19 +57,228 @@ namespace {
 void (*deferredWrites[4])() = {};
 std::atomic<bool> frameAfterDeferredWrite{false};
 std::atomic<bool> frameDrawn{false};
+// The activity generation whose frame was painted last.
+std::atomic<uint32_t> frameDrawnGeneration{0};
 }  // namespace
 
+// Where a book opened from tenor/ugly goes on Home: the diary (NONE).
+constexpr HomeMenuItem UGLY_HOME_FROM_BOOK = HomeMenuItem::NONE;
+
+// The one answer to "where does Home go", for the Home key and the swipe up from the bottom edge alike: on touch,
+// the desk for Ugly and Recent for Cross; on buttons, the shell's first screen.
+HomeMenuItem ActivityManager::homeKeyTarget() const {
+  if (!tenorchrome::kTouchShell) return HomeMenuItem::NONE;
+  if (!shell::isUgly()) return HomeMenuItem::RECENTS;
+  return isReaderActivity() ? UGLY_HOME_FROM_BOOK : HomeMenuItem::DESK;
+}
+
+const char* ActivityManager::currentName() const { return currentActivity ? currentActivity->name.c_str() : nullptr; }
+
+namespace {
+// Touch shell: the frame about to reach the panel gets the dynamic bar the screen in front declares.
+// The reader's tap-zone map, over the reader's own frames only (not a panel or the sleep screen above it).
+void drawTapTip(const GfxRenderer& r) {
+  const char* name = activityManager.currentName();
+  if (readertip::isOpen() && name && std::strcmp(name, "EpubReader") == 0) readertip::draw(r);
+}
+void drawFootBar(const GfxRenderer& r) {
+  tenorchrome::drawFootBar(r, tenorchrome::footBarFor(activityManager.currentName()), activityManager.footZone());
+  drawTapTip(r);
+  activityManager.drawLightGesture(r);
+}
+void saveGestureLight() { SETTINGS.saveToFile(); }
+void drawGrayLightGesture(const GfxRenderer& r) {
+  drawTapTip(r);
+  activityManager.drawLightGesture(r);
+}
+}  // namespace
+
+void ActivityManager::drawLightGesture(const GfxRenderer& r) const {
+  lightGesture.draw(r, tenorchrome::touchBarTop(r.getScreenHeight()));
+}
+
+void ActivityManager::deferLightGestureSave() {
+  if (!lightGesture.dirty) return;
+  lightGesture.dirty = false;
+  deferWrite(&saveGestureLight);
+}
+
+// The level the two-finger gesture shows, onto the light: brightness (0 = off, the brightness kept for the
+// next step up) or warmth.
+bool ActivityManager::applyLightLevel() {
+  if (!lightGesture.vertical) {
+    if (Frontlight.hasColorTemperature()) Frontlight.setWarmth(lightGesture.value);
+  } else if (lightGesture.value) {
+    Frontlight.setBrightness(lightGesture.value);
+    Frontlight.setOn(true);
+  } else {
+    Frontlight.setOn(false);
+  }
+  return true;
+}
+
+// Two fingers set the light while they move (FrontlightGesture). The light changes on this pass; the level
+// shows on the next frame the render task draws. True while two fingers are down or their release is being
+// consumed, so no screen reads them as a tap or a swipe.
+bool ActivityManager::handleLightGesture() {
+  if (!BoardConfig::isX4Pro()) return false;
+  uint8_t down = 0;
+  int x = 0, y = 0;
+  const bool two = mappedInput.touchContactsAt(down, x, y) && down == 2;
+  uint8_t contacts = 0;
+  int dx = 0, dy = 0;
+  unsigned long ms = 0;
+  const bool released = mappedInput.popMultiTouchSwipe(contacts, dx, dy, &ms);
+  if (!two && !released && !lightGesture.following()) return false;
+  if (!two) lightGesture.lift();
+  if (!Frontlight.present()) return true;
+  // ponytail: the render task reads these few bytes without the render lock (a torn read draws one stale
+  // number for one frame); taking the lock here would hold the light until the panel finished a refresh.
+  const uint32_t now = millis();
+  bool changed = false;
+  if (two && lightGesture.follow(x, y, Frontlight.brightness(), Frontlight.warmth(), Frontlight.isOn(), now)) {
+    changed = applyLightLevel();
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("LGT", "step %s=%u t=%lu", lightGesture.vertical ? "bright" : "warm", lightGesture.value, now);
+#endif
+  }
+  if (released && contacts == 2) {
+    if (lightGesture.flick(dx, dy, ms, Frontlight.brightness(), now)) {
+      changed = true;
+      Frontlight.setBrightness(lightGesture.keep);
+      Frontlight.setOn(false);
+#ifdef TENOR_PRESS_PROBE
+      LOG_INF("LGT", "flick off keep=%u t=%lu", lightGesture.keep, now);
+#endif
+    } else if (lightGesture.settle(dx, dy, ms, Frontlight.brightness(), Frontlight.warmth(), Frontlight.isOn(), now)) {
+      changed = applyLightLevel();
+    }
+  }
+#ifdef TENOR_PRESS_PROBE
+  if (released) LOG_INF("LGT", "release contacts=%u dx=%d dy=%d ms=%lu", contacts, dx, dy, ms);
+#endif
+  if (!changed) return true;
+  lightGesture.dirty = lightGesture.dirty || SETTINGS.frontlightBrightness != Frontlight.brightness() ||
+                       SETTINGS.frontlightWarmth != Frontlight.warmth() ||
+                       SETTINGS.frontlightOn != (Frontlight.isOn() ? 1 : 0);
+  SETTINGS.frontlightBrightness = Frontlight.brightness();
+  SETTINGS.frontlightWarmth = Frontlight.warmth();
+  SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
+  requestUpdate();
+  return true;
+}
+
+// The top menu: the light panel, over whatever screen asked for it (not over itself).
+void ActivityManager::openTopMenu() {
+  if (currentActivity && currentActivity->name == "FrontlightPanel") return;
+  pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
+}
+
+HomeMenuItem ActivityManager::zoneOrigin() const {
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  if (shell::isUgly()) {
+    for (auto it = stackActivities.rbegin(); it != stackActivities.rend(); ++it)
+      if (*it && (*it)->zoneRoot() != HomeMenuItem::NONE) return (*it)->zoneRoot();
+    return HomeMenuItem::NONE;
+  }
+#endif
+  return homeMenuOrigin();
+}
+
+std::vector<tenorchrome::X3PathNode> ActivityManager::x3NavigationPath(const char* title) const {
+  using tenorchrome::X3PathIcon;
+  X3PathIcon root = X3PathIcon::Recent;
+  switch (footZone()) {
+    case tenorchrome::Zone::File: root = X3PathIcon::File; break;
+    case tenorchrome::Zone::Favorites: root = X3PathIcon::Favorites; break;
+    case tenorchrome::Zone::Stats: root = X3PathIcon::Stats; break;
+    case tenorchrome::Zone::Settings: root = X3PathIcon::Settings; break;
+    case tenorchrome::Zone::Book: root = X3PathIcon::Book; break;
+    case tenorchrome::Zone::Recent: break;
+  }
+  if (currentActivity && currentActivity->name == "Settings") root = X3PathIcon::Settings;
+  std::vector<tenorchrome::X3PathNode> nodes{{root, ""}};
+  if (x3NavigationIsFilePath()) {
+    nodes.front().icon = X3PathIcon::File;
+  } else {
+    bool reading = false;
+    std::string previousName;
+    for (const auto& activity : stackActivities) {
+      if (!activity || activity->isHomeActivity()) continue;
+      if (activity->name == "Settings" && !reading) nodes.front().icon = X3PathIcon::Settings;
+      if (activity->isReaderActivity()) {
+        reading = true;
+        nodes.front().icon = X3PathIcon::Book;
+        continue;
+      }
+      const auto label = activity->x3NavigationLabel();
+      // Tiers of the same screen in a row (the quotation books, then one book) are one pill.
+      if (!label.empty() && previousName != activity->name) nodes.push_back({activity->navigationIcon(), label});
+      previousName = activity->name;
+    }
+  }
+  nodes.push_back({currentActivity ? currentActivity->navigationIcon() : X3PathIcon::More, title ? title : ""});
+  return nodes;
+}
+
+bool ActivityManager::x3NavigationIsFilePath() const {
+  return currentActivity && currentActivity->name == "FileBrowser";
+}
+
+tenorchrome::Zone ActivityManager::footZone() const {
+  if (isReaderActivity()) return tenorchrome::Zone::Book;
+  switch (zoneOrigin()) {
+    case HomeMenuItem::FILE_BROWSER:
+      return tenorchrome::Zone::File;
+    case HomeMenuItem::STATS_TAB:
+      return tenorchrome::Zone::Stats;
+    case HomeMenuItem::SETTINGS_MENU:
+      return tenorchrome::Zone::Settings;
+    case HomeMenuItem::FAVORITES_TAB:
+      return tenorchrome::Zone::Favorites;
+    default:
+      return tenorchrome::Zone::Recent;
+  }
+}
+
+// The zone's icon in the bar: back to the book's page, or to the Home card the screen was reached from.
+// Each screen above the book closes as its Back would (a cancelled result), one per pass.
+void ActivityManager::goZoneRoot() {
+  if (!isReaderActivity()) {
+    goHome(zoneOrigin());
+    return;
+  }
+  if (currentActivity->isReaderActivity()) return;
+  toReaderPage = true;
+  currentActivity->result.isCancelled = true;
+  popActivity();
+}
+
 void ActivityManager::begin() {
+  if (tenorchrome::kTouchShell) {
+    GfxRenderer::preDisplayHook = &drawFootBar;
+    GfxRenderer::preGrayUploadHook = &drawGrayLightGesture;
+  }
 #if defined(configNUM_CORES) && configNUM_CORES > 1
   constexpr BaseType_t renderTaskCore = 1;
 #else
   constexpr BaseType_t renderTaskCore = 0;
 #endif
+#if CROSSPOINT_VECTOR_FONTS
+  // FreeType rasterization runs on this task, and the deepest observed chain
+  // is a glyph fault DURING LAYOUT: expat + parser + line-layout frames
+  // (~3.5KB on Xtensa) with the scan converter's FT_RENDER_POOL_SIZE (4KB)
+  // stack-resident band pool on top - a measured ~8KB peak that trips the
+  // canary on an 8KB stack. Vector-font boards all have PSRAM-class RAM.
+  constexpr uint32_t renderTaskStackBytes = 16384;
+#else
+  constexpr uint32_t renderTaskStackBytes = 8192;
+#endif
   xTaskCreatePinnedToCore(&renderTaskTrampoline, "ActivityManagerRender",
-                          8192,               // Stack size
-                          this,               // Parameters
-                          1,                  // Priority
-                          &renderTaskHandle,  // Task handle
+                          renderTaskStackBytes,  // Stack size
+                          this,                  // Parameters
+                          1,                     // Priority
+                          &renderTaskHandle,     // Task handle
                           renderTaskCore  // Keep long renders/cover decodes off CPU 0's idle watchdog when available
   );
   assert(renderTaskHandle != nullptr && "Failed to create render task");
@@ -78,12 +296,30 @@ void ActivityManager::renderTaskLoop() {
     // where the main task deletes the activity between the null-check and render().
     RenderLock lock;
     if (currentActivity && !sleepTransition) {
+      // A refresh still running from before (the wake notice) reads the framebuffer to the end:
+      // nothing draws over it until it is done. Without a notice there is nothing to wait for.
+      if (SleepActivity::takeWakeNoticeRunning()) renderer.waitRefreshComplete();
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
       // Night mode is a global output polarity applied to every activity.
       // The sleep screen forces normal polarity itself (SleepActivity).
       display.setInverted(SETTINGS.screenInverted != 0);
-      currentActivity->render(std::move(lock));
+      auto& scrollbar = PageScrollbar::instance();
+      scrollbar.activate(currentActivity.get());
+      if (shell::isUgly()) {
+        const uint64_t pageKey = currentActivity->uglyIconPageKey();
+        uint32_t candidate = 0;
+        if (currentActivity->uglyIconFrame.needsSeed(pageKey)) {
+          candidate = ugly::markSeed();
+        }
+        ugly::setIconFrameSeed(currentActivity->uglyIconFrame.bind(pageKey, candidate));
+      }
+      if (!scrollbar.renderIdleUpdate(renderer, mappedInput)) {
+        scrollbar.beginPaint();
+        if (!currentActivity->renderIdleUpdate()) currentActivity->render(std::move(lock));
+        scrollbar.endPaint();
+      }
       frameAfterDeferredWrite.store(true, std::memory_order_release);
+      frameDrawnGeneration.store(activityGeneration_, std::memory_order_release);
       frameDrawn.store(true, std::memory_order_release);
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
@@ -99,9 +335,29 @@ void ActivityManager::renderTaskLoop() {
 }
 
 void ActivityManager::loop() {
+#ifdef TENOR_PRESS_PROBE
+  // Real contacts, for latency from the controller's report to the panel ("Wait complete"): a finger down,
+  // a finger up with how long it was held, and the count of contacts when it changes.
+  {
+    float nx = 0, ny = 0;
+    if (gpio.wasTouchDown(nx, ny)) LOG_INF("TCH", "down x=%.3f y=%.3f t=%lu", nx, ny, millis());
+    if (gpio.wasTouchReleased()) LOG_INF("TCH", "up held=%lu t=%lu", gpio.lastTouchHeldMs(), millis());
+    static uint8_t lastContacts = 0;
+    uint8_t contacts = 0;
+    int cx = 0, cy = 0;
+    mappedInput.touchContactsAt(contacts, cx, cy);
+    if (contacts != lastContacts) LOG_INF("TCH", "contacts=%u t=%lu", contacts, millis());
+    lastContacts = contacts;
+  }
+#endif
   if (mappedInput.consumeSuppressedRelease()) return;
 
   if (currentActivity && currentActivity->requiresExclusiveStorageLoop()) {
+    // Drain a classified multi-contact release while USB owns storage. It must
+    // never become a single-contact action or a deferred settings write.
+    uint8_t contacts = 0;
+    int dx = 0, dy = 0;
+    mappedInput.popMultiTouchSwipe(contacts, dx, dy);
     currentActivity->loop();
     // An exclusive-storage activity must restart rather than navigate away:
     // processing a pending action here could re-enable filesystem users while
@@ -110,6 +366,14 @@ void ActivityManager::loop() {
       xTaskNotify(renderTaskHandle, 1, eIncrement);
     }
     return;
+  }
+
+  if (!sleepTransition && pendingAction == PendingAction::None && handleLightGesture()) return;
+  if (lightGesture.expired(millis())) {
+    RenderLock lock;
+    lightGesture.visible = false;
+    deferLightGestureSave();
+    requestUpdate();
   }
 
   // The next screen's first frame is up: now the writes the screen before it left (deferWrite),
@@ -121,38 +385,78 @@ void ActivityManager::loop() {
 
   if (currentActivity && !sleepTransition && pendingAction == PendingAction::None) {
     const bool heldBack = mappedInput.wasLongPressed(MappedInputManager::Button::Back, 1000);
+    const bool bottomHome = mappedInput.wasBottomHomeGesture();
     if (!currentActivity->isHomeActivity() && (heldBack || mappedInput.wasHomeGesture())) {
+      const HomeMenuItem homeTarget = homeKeyTarget();
       if (currentActivity->saveInputBeforeHome()) {
         homeAfterInput = true;
+        homeAfterInputTarget = homeTarget;
         return;
       }
-      if (currentActivity->handleHomeGesture()) {
-        if (heldBack) homeAfterInput = true;
+      // A touch Ugly form saves on the way out, so both gestures go through it there, and land on the desk after.
+      const bool uglyTouch = tenorchrome::kTouchShell && shell::isUgly();
+      if ((!bottomHome || uglyTouch) && currentActivity->handleHomeGesture()) {
+        if (heldBack || uglyTouch) {
+          homeAfterInput = true;
+          homeAfterInputTarget = homeTarget;
+        }
         return;
       }
-      goHome();
+      goHome(homeTarget);
+      return;
+    }
+    // Touch, Ugly: Home from the diary or the notebook goes to the desk; on the desk it does nothing.
+    if (tenorchrome::kTouchShell && shell::isUgly() && currentActivity->isHomeActivity() && mappedInput.wasHomeGesture()) {
+      if (currentActivity->name != "UglyDesk") goHome(homeKeyTarget());
+      return;
+    }
+    // Touch: the Home key from the Home screen itself brings it back to its default card, Recent.
+    if (tenorchrome::kTouchShell && currentActivity->isHomeActivity() && mappedInput.wasHomeGesture() &&
+        (bottomHome || homeMenuOrigin() != HomeMenuItem::RECENTS)) {
+      goHome(HomeMenuItem::RECENTS);
       return;
     }
 
-    // Tap-first control-center entry: a tap on the status-bar band of the
-    // top-level tab screens opens it, mirroring the top-edge swipe (which some
-    // panels' etched glass makes unreliable). The reader keeps its clean page
-    // (no status bar there to tap). Touch boards only, like the swipe itself.
-    bool statusBarTap = false;
-    if (mappedInput.hasTouch() &&
-        (currentActivity->name == "Home" || currentActivity->name == "FileBrowser" ||
-         currentActivity->name == "Settings" || currentActivity->name == "NetworkModeSelection")) {
+    // Touch: the "B" of a remote that links blinks in the status strip (not over a book's page).
+    if (tenorchrome::kTouchShell && !currentActivity->isReaderActivity() && tenorchrome::bluetoothBlinkDue())
+      requestUpdate();
+
+    // Touch: the zone's icon in the dynamic bar.
+    if (tenorchrome::kTouchShell) {
       int tx = 0;
       int ty = 0;
-      statusBarTap = mappedInput.wasScreenTapped(tx, ty) && ty < 44;
+      if (mappedInput.wasScreenTapped(tx, ty) && HeaderBackTapTarget::zoneContains(tx, ty)) {
+        goZoneRoot();
+        return;
+      }
     }
-    if (currentActivity->name != "FrontlightPanel" && (statusBarTap || mappedInput.wasLightPanelGesture())) {
-      pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
+
+    // Tap-first control-center entry: a tap on the status band opens the top menu (the light panel),
+    // mirroring the top-edge swipe (which some panels' etched glass makes unreliable). Touch shell: on
+    // every screen that draws the strip, the strip alone, so a tap on the first row of a list is the
+    // row's; going back is the bar's "<". Other touch boards: the band of the top-level tab screens.
+    bool statusBarTap = false;
+    if (mappedInput.hasTouch() &&
+        (tenorchrome::kTouchShell ? HeaderBackTapTarget::strip
+                                  : currentActivity->name == "Home" || currentActivity->name == "FileBrowser" ||
+                                        currentActivity->name == "Settings" ||
+                                        currentActivity->name == "NetworkModeSelection")) {
+      int tx = 0;
+      int ty = 0;
+      // The header back button shares this band; its taps stay Back.
+      const int band = tenorchrome::kTouchShell ? tenorchrome::TOUCH_STRIP_HEIGHT : 44;
+      statusBarTap = mappedInput.wasScreenTapped(tx, ty) && ty < band && !HeaderBackTapTarget::contains(tx, ty);
+    }
+    // Both ways in are touch gestures, so a build without a touch board leaves the panel out.
+    if (BoardConfig::hasTouch() && currentActivity->name != "FrontlightPanel" &&
+        (statusBarTap || mappedInput.wasLightPanelGesture())) {
+      openTopMenu();
       return;
     }
 
     // Note: do not hold a lock here, the loop() method must be responsible for acquire one if needed
     currentActivity->onTick();
+    PageScrollbar::instance().noteInput(mappedInput);
     currentActivity->loop();
   }
 
@@ -163,11 +467,11 @@ void ActivityManager::loop() {
 #ifdef TENOR_PRESS_PROBE
     static uint32_t radioWaitFrom = 0;
     if (!radioWaitFrom) radioWaitFrom = millis() | 1;
-    if (!freeink::ble::suspendForTransition()) return;
+    if (!bleturner::beforeScreenChange(0, pendingActivity && pendingActivity->isReaderActivity())) return;
     LOG_INF("ACT", "Transition radio=%lu ms", static_cast<unsigned long>(millis() - radioWaitFrom));
     radioWaitFrom = 0;
 #else
-    if (!freeink::ble::suspendForTransition()) return;
+    if (!bleturner::beforeScreenChange(0, pendingActivity && pendingActivity->isReaderActivity())) return;
 #endif
     ++activityGeneration_;
 
@@ -189,8 +493,11 @@ void ActivityManager::loop() {
 
       if (stackActivities.empty()) {
         LOG_DBG("ACT", "No more activities on stack, going home");
+        const HomeMenuItem homeTarget = homeAfterInput ? homeAfterInputTarget : HomeMenuItem::NONE;
+        homeAfterInput = false;
+        homeAfterInputTarget = HomeMenuItem::NONE;
         lock.unlock();  // goHome may acquire its own lock
-        goHome();
+        goHome(homeTarget);
         continue;  // Will launch goHome immediately
 
       } else {
@@ -210,10 +517,22 @@ void ActivityManager::loop() {
         }
 
         if (homeAfterInput) {
+          const HomeMenuItem homeTarget = homeAfterInputTarget;
           homeAfterInput = false;
+          homeAfterInputTarget = HomeMenuItem::NONE;
           lock.unlock();
-          goHome();
+          goHome(homeTarget);
           continue;
+        }
+        // On the way down to the book's page (the zone icon): the next screen closes too.
+        if (toReaderPage) {
+          if (currentActivity->isReaderActivity()) {
+            toReaderPage = false;
+          } else if (pendingAction == PendingAction::None) {
+            currentActivity->result.isCancelled = true;
+            popActivity();
+            continue;
+          }
         }
         if (pendingAction == PendingAction::None) {
           lock.unlock();
@@ -234,6 +553,8 @@ void ActivityManager::loop() {
       RenderLock lock;
 
       if (pendingAction == PendingAction::Replace) {
+        homeAfterInput = false;
+        homeAfterInputTarget = HomeMenuItem::NONE;
         // Destroy the current activity
         exitActivity(lock);
         // Clear the stack
@@ -248,6 +569,11 @@ void ActivityManager::loop() {
           currentActivity->onPause();
         }
         stackActivities.push_back(std::move(currentActivity));
+        // The parent's header back rect must not route taps on the pushed
+        // screen (which may draw no header of its own).
+        HeaderBackTapTarget::clear();
+        HeaderBackTapTarget::clearFoot();
+        HeaderBackTapTarget::strip = false;
         LOG_DBG("ACT", "Pushed to activity stack, new size = %zu", stackActivities.size());
       }
       pendingAction = PendingAction::None;
@@ -267,6 +593,7 @@ void ActivityManager::loop() {
     }
   }
 
+  if (!requestedUpdate.load() && PageScrollbar::instance().needsIdleUpdate(mappedInput)) requestedUpdate = true;
   if (requestedUpdate.exchange(false)) {
     // Using direct notification to signal the render task to update
     // Increment counter so multiple rapid calls won't be lost
@@ -349,6 +676,8 @@ void ActivityManager::flushDeferredWrites() {
 
 void ActivityManager::closeForRestart() {
   RenderLock lock;
+  homeAfterInput = false;
+  homeAfterInputTarget = HomeMenuItem::NONE;
   exitActivity(lock);
   flushDeferredWrites();
 }
@@ -356,6 +685,8 @@ void ActivityManager::closeForRestart() {
 void ActivityManager::exitActivity(const RenderLock& lock) {
   // Note: lock must be held by the caller
   if (currentActivity) {
+    lightGesture.visible = false;
+    deferLightGestureSave();
     // What the screen before this one left is written before this one leaves anything.
     flushDeferredWrites();
     saveNavigation(*currentActivity);
@@ -388,9 +719,15 @@ void ActivityManager::restoreNavigation() {
             state.tab >= 0 && state.tab < state.count ? state.cursors[state.tab].selected : 0);
     requestUpdate();
   }
+  // The outgoing screen's header back button must not eat taps on the next
+  // screen; the next header draw re-records it.
+  HeaderBackTapTarget::clear();
+  HeaderBackTapTarget::clearFoot();
+  HeaderBackTapTarget::strip = false;
 }
 
 void ActivityManager::replaceActivity(std::unique_ptr<Activity>&& newActivity) {
+  mappedInput.resetHomeButtonInput();
   if (currentActivity && newActivity && currentActivity->remembersNavigation() && !newActivity->isHomeActivity() &&
       newActivity->name != "Sleep") {
     navigationMemory.enter(currentActivity->navigationMemoryKey(), newActivity->navigationMemoryKey());
@@ -435,10 +772,6 @@ void ActivityManager::goToSettings(const int theBanDau) {
 
 void ActivityManager::goToFileBrowser(std::string path) {
   replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path)));
-}
-
-void ActivityManager::goToRecentBooks() {
-  replaceActivity(std::make_unique<RecentBooksActivity>(renderer, mappedInput));
 }
 
 void ActivityManager::goToBrowser() {
@@ -511,13 +844,16 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
 }
 
 void ActivityManager::goHome(HomeMenuItem initialMenuItem, bool cleanInitialRefresh) {
-  if (initialMenuItem == HomeMenuItem::NONE) initialMenuItem = homeMenuOrigin();
+  // An Ugly form asked to save before Home, then goes Home on its own (to the notebook page it came from, or
+  // nowhere in particular): it lands where the gesture was going.
+  if (homeAfterInput && homeAfterInputTarget == HomeMenuItem::DESK)
+    initialMenuItem = HomeMenuItem::DESK;
+  // The saved cursor of the tenor/cross Home means nothing to another shell.
+  if (initialMenuItem == HomeMenuItem::NONE && !shell::isUgly()) initialMenuItem = homeMenuOrigin();
   if (initialMenuItem == HomeMenuItem::NONE && currentActivity) {
     const auto& activityName = currentActivity->name;
     if (activityName == "FileBrowser") {
       initialMenuItem = HomeMenuItem::FILE_BROWSER;
-    } else if (activityName == "RecentBooks") {
-      initialMenuItem = HomeMenuItem::RECENTS;
     } else if (activityName == "OpdsBookBrowser") {
       initialMenuItem = HomeMenuItem::OPDS_BROWSER;
     } else if (activityName == "CrossPointWebServer") {
@@ -526,7 +862,7 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem, bool cleanInitialRefr
       initialMenuItem = HomeMenuItem::SETTINGS_MENU;
     }
   }
-  replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem, cleanInitialRefresh));
+  replaceActivity(shell::makeHome(renderer, mappedInput, initialMenuItem, cleanInitialRefresh));
 }
 void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
@@ -538,6 +874,7 @@ bool ActivityManager::switchSettingsSibling(const int direction) {
 }
 
 void ActivityManager::pushActivity(std::unique_ptr<Activity>&& activity) {
+  mappedInput.resetHomeButtonInput();
   if (activity && currentActivity) {
     activity->navigationPrefix = currentActivity->navigationPrefix;
     const auto label = currentActivity->navigationLabel();
@@ -563,6 +900,7 @@ void ActivityManager::pushActivity(std::unique_ptr<Activity>&& activity) {
 }
 
 void ActivityManager::popActivity() {
+  mappedInput.resetHomeButtonInput();
   if (pendingActivity) {
     // Should never happen in practice
     LOG_ERR("ACT", "pendingActivity while popActivity is not expected");
@@ -595,12 +933,21 @@ bool ActivityManager::isForegroundReaderReady() const {
   return isForegroundReaderActivity() && static_cast<ReaderActivity*>(currentActivity.get())->isPageReady();
 }
 
+bool ActivityManager::isForegroundHomePainted() const {
+  return pendingAction == PendingAction::None && currentActivity && currentActivity->name == "Home" &&
+         frameDrawnGeneration.load(std::memory_order_acquire) == activityGeneration_;
+}
+
 bool ActivityManager::foregroundReaderHoldsRadio() const {
   return isForegroundReaderActivity() && static_cast<ReaderActivity*>(currentActivity.get())->holdsRadio();
 }
 
-bool ActivityManager::readyForegroundReaderForRadio() {
-  return !isForegroundReaderActivity() || static_cast<ReaderActivity*>(currentActivity.get())->readyForRadio();
+bool ActivityManager::foregroundReaderCoversPage() const {
+  return isForegroundReaderActivity() && static_cast<ReaderActivity*>(currentActivity.get())->coversPage();
+}
+
+bool ActivityManager::yieldForegroundReaderForRadio() {
+  return !isForegroundReaderActivity() || static_cast<ReaderActivity*>(currentActivity.get())->yieldForRadio();
 }
 
 bool ActivityManager::pageTurn(const bool forward) {
@@ -630,6 +977,7 @@ ScreenshotInfo ActivityManager::getScreenshotInfo() const {
 }
 
 void ActivityManager::requestUpdate(bool immediate) {
+  PageScrollbar::instance().cancelIdleRequest();
   if (immediate) {
     if (renderTaskHandle) {
       xTaskNotify(renderTaskHandle, 1, eIncrement);
@@ -641,6 +989,7 @@ void ActivityManager::requestUpdate(bool immediate) {
   }
 }
 void ActivityManager::requestUpdateAndWait() {
+  PageScrollbar::instance().cancelIdleRequest();
   if (!renderTaskHandle) {
     return;
   }
@@ -677,19 +1026,16 @@ void ActivityManager::requestFirstPaintAndWait() {
 
 // RenderLock
 
-RenderLock::RenderLock() {
-  xSemaphoreTake(activityManager.renderingMutex, portMAX_DELAY);
-  isLocked = true;
+RenderLock::RenderLock(Mode mode) {
+  isLocked = xSemaphoreTake(activityManager.renderingMutex, mode == Mode::Try ? 0 : portMAX_DELAY) == pdTRUE;
+  assert((mode == Mode::Try || isLocked) && "Blocking render lock acquisition failed");
 }
 
-RenderLock::RenderLock(TryTake) {
-  isLocked = xSemaphoreTake(activityManager.renderingMutex, 0) == pdTRUE;
-}
+RenderLock::RenderLock() : RenderLock(Mode::Blocking) {}
 
-RenderLock::RenderLock([[maybe_unused]] Activity&) {
-  xSemaphoreTake(activityManager.renderingMutex, portMAX_DELAY);
-  isLocked = true;
-}
+RenderLock::RenderLock(TryTake) : RenderLock(Mode::Try) {}
+
+RenderLock::RenderLock(Activity&) : RenderLock(Mode::Blocking) {}
 
 RenderLock::~RenderLock() {
   if (isLocked) {
@@ -717,7 +1063,7 @@ bool RenderLock::peek() { return xQueuePeek(activityManager.renderingMutex, NULL
 #ifdef TENOR_UI_ACCEPTANCE
 void ActivityManager::stepHomeForTest(int direction) {
   RenderLock lock;
-  if (currentActivity && currentActivity->isHomeActivity())
+  if (currentActivity && currentActivity->name == "Home")
     static_cast<HomeActivity*>(currentActivity.get())->stepForTest(direction);
 }
 
@@ -725,7 +1071,7 @@ void ActivityManager::tabHomeForTest(int index) {
   // KHONG lay RenderLock o day: HomeActivity::selectTab da lay RenderLock(*this), va renderingMutex duoc
   // tao bang xSemaphoreCreateMutex nen KHONG tai nhap - lay lan hai se treo vinh vien (dung loi da lam
   // vong lap chinh thoi phuc vu lenh serial sau CMD:HOME_TAB). Lay dung MOT lan, tai cho da co san.
-  if (currentActivity && currentActivity->isHomeActivity())
+  if (currentActivity && currentActivity->name == "Home")
     static_cast<HomeActivity*>(currentActivity.get())->tabForTest(index);
 }
 #endif

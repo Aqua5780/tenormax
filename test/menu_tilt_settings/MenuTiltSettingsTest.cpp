@@ -41,9 +41,50 @@ bool longPressValuesMatch(const std::vector<SettingInfo>& catalog, const bool ha
   std::vector<StrId> expected{StrId::STR_KOSYNC,     StrId::STR_DISABLED,    StrId::STR_BOOKMARK_OPTION,
                               StrId::STR_DICTIONARY, StrId::STR_READER_MENU, StrId::STR_FILE_TRANSFER};
   if (hasImu) expected.push_back(StrId::STR_TILT_PAGE_TURN);
+  expected.push_back(StrId::STR_QUOTES_SAVE_ACTION);
+#if FREEINK_CAP_BLE_HID_HOST
+  expected.push_back(StrId::STR_BLE_CONNECT_REMOTE);
+#endif
   return longPress->enumValues == expected &&
-         expected.size() == (hasImu ? CrossPointSettings::LONG_PRESS_MENU_FUNCTION_COUNT
-                                    : CrossPointSettings::LONG_PRESS_MENU_FUNCTION_COUNT - 1U);
+         expected.size() == CrossPointSettings::LONG_PRESS_MENU_FUNCTION_COUNT - (hasImu ? 0U : 1U) -
+                                (FREEINK_CAP_BLE_HID_HOST ? 0U : 1U);
+}
+
+// Label of each stored Confirm-hold number (0-7), whatever list position a board shows it at.
+constexpr StrId LONG_PRESS_LABELS[] = {StrId::STR_KOSYNC,     StrId::STR_DISABLED,    StrId::STR_BOOKMARK_OPTION,
+                                       StrId::STR_DICTIONARY, StrId::STR_READER_MENU, StrId::STR_FILE_TRANSFER,
+                                       StrId::STR_TILT_PAGE_TURN, StrId::STR_QUOTES_SAVE_ACTION,
+                                       StrId::STR_BLE_CONNECT_REMOTE};
+
+// Every stored Confirm-hold number reads back as itself and saves as itself; the list shows its label at the
+// position the board offers it. Without an IMU the tilt number (6) is not offered and falls back to Off, while
+// Save quotation (7) takes list position 6 and is still stored as 7.
+bool longPressStoreKept(const std::vector<SettingInfo>& catalog, const bool hasImu) {
+  const SettingInfo* longPress = findSetting(catalog, "longPressMenuFunction");
+  if (!expect(longPress && longPress->valueGetter && longPress->valueSetter, "Confirm-hold row maps list position to number")) {
+    return false;
+  }
+  bool ok = true;
+  for (int stored = 0; stored < 10; ++stored) {
+    JsonDocument in;
+    in["tenorPresetVersion"] = CrossPointSettings::TENOR_PRESET_VERSION;
+    in["longPressMenuFunction"] = stored;
+    SETTINGS.longPressMenuFunction = CrossPointSettings::LP_MENU_DISABLED;
+    ok = expect(SETTINGS.fromJson(in.as<JsonVariantConst>()), "Confirm-hold JSON loads") && ok;
+    const bool offered = stored < 9 && (hasImu || stored != 6) && (FREEINK_CAP_BLE_HID_HOST || stored != 8);
+    const uint8_t want = offered ? static_cast<uint8_t>(stored) : CrossPointSettings::LP_MENU_DISABLED;
+    ok = expect(SETTINGS.longPressMenuFunction == want, "stored Confirm-hold number is kept, an unoffered one falls to Off") && ok;
+    JsonDocument out;
+    SETTINGS.toJson(out);
+    ok = expect(out["longPressMenuFunction"].as<int>() == want, "Confirm-hold number saves as the number it holds") && ok;
+    const uint8_t position = longPress->valueGetter();
+    ok = expect(position < longPress->enumValues.size() && longPress->enumValues[position] == LONG_PRESS_LABELS[want],
+                "list position shows the label of the stored function") &&
+         ok;
+    longPress->valueSetter(position);
+    ok = expect(SETTINGS.longPressMenuFunction == want, "choosing the shown position stores the same number") && ok;
+  }
+  return ok;
 }
 
 // A short press wakes the device only where a short press also puts it to sleep.
@@ -109,13 +150,19 @@ int runQuickActions() {
         std::printf("FAIL shake action %u on %s\n", action, screen.name);
         ok = false;
       }
-      // Face down, face up, double tap and a remote button are triggers like the shake: the
-      // same outcome on every screen.
-      for (const Trigger flip : {Trigger::FaceDown, Trigger::FaceUp, Trigger::DoubleTap, Trigger::Remote}) {
-        if (quickaction::resolve(action, flip, reader) != shake || quickaction::resolve(action, flip, reader, true) != shake) {
+      // Face down, face up, the double taps and a remote button are triggers like the shake: the
+      // same outcome on every screen. A double tap's Page turn outside a book presses the side
+      // button the page turns with, so there it steps the tabs as the side buttons do.
+      for (const Trigger flip :
+           {Trigger::FaceDown, Trigger::FaceUp, Trigger::DoubleTap, Trigger::ScreenTap, Trigger::EdgeTap, Trigger::Remote}) {
+        const bool tap = flip == Trigger::DoubleTap || flip == Trigger::ScreenTap || flip == Trigger::EdgeTap;
+        const Outcome want = tap && action == CrossPointSettings::PAGE_TURN && !reader ? Outcome::SideForward : shake;
+        if (quickaction::resolve(action, flip, reader) != want || quickaction::resolve(action, flip, reader, true) != want) {
           std::printf("FAIL %s action %u on %s\n",
                       flip == Trigger::FaceDown ? "face down" : flip == Trigger::FaceUp ? "face up"
                                                            : flip == Trigger::DoubleTap ? "double tap"
+                                                           : flip == Trigger::ScreenTap ? "screen tap"
+                                                           : flip == Trigger::EdgeTap ? "edge tap"
                                                                                         : "remote",
                       action, screen.name);
           ok = false;
@@ -182,7 +229,7 @@ int runPowerValuesKept() {
   return ok ? 0 : 1;
 }
 
-// The two hard shake rows: in Motion sensor after the flick strengths, Off and Medium on
+// The two hard shake rows: in Gestures after the flick strengths, Off and Medium on
 // a new card and on a file from before them, saved and read back, out-of-range values kept out.
 int runShakeSettings() {
   halTiltSensor.available = true;
@@ -249,7 +296,7 @@ int runShakeSettings() {
   return ok ? 0 : 1;
 }
 
-// Face down and face up: after the shake rows in Motion sensor, the shake's own list, Off on
+// Face down and face up: after the shake rows in Gestures, the shake's own list, Off on
 // a new card and on a file from before them, every value saved and read back, out-of-range Off.
 int runFlipSettings() {
   halTiltSensor.available = true;
@@ -302,8 +349,9 @@ int runFlipSettings() {
   return ok ? 0 : 1;
 }
 
-// Double tap: the last Motion sensor row, after face up, the shake's own list, Off on a new
-// card and on a file from before it, every value saved and read back, out-of-range Off.
+// Double tap on the back, the screen, then the edge: the last Gestures rows, after face up, the
+// shake's own list, Off on a new card and on a file from before them, every value saved and read
+// back, out-of-range Off.
 int runDoubleTapSettings() {
   halTiltSensor.available = true;
   CrossPointSettings& settings = SETTINGS;
@@ -314,6 +362,19 @@ int runDoubleTapSettings() {
   ok = expect(up && tap, "the row is present with the sensor") && ok;
   if (!up || !tap) return 1;
   ok = expect(tap == up + 1, "double tap right after face up") && ok;
+  const SettingInfo* screen = findSetting(catalog, "screenTapAction");
+  ok = expect(screen == tap + 1 && screen->type == SettingType::ENUM && screen->category == StrId::STR_CAT_MOTION &&
+                  screen->nameId == StrId::STR_SCREEN_TAP_ACTION &&
+                  screen->valuePtr == &CrossPointSettings::screenTapAction &&
+                  screen->enumValues == quickaction::shakeLabels(),
+              "the screen row right after the back, with the shake's choices") &&
+       ok;
+  const SettingInfo* edge = findSetting(catalog, "edgeTapAction");
+  ok = expect(edge == screen + 1 && edge->type == SettingType::ENUM && edge->category == StrId::STR_CAT_MOTION &&
+                  edge->nameId == StrId::STR_EDGE_TAP_ACTION && edge->valuePtr == &CrossPointSettings::edgeTapAction &&
+                  edge->enumValues == quickaction::shakeLabels(),
+              "the edge row right after the screen, with the shake's choices") &&
+       ok;
   ok = expect(tap->type == SettingType::ENUM && tap->category == StrId::STR_CAT_MOTION &&
                   tap->nameId == StrId::STR_DOUBLE_TAP_ACTION && tap->valuePtr == &CrossPointSettings::doubleTapAction &&
                   tap->enumValues == quickaction::shakeLabels(),
@@ -324,24 +385,38 @@ int runDoubleTapSettings() {
   before["tenorPresetVersion"] = CrossPointSettings::TENOR_PRESET_VERSION;
   before["faceUpAction"] = 3;
   ok = expect(settings.fromJson(before.as<JsonVariantConst>()), "file from before the row loads") && ok;
-  ok = expect(settings.doubleTapAction == 0 && settings.faceUpAction == 3,
-              "a file without the key keeps double tap Off and its face up") &&
+  ok = expect(settings.doubleTapAction == 0 && settings.screenTapAction == 0 && settings.edgeTapAction == 0 &&
+                  settings.faceUpAction == 3,
+              "a file without the keys keeps every double tap Off and its face up") &&
        ok;
   const uint8_t count = static_cast<uint8_t>(std::size(quickaction::SHAKE_ORDER));
   for (uint8_t a = 0; a < count; ++a) {
     settings.doubleTapAction = a;
+    settings.screenTapAction = static_cast<uint8_t>((a + 1) % count);
+    settings.edgeTapAction = static_cast<uint8_t>(count - 1 - a);
     JsonDocument saved;
     settings.toJson(saved);
     settings.doubleTapAction = 0;
+    settings.screenTapAction = 0;
+    settings.edgeTapAction = 0;
     ok = expect(settings.fromJson(saved.as<JsonVariantConst>()), "double tap JSON loads") && ok;
-    ok = expect(settings.doubleTapAction == a, "every action round trips") && ok;
+    ok = expect(settings.doubleTapAction == a && settings.screenTapAction == (a + 1) % count &&
+                    settings.edgeTapAction == count - 1 - a,
+                "every action round trips") &&
+         ok;
   }
   settings.doubleTapAction = 0;
+  settings.screenTapAction = 0;
+  settings.edgeTapAction = 0;
   JsonDocument corrupt;
   corrupt["tenorPresetVersion"] = CrossPointSettings::TENOR_PRESET_VERSION;
   corrupt["doubleTapAction"] = count;
+  corrupt["screenTapAction"] = count;
+  corrupt["edgeTapAction"] = 200;
   ok = expect(settings.fromJson(corrupt.as<JsonVariantConst>()), "corrupt double tap JSON loads") && ok;
-  ok = expect(settings.doubleTapAction == 0, "an out-of-range value keeps Off") && ok;
+  ok = expect(settings.doubleTapAction == 0 && settings.screenTapAction == 0 && settings.edgeTapAction == 0,
+              "an out-of-range value keeps Off") &&
+       ok;
   settings.faceUpAction = 0;
   std::printf("menu_tilt_settings=double-tap:%s\n", ok ? "GREEN" : "RED");
   return ok ? 0 : 1;
@@ -362,15 +437,34 @@ int main(int argc, char** argv) {
 
   halTiltSensor.available = hasImu;
   const auto& catalog = getBaseSettingsList();
+  std::printf("X3 descriptors imu=%d count=%zu\n", hasImu, catalog.size());
+  for (const auto& setting : catalog) std::printf("descriptor=%s\n", setting.key ? setting.key : "<null>");
   const SettingInfo* readerTilt = findSetting(catalog, "tiltPageTurn");
   const SettingInfo* menuTilt = findSetting(catalog, "tiltTabNavigation");
   const SettingInfo* rowTilt = findSetting(catalog, "tiltMenuNavigation");
   CrossPointSettings& settings = SETTINGS;
   const SettingInfo* strengthH = findSetting(catalog, "tiltStrengthH");
   const SettingInfo* strengthV = findSetting(catalog, "tiltStrengthV");
-  bool ok = expect(catalog.size() == (hasImu ? 80U : 70U), "X3 descriptor count");
+  // 1.6.5 added 11 rows (library metadata, time zone, DST, clock in header, Back to file
+  // browser, three Home button actions, two page gestures, double-click light); every
+  // existing row kept its place. v1.0.52 then dropped the UI theme row and added the starting up notice row,
+  // v1.0.53 the touch back tap zone and tap zone tip rows, the persisted-only rows of tenor/ugly
+  // (uiShellClockMemo, uglyBatteryHidden) and the clock shown once (uiShellClockOnce). v1.0.59 added Button hints.
+  // v1.0.60 adds the File order row of Settings, System.
+  bool ok = expect(catalog.size() == (hasImu ? 111U : 99U), "X3 descriptor count");
+  const auto* homeStyle = findSetting(catalog, "homeStyle");
+  ok &= expect(homeStyle && settingHiddenOnThisBoard(*homeStyle), "X3 hides the Home style descriptor");
+  const SettingInfo* tips = findSetting(catalog, "tipsEnabled");
+  ok = expect(tips && tips->type == SettingType::TOGGLE && tips->category == StrId::STR_CAT_DISPLAY &&
+                  tips->nameId == StrId::STR_TIPS && tips->valuePtr == &CrossPointSettings::tipsEnabled &&
+                  settings.tipsEnabled == 1,
+              "Display has an independent tips toggle, enabled by default") && ok;
+  ok = expect(findSetting(catalog, "uglyStartScreen") && findSetting(catalog, "uglyRootScreen") &&
+                  findSetting(catalog, "wakeIntoBook"),
+              "base catalog keeps Root and startup descriptors before shell filtering") && ok;
   ok = expect(longPressValuesMatch(catalog, hasImu), "Confirm-hold list shows Reader menu and appends the new actions") &&
        ok;
+  ok = longPressStoreKept(catalog, hasImu) && ok;
 
   if (!hasImu) {
     ok = expect(readerTilt == nullptr && menuTilt == nullptr && rowTilt == nullptr && strengthH == nullptr &&
@@ -396,12 +490,14 @@ int main(int argc, char** argv) {
                     saved["faceDownAction"].isNull() && saved["faceUpAction"].isNull(),
                 "no face down or face up rows and keys without the sensor") &&
          ok;
-    ok = expect(findSetting(catalog, "doubleTapAction") == nullptr && saved["doubleTapAction"].isNull(),
-                "no double tap row and key without the sensor") &&
+    ok = expect(findSetting(catalog, "doubleTapAction") == nullptr && saved["doubleTapAction"].isNull() &&
+                    findSetting(catalog, "screenTapAction") == nullptr && saved["screenTapAction"].isNull() &&
+                    findSetting(catalog, "edgeTapAction") == nullptr && saved["edgeTapAction"].isNull(),
+                "no double tap rows and keys without the sensor") &&
          ok;
     ok = expect(std::none_of(catalog.begin(), catalog.end(),
                              [](const SettingInfo& s) { return s.category == StrId::STR_CAT_MOTION; }),
-                "no Motion sensor row without the sensor") &&
+                "no Gestures row without the sensor") &&
          ok;
     std::printf("menu_tilt_settings=no-imu:%s\n", ok ? "GREEN" : "RED");
     return ok ? 0 : 1;
@@ -411,7 +507,7 @@ int main(int argc, char** argv) {
   if (!readerTilt || !menuTilt || !rowTilt) return 1;
   ok = expect(readerTilt->nameId == StrId::STR_TILT_PAGE_TURN &&
                   readerTilt->valuePtr == &CrossPointSettings::tiltPageTurn && isTiltEnum(*readerTilt, StrId::STR_CAT_MOTION),
-              "reader tilt descriptor keeps its key and values, in Motion sensor") &&
+              "reader tilt descriptor keeps its key and values, in Gestures") &&
        ok;
   ok = expect(menuTilt->nameId == StrId::STR_TILT_TAB_NAVIGATION &&
                   menuTilt->valuePtr == &CrossPointSettings::tiltTabNavigation && isTiltEnum(*menuTilt, StrId::STR_CAT_MOTION),
@@ -420,7 +516,7 @@ int main(int argc, char** argv) {
   ok = expect(rowTilt->nameId == StrId::STR_TILT_MENU_NAVIGATION &&
                   rowTilt->valuePtr == &CrossPointSettings::tiltMenuNavigation &&
                   isTiltEnum(*rowTilt, StrId::STR_CAT_MOTION),
-              "row tilt descriptor uses independent field in Motion sensor") &&
+              "row tilt descriptor uses independent field in Gestures") &&
        ok;
   ok = expect(menuTilt == readerTilt + 1, "tab tilt follows reader tilt") && ok;
   // Every sensor row, in one tab and this order; none left in Reader or Controls.
@@ -431,8 +527,9 @@ int main(int argc, char** argv) {
     }
     ok = expect(motion == std::vector<std::string>{"tiltPageTurn", "tiltTabNavigation", "tiltMenuNavigation",
                                                    "tiltStrengthH", "tiltStrengthV", "shakeAction", "shakeStrength",
-                                                   "faceDownAction", "faceUpAction", "doubleTapAction"},
-                "Motion sensor holds every sensor row, in order") &&
+                                                   "faceDownAction", "faceUpAction", "doubleTapAction",
+                                                   "screenTapAction", "edgeTapAction"},
+                "Gestures holds every sensor row, in order") &&
          ok;
   }
   ok = expect(rowTilt == menuTilt + 1, "row tilt row sits directly after tab tilt") && ok;

@@ -35,6 +35,7 @@ class HalStorage {
   bool disconnectUsbDriveHost();
   void endUsbDrive();
   UsbDriveState usbDriveState() const;
+  bool usbDriveHostSuspended() const;
   std::vector<String> listFiles(const char* path = "/", int maxFiles = 200);
   // Read the entire file at `path` into a String. Returns empty string on failure.
   String readFile(const char* path);
@@ -64,6 +65,7 @@ class HalStorage {
   bool openFileForWrite(const char* moduleName, const std::string& path, HalFile& file);
   bool openFileForWrite(const char* moduleName, const String& path, HalFile& file);
   bool removeDir(const char* path);
+  bool freeSpace(uint64_t& bytes, uint32_t& clusterBytes);
 
   static HalStorage& getInstance() { return instance; }
 
@@ -98,6 +100,7 @@ class HalFile : public Print {
   size_t size();
   size_t fileSize();
   uint64_t fileSize64();
+  uint32_t modificationTime();
   bool seek(size_t pos);
   bool seek64(uint64_t pos);
   bool seekCur(int64_t offset);

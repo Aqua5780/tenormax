@@ -1,6 +1,12 @@
 #include "UiAppHost.h"
 
+#include "MappedInputManager.h"
+#include "activities/Activity.h"
+#include "activities/ActivityManager.h"
+#include "TouchScroll.h"
 #include "UiAppHelpers.h"
+#include "components/TenorMenuChrome.h"
+#include "util/ButtonNavigator.h"
 
 namespace fui = freeink::ui;
 
@@ -19,19 +25,97 @@ void UiAppHost::renderUi() {
 }
 
 UiAppHost::TouchRoute UiAppHost::routeTouch(const MappedInputManager& input, const bool withLongPress,
-                                            const bool routeHeld) {
+                                            const bool routeHeld, const unsigned long holdMs) {
   TouchRoute result;  // named apart from route() — cppcheck flags the shadow
+  cancelStaleTouch(input);
   if (!uiReady) return result;
-  result.snap = touchSnapshotFrom(input, withLongPress);
+  result.snap = touchSnapshotFrom(input, withLongPress && holdMs == 0);
+  if (withLongPress && holdMs > 0) {
+    int x = 0, y = 0;
+    if (input.wasScreenHold(x, y, holdMs)) {
+      result.snap = {};
+      result.snap.touchReleased = result.snap.longPress = true;
+      result.snap.touchX = static_cast<int16_t>(x);
+      result.snap.touchY = static_cast<int16_t>(y);
+    }
+  }
   if (!result.snap.touchPressed && !result.snap.touchReleased && !(routeHeld && result.snap.touchHeld)) {
     return result;
   }
   result.routed = true;
-  result.event = app.route(result.snap);
+  result.event = routeApp(result.snap);
   return result;
 }
 
-fui::ActionEvent UiAppHost::route(const fui::InputSnapshot& snap) {
+void UiAppHost::cancelStaleTouch(const MappedInputManager& input) {
+  if (touchContactGeneration == input.touchContactGeneration()) return;
+  touchContactGeneration = input.touchContactGeneration();
+  app.cancelTouchContact();
+}
+
+fui::ActionEvent UiAppHost::route(const fui::InputSnapshot& snap, const MappedInputManager& input) {
+  cancelStaleTouch(input);
   if (!uiReady) return {};
-  return app.route(snap);
+  return routeApp(snap);
+}
+
+// Touch: the tap being dispatched (a screen opens a value list from its handler), else the rect of the last
+// tap the routing dispatched, for the screen in front when it came (a screen acting on a tap a pass after
+// routing it: the reader menu reports it, the reader opens the list).
+namespace {
+const UiAppHost::UiApp* dispatching = nullptr;
+fui::Rect lastTapRect{};
+uint32_t lastTapScreen = UINT32_MAX;
+}  // namespace
+
+fui::ActionEvent UiAppHost::routeApp(const fui::InputSnapshot& snap) {
+  dispatching = &app;
+  const fui::ActionEvent event = app.route(snap);
+  dispatching = nullptr;
+  if (event) {
+    lastTapRect = app.publishedRect(event.action, event.value);
+    lastTapScreen = activityManager.activityGeneration();
+  }
+  return event;
+}
+
+fui::Rect UiAppHost::dispatchingRect() {
+  if (dispatching) {
+    const fui::ActionEvent event = dispatching->lastEvent();
+    return event ? dispatching->publishedRect(event.action, event.value) : fui::Rect{};
+  }
+  return lastTapScreen == activityManager.activityGeneration() ? lastTapRect : fui::Rect{};
+}
+
+void UiAppHost::followStep(fui::ListNav& nav, const int count) {
+  if (tenorchrome::kTouchShell) {
+    nav.follow(count);
+    return;
+  }
+  nav.top = ButtonNavigator::pageTopAfterStep(nav.selected, nav.top, nav.pageRowsFor(count), count);
+  nav.followPending = true;
+}
+
+int UiAppHost::swipeRows(const MappedInputManager& input, const fui::ListNav& nav, const int count,
+                         const fui::ActionId rowAction, const int keepRows) const {
+  int dy = 0;
+  unsigned long heldMs = 0;
+  if (!input.wasVerticalSwipe(dy, heldMs)) return 0;
+  const int page = nav.pageRowsFor(count);
+  // The pitch between the first and the last row of the page that registered a touch (a disabled row
+  // registers none).
+  fui::Rect first{}, last{};
+  int firstIndex = -1, lastIndex = -1;
+  for (int i = nav.top; i < nav.top + page && i < count; ++i) {
+    const fui::Rect r = app.publishedRect(rowAction, static_cast<int16_t>(i));
+    if (r.height <= 0) continue;
+    if (firstIndex < 0) {
+      first = r;
+      firstIndex = i;
+    }
+    last = r;
+    lastIndex = i;
+  }
+  const int pitch = lastIndex > firstIndex ? (last.y - first.y) / (lastIndex - firstIndex) : first.height;
+  return touchscroll::rows(dy, heldMs, pitch, page > keepRows + 1 ? page - keepRows : page);
 }

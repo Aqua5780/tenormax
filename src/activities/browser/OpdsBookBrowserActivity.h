@@ -1,4 +1,6 @@
 #pragma once
+#include "activities/X3ActivityLayout.h"
+#include "shells/ugly/UglyMarkSeed.h"
 #include <OpdsParser.h>
 
 #include <cstdint>
@@ -34,7 +36,11 @@ inline bool idleExitDue(const uint32_t now, const bool waiting, const bool radio
  * Supports navigation through catalog hierarchy and downloading EPUBs.
  */
 class OpdsBookBrowserActivity final : public Activity, private UiAppHost {
+  x3activity::InfoPages x3Info;
+
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Network; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_OPDS_BROWSER); }
   enum class BrowserState { CHECK_WIFI, WIFI_SELECTION, LOADING, BROWSING, DOWNLOADING, ERROR, SEARCH_INPUT };
 
   explicit OpdsBookBrowserActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, OpdsServer server);
@@ -45,6 +51,7 @@ class OpdsBookBrowserActivity final : public Activity, private UiAppHost {
   void render(RenderLock&&) override;
 
  private:
+  mutable ugly::MarkState mark_;
   ButtonNavigator buttonNavigator;
   BrowserState state = BrowserState::LOADING;
   std::vector<OpdsEntry> entries;
@@ -57,6 +64,7 @@ class OpdsBookBrowserActivity final : public Activity, private UiAppHost {
   std::string currentPath;
   std::string searchTemplate;
   int selectorIndex = 0;
+  void renderUglyNote();
   std::string errorMessage;
   std::string statusMessage;
   size_t downloadProgress = 0;
@@ -83,6 +91,7 @@ class OpdsBookBrowserActivity final : public Activity, private UiAppHost {
   static void onRowEvent(const freeink::ui::ActionEvent& event, void* user);
   static void onSearchEvent(const freeink::ui::ActionEvent& event, void* user);
   static void onCancelEvent(const freeink::ui::ActionEvent& event, void* user);
+  static void onBackEvent(const freeink::ui::ActionEvent& event, void* user);
   void screenHeader(UiScreen& screen, bool withSearch);
   void buildBrowsingScreen(UiScreen& screen);
   void buildDownloadScreen(UiScreen& screen);

@@ -1,8 +1,11 @@
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
+#include "FileBrowserSort.h"
 
 // Doc mot thu muc tren the nho thanh danh sach ten doc duoc.
 //
@@ -23,7 +26,23 @@ enum class Loc : uint8_t {
 // Ghi ten cac muc vao `ra`, thu muc mang dau '/' o cuoi, da sap xep theo FsHelpers.
 // `dem` la vung nho muon de hung ten file; ham nay KHONG tu cap phat.
 // Tra ve false khi khong mo duoc thu muc, va luc do `ra` rong.
-bool doc(const char* duongDan, bool hienFileAn, Loc loc, char* dem, size_t demCo, std::vector<std::string>& ra);
+// `tran` > 0 la so muc toi da: vuot thi dung doc, `ra` rong, *quaTran = true (ham van tra ve true). Man
+// nao danh sach lon theo so tep tren the thi dat tran; 0 la khong gioi han, nhu moi noi goi cu.
+bool doc(const char* duongDan, bool hienFileAn, Loc loc, char* dem, size_t demCo, std::vector<std::string>& ra,
+         size_t tran = 0, bool* quaTran = nullptr, filebrowser::SortMode sortMode = filebrowser::SortMode::Name);
+
+// How many names a folder page may hold, from the heap left: the one decision for every screen that lists a
+// card folder (tenor/cross Home and File, and the tenor/ugly Folder page). Each row costs a string slot (the
+// vector doubles, so twice that must fit in one block) and its name on the heap, and some heap stays for the
+// frame and the card library. 0 means refuse the folder rather than run out. Pass the result as `tran`.
+// Every row action carries its absolute index in int16_t.
+inline constexpr size_t FOLDER_MAX_ROWS = static_cast<size_t>(std::numeric_limits<int16_t>::max());
+inline constexpr size_t FOLDER_HEAP_KEEP = 16 * 1024, FOLDER_BYTES_PER_ROW = 80;
+inline size_t tran(const size_t freeHeap, const size_t largestBlock) {
+  const size_t byFree = freeHeap > FOLDER_HEAP_KEEP ? (freeHeap - FOLDER_HEAP_KEEP) / FOLDER_BYTES_PER_ROW : 0;
+  const size_t byBlock = largestBlock / (2 * sizeof(std::string));
+  return std::min({FOLDER_MAX_ROWS, byFree, byBlock});
+}
 
 // Adjacent visible sibling folder in natural order, wrapping at either end.
 // Holds only candidate names, never the whole parent directory in RAM.

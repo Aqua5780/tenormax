@@ -1,4 +1,5 @@
 #pragma once
+#include "shells/ugly/UglyMarkSeed.h"
 
 #include "MappedInputManager.h"
 #include "activities/Activity.h"
@@ -17,12 +18,12 @@ class EpubReaderPercentSelectionActivity final : public Activity, private UiAppH
   void render(RenderLock&&) override;
 
  private:
-  // The UiAppHost app hosts the shared slider dialog (drag slider, -/+ zones,
-  // touch Cancel/OK); the header stays on GUI.drawHeader.
+  mutable ugly::MarkState mark_;
+  // The UiAppHost app hosts the shared slider dialog popup (capsule slider,
+  // [-] [+] [Confirm] buttons) drawn over the screen underneath.
   static void percentScreen(UiScreen& screen, void* user);
   static void onSliderEvent(const freeink::ui::ActionEvent& event, void* user);
   static void onStepEvent(const freeink::ui::ActionEvent& event, void* user);
-  static void onCancelEvent(const freeink::ui::ActionEvent& event, void* user);
   static void onOkEvent(const freeink::ui::ActionEvent& event, void* user);
   void buildPercentScreen(UiScreen& screen);
   void cancel();

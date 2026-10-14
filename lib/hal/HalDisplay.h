@@ -50,6 +50,7 @@ class HalDisplay {
                             bool fromProgmem = false) const;
 
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
+  void displayWindow(int x, int y, int width, int height);
   // Non-blocking refresh (shadow-free): starts the panel waveform and returns
   // while the panel refreshes on its own. The framebuffer must stay untouched
   // until waitRefreshComplete(), and the caller must rebuild the differential
@@ -61,6 +62,7 @@ class HalDisplay {
   // True when displayBufferAsync() genuinely overlaps (panel driver defers);
   // false where it falls back to a blocking refresh.
   bool supportsAsyncRefresh() const;
+  bool refreshBusy();
   // True when an ordinary deferred B/W refresh is suitable as the base for a
   // grayscale pass. X3 needs its controller-specific grayscale base waveform.
   bool supportsAsyncGrayscaleBase() const;

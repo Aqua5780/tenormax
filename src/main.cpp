@@ -9,12 +9,17 @@
 #if defined(TENOR_UI_ACCEPTANCE) || defined(TENOR_PRESS_PROBE)
 #include "activities/network/CrossPointWebServerActivity.h"
 #endif
-#ifdef TENOR_OTA_ACCEPTANCE
 #include "activities/settings/OtaUpdateActivity.h"
-#endif
+#include "network/UpdateBoot.h"
 #include <Arduino.h>
+#include <BlePageTurner.h>
 #include <BoardConfig.h>
+
+#include "activities/reader/FirstPaint.h"
 #include <Epub.h>
+#ifdef TENOR_PRESS_PROBE
+#include <Epub/BuildStageProbe.h>
+#endif
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
 #include <GfxRenderer.h>
@@ -30,6 +35,7 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <SPI.h>
+#include <VectorFontSupport.h>
 #include <WiFi.h>
 #ifndef SIMULATOR
 #include <HalGaugeCapacity.h>
@@ -37,9 +43,6 @@
 #endif
 #include <XteinkDetect.h>
 #include <builtinFonts/all.h>
-#if FREEINK_CAP_TOUCH
-#include <esp_sntp.h>
-#endif
 
 #include <Memory.h>
 #ifdef TENOR_TTF_PROBE
@@ -52,10 +55,10 @@
 #include <esp_ota_ops.h>
 #endif
 
+#include "BlePageTurnerHost.h"
 #include "CrossPointSettings.h"
-#include "BleIdleOff.h"
-#include "BlePageTurnerRuntime.h"
 #include "HeapMapProbe.h"
+#include "HeapBigProbe.h"
 #include "SettingsList.h"
 #include "CrossPointState.h"
 #include "KOReaderCredentialStore.h"
@@ -65,16 +68,20 @@
 #include "ReadingStatsStore.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
+#include "FontPackInstaller.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyInk.h"
+#include "shells/ugly/UglySleep.h"
+#include "activities/boot_sleep/SleepActivity.h"
 #include "activities/home/BookStatsActivity.h"
 #include "QuoteStore.h"
 #include "activities/home/QuotesActivity.h"
 
-// Page turner BLE: chi lien ket host cua SDK khi capability duoc bat (xem env x3-ble).
+// Page turner BLE: lib/BlePageTurner chi chay radio khi capability duoc bat (xem env x3-ble).
 #include "FileTransferState.h"
 #if defined(FREEINK_CAP_BLE_HID_HOST) && FREEINK_CAP_BLE_HID_HOST
-#include <BleKeyboardHost.h>
 #define CROSSPOINT_BLE_HID_HOST 1
 #else
 #define CROSSPOINT_BLE_HID_HOST 0
@@ -87,9 +94,17 @@
 #include "fontIds.h"
 #include "UIFontTiers.h"
 #include "ReaderInkWeight.h"
+#include "platform/BootTrial.h"
+#if TENOR_CABLE_FLASH
+#include "platform/CableFlashLink.h"
+#endif
+#include "platform/ColdLog.h"
+#include "platform/PutFile.h"
+#include "platform/FirmwareProbe.h"
 #include "platform/UsbSerialJtagHandoff.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
+#include "util/Timezones.h"
 #include "util/WakeBook.h"
 
 #if defined(TENOR_UI_ACCEPTANCE) || defined(TENOR_PRESS_PROBE)
@@ -126,12 +141,22 @@ class TlsAuditActivity final : public Activity {
 };
 #endif
 
+#if CROSSPOINT_VECTOR_FONTS
+// Rendering (incl. FreeType TTF rasterization) runs on the Arduino loop task.
+// The default 8 KB stack overflows inside FreeType's FT_Open_Face / variable-font
+// parsing. This runtime override applies even with the prebuilt (dio_opi) core,
+// where CONFIG_ARDUINO_LOOP_STACK_SIZE from sdkconfig is baked in and ignored.
+// Vector-font boards only: without TTF the stock loop stack has always sufficed,
+// and non-PSRAM boards need the 16KB back in DRAM.
+SET_LOOP_TASK_STACK_SIZE(24 * 1024)
+#endif
+
 GfxRenderer renderer(display);
 MappedInputManager mappedInputManager(gpio, renderer);
 ActivityManager activityManager(renderer, mappedInputManager);
 FontDecompressor fontDecompressor;
 SdCardFontSystem sdFontSystem;
-FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
+FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts(), renderer.getTtfFonts());
 static unsigned long allowSleepAt = 0;
 static unsigned long lastX4ProPowerClickAt = 0;
 
@@ -198,13 +223,12 @@ EpdFontFamily notosans18FontFamily(&notosans18RegularFont, &notosans18BoldFont, 
 
 #endif  // OMIT_FONTS
 
-// Font he thong: Geist cam tieu de, Be Vietnam Pro cam chu than va nhan nut.
-// Ca hai deu du dau tieng Viet; do 14/09 tren 44 ky tu nguyen am hai dau.
-EpdFont smallFont(&bevietnampro_8_regular);
+// Font he thong: mot ho Geist cho moi co (8, 10, 12; 14 va 16 nam o UIFontTiers.cpp), chu Han tu Noto Sans SC.
+EpdFont smallFont(&geist_8_regular);
 EpdFontFamily smallFontFamily(&smallFont);
 
-EpdFont ui10RegularFont(&bevietnampro_10_regular);
-EpdFont ui10BoldFont(&bevietnampro_10_bold);
+EpdFont ui10RegularFont(&geist_10_regular);
+EpdFont ui10BoldFont(&geist_10_bold);
 EpdFontFamily ui10FontFamily(&ui10RegularFont, &ui10BoldFont);
 
 EpdFont ui12RegularFont(&geist_12_regular);
@@ -215,6 +239,9 @@ EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
 RTC_NOINIT_ATTR uint32_t silentRebootMagic;
 RTC_NOINIT_ATTR uint32_t silentRebootTarget;
 RTC_NOINIT_ATTR uint32_t silentRebootHomeMenu;
+RTC_NOINIT_ATTR uint32_t silentRebootPayload;
+// The restart into the update screen (UpdateBoot.h): armed only by silentRestartToOta().
+RTC_NOINIT_ATTR update_boot::Slot otaBootSlot;
 
 #ifdef TENOR_PRESS_PROBE
 #include <BatteryMonitor.h>
@@ -224,16 +251,58 @@ RTC_NOINIT_ATTR uint32_t silentRebootHomeMenu;
 // wake to the first app instruction is measured, bootloader included.
 RTC_NOINIT_ATTR uint32_t probeWakeMagic;
 RTC_NOINIT_ATTR uint32_t probeWakeSeconds;
+// CMD:WAKE_HOLD <ms>: the next timed wakes read the power key as held until this many ms after the
+// app started (0 clears it), so the hold check runs as it does for a real press.
+RTC_NOINIT_ATTR uint32_t probeWakeHoldMagic;
+RTC_NOINIT_ATTR uint32_t probeWakeHoldMs;
 RTC_NOINIT_ATTR uint64_t probeWakeTargetUs;
 constexpr uint32_t PROBE_WAKE_MAGIC = 0x57414B45;
 extern "C" uint64_t esp_rtc_get_time_us(void);
 // CMD:KEEP_HEAP 1: the next Wi-Fi exits to Home end the session in place instead of the
 // silent restart, and report the heap they leave, to decide whether the restart is still needed.
 static bool probeKeepHeap = false;
+// CMD:OTA_DRYRUN: the test manifest the series of update boots reads.
+RTC_NOINIT_ATTR char probeDryRunUrl[160];
+// The last dry run's result line, printed again by the boot after it (the restart drops the port).
+constexpr uint32_t PROBE_DRYRUN_LINE_MAGIC = 0x4C494E45;
+RTC_NOINIT_ATTR uint32_t probeDryRunLineMagic;
+RTC_NOINIT_ATTR char probeDryRunLine[640];
+void probeKeepDryRunLine(const char* line) {
+  snprintf(probeDryRunLine, sizeof(probeDryRunLine), "%s", line);
+  probeDryRunLineMagic = PROBE_DRYRUN_LINE_MAGIC;
+}
+// Three times, 3, 6 and 10 s after boot, whenever the loop runs: the cable reader reattaches late.
+static void probeReprintDryRunLine() {
+  static uint8_t printed = 0;
+  static constexpr unsigned long AT_MS[] = {3000, 6000, 10000};
+  if (probeDryRunLineMagic != PROBE_DRYRUN_LINE_MAGIC || printed >= 3 || millis() < AT_MS[printed]) return;
+  probeDryRunLine[sizeof(probeDryRunLine) - 1] = '\0';
+  logSerial.printf("OTA_DRYRUN_PREV %u/3 %s", static_cast<unsigned>(printed + 1), probeDryRunLine);
+  if (++printed == 3) probeDryRunLineMagic = 0;
+}
+#if FREEINK_CAP_TOUCH && !defined(SIMULATOR)
+#include "platform/TouchProbe.h"
+// CMD:TAP / CMD:SWIPE: a scripted finger, fed to the GT911 read on this loop task in the app's coordinates.
+static touchprobe::Plan probeTouchPlan;
+static int8_t probeTouchHook(uint16_t& x, uint16_t& y) {
+  int ax = 0, ay = 0;
+  const int8_t state = touchprobe::sample(probeTouchPlan, millis(), ax, ay);
+  if (state > 0) {
+    const auto& t = BoardConfig::ACTIVE.touch;
+    touchprobe::toTouch(ax, ay, renderer.getOrientation(), renderer.getDisplayWidth(), renderer.getDisplayHeight(),
+                        t.rawMaxX - t.rawMinX, t.rawMaxY - t.rawMinY, x, y);
+  }
+  return state;
+}
+#endif
 #endif
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
+constexpr uint32_t SILENT_REBOOT_TARGET_SETTINGS = 2;
+constexpr uint32_t SILENT_REBOOT_TARGET_OTA = 3;
+constexpr uint32_t SILENT_REBOOT_TARGET_MAX = SILENT_REBOOT_TARGET_OTA;
+constexpr uint32_t SILENT_REBOOT_LIGHT_ON = 1U << 0;
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -252,75 +321,112 @@ enum class BootResume : uint8_t {
 // startDeepSleep() does not return, so a set latch only ends at the wakeup reset.
 static bool deepSleepInProgress = false;
 
-#if FREEINK_CAP_TOUCH
-static bool finishWifiSessionWithoutRestart() {
-  if (!BoardConfig::hasTouch()) return false;
-
-  // A software reset does not cycle externally powered touch/frontlight rails.
-  // Shut down the network stack in place so those peripherals retain state.
-  if (esp_sntp_enabled()) {
-    esp_sntp_stop();
-  }
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  LOG_DBG("MAIN", "WiFi stopped without restart on touch device");
-  return true;
+// A silent restart is internal maintenance, so the light must come back exactly
+// as the user left it. SETTINGS.frontlightOn is the saved preference and
+// legitimately diverges from the live state (a wake with Restore Light on Wake
+// off leaves the light off while the saved "was on" preference is kept), so
+// carry the live state across the reboot instead of re-deriving it from
+// settings. Cleared with the magic in setup(). A restart to Home also keeps the
+// Home tab it came from.
+static void armSilentReboot(const uint32_t target) {
+  silentRebootTarget = target;
+  if (target == SILENT_REBOOT_TARGET_HOME)
+    silentRebootHomeMenu = static_cast<uint32_t>(activityManager.homeMenuOrigin());
+  silentRebootPayload = Frontlight.isOn() ? SILENT_REBOOT_LIGHT_ON : 0;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
 }
+
+// The notice left on the glass while the device restarts quietly.
+static void showRestartNotice() {
+  const char* text = shell::uglyParts() ? ugly::loadingNotice() : tr(STR_LOADING_POPUP);
+  LOG_DBG("MAIN", "Restart notice: %s", text);
+  GUI.drawPopup(renderer, text);
+}
+
+// Returns instead of rebooting when sleep supersedes the reboot; callers keep
+// running in that case.
+static void silentRestartTo(const uint32_t target, const char* targetName) {
+  if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
+  armSilentReboot(target);
+  LOG_DBG("MAIN", "Silent restart (target=%s)", targetName);
+  // E-ink retains the previous frame until the target's first paint lands
+  // (~2-3s). Without an overlay, users don't see the reboot and fire input
+  // through to the new activity. On Home, Select on the default
+  // selectorIndex=0 opens the most-recent book, looking like a trampoline back
+  // to the reader they just exited.
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("FTX", "restart notice target=%s t=%lu", targetName, millis());
 #endif
+  showRestartNotice();
+  delay(50);
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("FTX", "restart now t=%lu", millis());
+#endif
+  ESP.restart();
+}
 
 void silentRestart() {
-  if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
-#if FREEINK_CAP_TOUCH
-  if (finishWifiSessionWithoutRestart()) return;
-#endif
 #ifdef TENOR_PRESS_PROBE
-  if (probeKeepHeap) {
+  if (!deepSleepInProgress && probeKeepHeap) {
     WiFi.mode(WIFI_OFF);
     delay(100);
     LOG_INF("PROBE", "Wi-Fi off without restart heap=%u largest=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     return;
   }
 #endif
-  silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
-  silentRebootHomeMenu = static_cast<uint32_t>(activityManager.homeMenuOrigin());
-  silentRebootMagic = SILENT_REBOOT_MAGIC;
-  LOG_DBG("MAIN", "Silent restart (target=home)");
-  // E-ink retains the previous frame until Home's first paint lands (~2-3s).
-  // Without an overlay, users don't see the reboot and fire input through to
-  // Home. Select on the default selectorIndex=0 then opens the most-recent
-  // book, looking like a trampoline back to the reader they just exited.
-  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-  delay(50);
-  ESP.restart();
+  silentRestartTo(SILENT_REBOOT_TARGET_HOME, "home");
 }
 
-void silentRestartToReader() {
-  if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
-#if FREEINK_CAP_TOUCH
-  if (finishWifiSessionWithoutRestart()) return;
-#endif
-  silentRebootTarget = SILENT_REBOOT_TARGET_READER;
-  silentRebootMagic = SILENT_REBOOT_MAGIC;
-  LOG_DBG("MAIN", "Silent restart (target=reader)");
-  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-  delay(50);
-  ESP.restart();
+void silentRestartToReader() { silentRestartTo(SILENT_REBOOT_TARGET_READER, "reader"); }
+
+void silentRestartToSettings() { silentRestartTo(SILENT_REBOOT_TARGET_SETTINGS, "settings"); }
+
+void silentRestartToOta(const uint8_t dryRunsLeft, const uint8_t dryRunsTotal) {
+  if (deepSleepInProgress) return;
+  update_boot::arm(otaBootSlot, dryRunsLeft, dryRunsTotal);
+  silentRestartTo(SILENT_REBOOT_TARGET_OTA, "ota");
 }
+
+#if CROSSPOINT_BLE_HID_HOST
+static void runQuickAction(uint8_t action, quickaction::Trigger trigger);
+
+// The page turner's two doors that only this file has: a remote shortcut runs the catalog
+// action of the same name, and a heap in pieces restarts into the open book.
+static void runRemoteShortcut(const bleturner::Action shortcut) {
+  runQuickAction(shortcut == bleturner::Action::ReaderMenu ? CrossPointSettings::READER_MENU
+                                                           : CrossPointSettings::SAVE_QUOTE,
+                 quickaction::Trigger::Remote);
+}
+// The close waits out a paint and writes the reading place and every deferred write first.
+static void restartIntoOpenBook() {
+  activityManager.closeForRestart();
+  silentRestartToReader();
+  // Only a board that keeps its rails (touch) gets here without a restart: reopen the book.
+  activityManager.goToReader(APP_STATE.openEpubPath);
+}
+#endif
 
 void restartToHomeAfterStorageHandoff() {
   if (deepSleepInProgress) return;  // sleeping supersedes the storage handoff reboot
-  silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
-  silentRebootHomeMenu = static_cast<uint32_t>(activityManager.homeMenuOrigin());
-  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  armSilentReboot(SILENT_REBOOT_TARGET_HOME);
   LOG_DBG("MAIN", "Restart after storage handoff (target=home)");
-  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  showRestartNotice();
   delay(50);
   handoffUsbOtgToSerialJtag();
   ESP.restart();
 }
 
+void toggleFrontlight() {
+  if (!Frontlight.present()) return;
+  const bool lightOn = !Frontlight.isOn();
+  Frontlight.setOn(lightOn);
+  SETTINGS.frontlightOn = lightOn ? 1 : 0;
+  SETTINGS.saveToFile();
+  LOG_INF("LIGHT", "Frontlight toggled %s", lightOn ? "on" : "off");
+}
+
 bool handleX4ProFrontlightDoubleClick() {
-  if (!BoardConfig::isX4Pro() || !gpio.wasReleased(HalGPIO::BTN_POWER)) {
+  if (!BoardConfig::isX4Pro() || !SETTINGS.doubleClickPwrLight || !gpio.wasReleased(HalGPIO::BTN_POWER)) {
     return false;
   }
 
@@ -336,11 +442,7 @@ bool handleX4ProFrontlightDoubleClick() {
   }
 
   lastX4ProPowerClickAt = 0;
-  const bool lightOn = !Frontlight.isOn();
-  Frontlight.setOn(lightOn);
-  SETTINGS.frontlightOn = lightOn ? 1 : 0;
-  SETTINGS.saveToFile();
-  LOG_INF("LIGHT", "Frontlight toggled %s by power-button double-click", lightOn ? "on" : "off");
+  toggleFrontlight();
   return true;
 }
 
@@ -424,7 +526,9 @@ void enterDeepSleep(bool fromTimeout = false) {
   // The X3 UC8279 wakes by refreshing only the pixels that differ from the frame kept here, so it
   // keeps the frame only when that frame is what the glass shows: not after a gray pass, whose
   // levels no B/W frame names. Without a frame the wake drives every pixel instead.
-  const bool tenorScreen = SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::TENOR;
+  // The tenor/ugly doodle is a black and white frame kept the same way.
+  const bool tenorScreen = SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::TENOR ||
+                           SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::UGLY;
   if (renderer.diffOnlyPanel() ? renderer.panelFrameKnown() : isQuickResumeSleep || tenorScreen) {
     saveSleepFrameBuffer();
   } else if (Storage.exists(SLEEP_FRAME_FILE)) {
@@ -444,6 +548,9 @@ void enterDeepSleep(bool fromTimeout = false) {
   halGaugeCapacity.abandon();
 #endif
   display.deepSleep();
+#if TENOR_COLD_LOG
+  coldlog::flush("sleep");
+#endif
   Storage.prepareForDeepSleep();
   LOG_INF("SLP", "Timing ready-to-sleep=%lu ms", static_cast<unsigned long>(millis() - sleepStarted));
   LOG_DBG("MAIN", "Entering deep sleep");
@@ -466,7 +573,8 @@ static void logHeapMark(const char* tag) {
           static_cast<unsigned>(heap.largestBlockBytes), static_cast<unsigned>(heap.minFreeBytes));
 }
 
-void setupDisplayAndFonts(bool seamless = false) {
+// sdFonts false: the update boot, whose screen draws built-in fonts only (UpdateBoot.h).
+void setupDisplayAndFonts(bool seamless = false, bool sdFonts = true) {
 #if !FREEINK_MCU_C3
   // C3 resolves its controller in HalGPIO::begin() before SPI claims the
   // display pins. X4 Pro skips that C3-only path, so probe here before
@@ -513,9 +621,13 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.insertFont(UI_TITLE_FONT_ID, uiFontTierFamily(UIFontRole::Title, 0));
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
   logHeapMark("fonts-builtin");
+  // tenor/ugly: its four fonts always go in, under this lock like the others, so no screen registers them while
+  // the render task reads the font table (the box that asks before the shell turns to tenor/ugly is drawn from
+  // tenor/cross). Four table entries, no glyph data: the faces live in flash.
+  ugly::ensureFonts(renderer);
 
   // Discover and load SD card fonts
-  sdFontSystem.begin(renderer);
+  if (sdFonts) sdFontSystem.begin(renderer);
   if (!applyUiFontSize(renderer, SETTINGS.uiTextSize)) {
     LOG_ERR("MAIN", "Unable to apply saved UI font size");
   }
@@ -533,10 +645,28 @@ void setup() {
   // enumeration proceed asynchronously so users do not pay this startup cost.
   delay(250);
 #endif
+#ifdef TENOR_PRESS_PROBE
+  logSerial.setRxBufferSize(8192);  // CMD:PUT: a 4096 byte window must fit while the card is written
+#elif TENOR_CABLE_FLASH && !defined(SIMULATOR)
+  logSerial.setRxBufferSize(2048);  // a whole cable flash frame (1,048 B) waits while the slot is written
+#endif
   Serial.begin(115200);
 #if LOG_SERIAL_HAS_TX_TIMEOUT
   logSerial.setTxTimeoutMs(1);  // This is a load-bearing 1. Do not modify.
 #endif
+#if ARDUINO_USB_CDC_ON_BOOT && defined(ARDUINO_USB_MODE) && !ARDUINO_USB_MODE
+  // Native USB CDC reboots into ROM download on a host's DTR/RTS reset sequence; a board that
+  // cannot be reached in download mode would stay there until reset by hand.
+  logSerial.enableReboot(false);
+#endif
+#endif
+#if FREEINK_DEVICE_X4PRO && !defined(SIMULATOR)
+  const bool trialBoot = boot_trial::begin();
+#else
+  const bool trialBoot = false;
+#endif
+#if defined(TENOR_PRESS_PROBE) && FREEINK_DEVICE_X4PRO && !defined(SIMULATOR)
+  fwprobe::onBoot();  // CMD:ROLLBACK_TEST crashes the boots it was armed for, here
 #endif
 
   HalSystem::begin();
@@ -548,7 +678,8 @@ void setup() {
   // Bound the target range too - RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_READER) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_MAX) ? silentRebootTarget : 0;
+  const bool silentRebootLightOn = isSilentReboot && (silentRebootPayload & SILENT_REBOOT_LIGHT_ON) != 0;
   const HomeMenuItem snapshotHomeMenu =
       isSilentReboot && silentRebootHomeMenu <= static_cast<uint32_t>(HomeMenuItem::FAVORITES_TAB)
           ? static_cast<HomeMenuItem>(silentRebootHomeMenu)
@@ -556,6 +687,11 @@ void setup() {
   silentRebootMagic = 0;
   silentRebootTarget = 0;
   silentRebootHomeMenu = 0;
+  silentRebootPayload = 0;
+  // Spent here on every boot, like the flags above: whatever ends the update boot, the next one
+  // is a normal boot unless the update screen arms another.
+  const update_boot::Request otaBoot = update_boot::take(otaBootSlot);
+  const bool updateBoot = isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_OTA && otaBoot.armed;
 
 #ifdef TENOR_PRESS_PROBE
   const bool probeTimerWake = esp_reset_reason() == ESP_RST_DEEPSLEEP &&
@@ -577,14 +713,21 @@ void setup() {
   // boot - but defer the sleep-or-boot decision until SETTINGS is loaded below:
   // click-to-wake is a setting, and an X4 battery power-off cuts all power, so
   // only SD state survives to the next boot.
-  const unsigned long verifyStarted = millis();
-  bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
+  // The hold that wakes is watched from here, while the stores, the display and the fonts load: it
+  // is judged early where the settings can tell (below), and for good just before the first thing
+  // that reaches the glass or the card.
+  bool watchWakeHold = wakeupReason == HalGPIO::WakeupReason::PowerButton;
 #ifdef TENOR_PRESS_PROBE
-  LOG_INF("PROBE", "wake verify=%lu ms", millis() - verifyStarted);
-  wakeHoldVerified = wakeHoldVerified || probeTimerWake;
-#else
-  (void)verifyStarted;
+  const bool probeHold = probeTimerWake && probeWakeHoldMagic == PROBE_WAKE_MAGIC && probeWakeHoldMs > 0;
+  // A plain timed wake stands in for a hold already verified: nothing to watch.
+  if (probeTimerWake && !probeHold) watchWakeHold = false;
+  if (probeHold) {
+    gpio.setProbeWakeHold(probeWakeHoldMs);
+    LOG_INF("PROBE", "wake hold simulated until=%lu ms", static_cast<unsigned long>(probeWakeHoldMs));
+  }
 #endif
+  [[maybe_unused]] const unsigned long holdBegan = millis();
+  if (watchWakeHold) gpio.beginPowerWakeHold();
 
   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 - an ESP32-S3 boot strap - so
   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
@@ -592,6 +735,10 @@ void setup() {
                                                                                      : MappedInputManager::Button::Up;
   const bool recoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
                                     gpio.isPressed(HalGPIO::BTN_POWER) && mappedInputManager.isPressed(recoveryButton);
+#if TENOR_CABLE_FLASH
+  // The keys held at power on are the yes for the first cable update, card or no card.
+  if (recoveryFirmwareMode) cableflash::grantRecoveryConsent();
+#endif
 
   halTiltSensor.begin();
   halClock.begin();
@@ -606,15 +753,20 @@ void setup() {
   // We need 6 open files concurrently when parsing a new chapter
   if (!Storage.begin()) {
     LOG_ERR("MAIN", "SD card initialization failed");
+    if (watchWakeHold) gpio.endPowerWakeHold(false);
     setupDisplayAndFonts(isSilentReboot);
     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
     return;
   }
 
+  FontPackInstaller::scan();
   HalSystem::checkPanic();
   logHeapMark("storage");
 
   APP_STATE.loadFromFile();
+#ifdef TENOR_PRESS_PROBE
+  logHeapMark("store-state");
+#endif
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
 
@@ -626,12 +778,27 @@ void setup() {
   // Touch boards default the reader menu to the toolbar overlay instead of the
   // full-screen list. Seeded before the load: fromJson() falls back to the
   // in-memory value only when the file carries no readerMenuStyle key, so a
-  // user's saved choice (either style) still wins.
-  if (gpio.hasTouch()) {
+  // user's saved choice (either style) still wins. The X4 Pro opens the list menu, as the X3 does.
+  if (gpio.hasTouch() && !FREEINK_DEVICE_X4PRO) {
     SETTINGS.readerMenuStyle = CrossPointSettings::READER_MENU_TOOLBAR;
   }
+#ifdef TENOR_PRESS_PROBE
+  (void)getBaseSettingsList();  // the catalog a settings screen builds, measured on its own
+  logHeapMark("settings-catalog");
+  releaseBaseSettingsList();  // the load does not keep it; no render task yet
+#endif
   SETTINGS.loadFromFile();
+#ifdef TENOR_PRESS_PROBE
+  logHeapMark("settings-json");
+#endif
+  shell::settingsLoaded();
+#if CROSSPOINT_BLE_HID_HOST
+  beginPageTurner(renderer, SETTINGS.ble, runRemoteShortcut, restartIntoOpenBook);
+#endif
   logHeapMark("store-settings");
+  // Push the saved timezone's POSIX rule into the clock (migrating the legacy
+  // UTC-offset setting on first boot after the update).
+  timezones::applyToClock();
   RECENT_BOOKS.loadFromFile();
   logHeapMark("store-recent");
   // Quote files written before v1.0.11 are renamed to the per-book scheme here, before the
@@ -652,16 +819,22 @@ void setup() {
 
   // Brightness and warmth are always restored. A normal wake starts with the
   // light off unless Restore Light on Wake is enabled; silent maintenance
-  // reboots preserve the live state so they do not unexpectedly go dark.
-  const bool restoreLightOn = SETTINGS.frontlightOn != 0 && (SETTINGS.frontlightRestoreOnWake != 0 || isSilentReboot);
+  // reboots replay the live state captured at restart, so they neither go dark
+  // nor light up against the user's wake preference.
+  const bool restoreLightOn =
+      isSilentReboot ? silentRebootLightOn : (SETTINGS.frontlightOn != 0 && SETTINGS.frontlightRestoreOnWake != 0);
   Frontlight.begin(SETTINGS.frontlightBrightness, SETTINGS.frontlightWarmth, restoreLightOn);
 
   switch (wakeupReason) {
-    case HalGPIO::WakeupReason::PowerButton:
+    case HalGPIO::WakeupReason::PowerButton: {
       // With Short Power Button Press = Sleep, a single click wakes on any
       // device, X3 included, so the tap that locks also unlocks; otherwise the
       // button must still be held (ghost-wake debounce).
-      if (!CrossPointSettings::acceptPowerWake(SETTINGS.shortPwrBtn, wakeHoldVerified)) {
+      const bool heldSoFar = !watchWakeHold || gpio.powerWakeHeld();
+#ifdef TENOR_PRESS_PROBE
+      LOG_INF("PROBE", "wake hold begin=%lu early=%lu held=%u", holdBegan, millis(), heldSoFar);
+#endif
+      if (!CrossPointSettings::acceptPowerWake(SETTINGS.shortPwrBtn, heldSoFar)) {
         LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
         halTiltSensor.deepSleep();
         Storage.prepareForDeepSleep();
@@ -669,6 +842,7 @@ void setup() {
       }
       wakePowerReleasePending = true;
       break;
+    }
     case HalGPIO::WakeupReason::AfterUSBPower:
       // Most devices return to sleep after a USB-powered cold boot.
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
@@ -722,47 +896,103 @@ void setup() {
     APP_STATE.openEpubPath.clear();
     APP_STATE.saveToFile();
   }
+  bool normalColdBoot = !isSleepWake;
+#ifndef SIMULATOR
+  normalColdBoot = esp_reset_reason() == ESP_RST_POWERON || esp_reset_reason() == ESP_RST_EXT;
+#endif
+  const bool normalUglyBoot = !recoveryFirmwareMode && !rebootedFromPanic && !updateBoot && !isSilentReboot &&
+                              (isSleepWake || normalColdBoot);
+  const auto uglyStart = SETTINGS.startScreen(normalUglyBoot);
+  const bool bookSetting = shell::isUgly() ? uglyStart == CrossPointSettings::UGLY_START_BOOK : SETTINGS.wakeIntoBook;
   const std::string wakeBook =
-      wakebook::bookToOpen(isSleepWake, SETTINGS.wakeIntoBook, APP_STATE.openEpubPath, RECENT_BOOKS.getBooks(),
-                           [](const std::string& path) { return Storage.exists(path.c_str()); });
+      wakebook::bookToOpen(isSleepWake, bookSetting, APP_STATE.openEpubPath, RECENT_BOOKS.getBooks(),
+                           [](const std::string& path) { return Storage.exists(path.c_str()); },
+                           shell::isUgly() && normalUglyBoot && normalColdBoot);
   const bool wakeToBook = !wakeBook.empty();
 
-  setupDisplayAndFonts(resume != BootResume::Splash);
+  setupDisplayAndFonts(resume != BootResume::Splash, !updateBoot);
   renderer.setDiffOnlyPanel(gpio.deviceIsX3() && display.getController() == HalDisplay::Controller::UC8279);
   logHeapMark("display-and-fonts");
+
+  bool sleepFrameKept = false;
+  if (resume == BootResume::SplashlessWake) {
+    // One-shot flag: re-arm the splash for the next ordinary boot. Set here,
+    // written once the first frame is up (HomeActivity::render); every other
+    // first screen writes it now, before it paints. Until then the card still
+    // says "asleep", so a wake cut off before its first frame (power lost, a
+    // hang) is simply repeated from the same kept frame. Writing in memory
+    // first means a sleep started meanwhile clears it again, and whichever
+    // save runs last writes that. A crash reboot shows the splash and
+    // re-arms the flag below.
+    APP_STATE.showBootScreen = true;
+    // The kept frame goes back into the controller while the hold is still being watched, so the
+    // first paint can start the moment the hold is judged. This reaches neither the glass nor the card.
+    const uint32_t wakeStarted = millis();
+    if (Storage.exists(SLEEP_FRAME_FILE) && loadSleepFrameBuffer()) {
+      sleepFrameKept = true;
+      if (gpio.deviceIsX3()) {
+        // Restore controller RAM without activating a waveform. The first
+        // Home/Reader paint cleans directly from this retained sleep frame.
+        renderer.cleanupGrayscaleWithFrameBuffer();
+      }
+      LOG_DBG("MAIN", "Restored sleep frame baseline");
+    } else {
+      // Nothing says what the glass holds: the first paint drives every pixel.
+      renderer.redriveNextRefresh();
+    }
+    LOG_INF("BOOT", "Wake frame=%lu ms", static_cast<unsigned long>(millis() - wakeStarted));
+  }
+
+  if (watchWakeHold) {
+    // The hold's last word, before anything reaches the glass or the card. With the quick press set
+    // to Sleep a tap is enough to wake, so nothing waits for the window.
+    [[maybe_unused]] const unsigned long finalAt = millis();
+    const bool held = gpio.endPowerWakeHold(SETTINGS.shortPwrBtn != CrossPointSettings::SLEEP);
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("PROBE", "wake hold final=%lu wait=%lu held=%u", finalAt, millis() - finalAt, held);
+#endif
+    if (!CrossPointSettings::acceptPowerWake(SETTINGS.shortPwrBtn, held)) {
+      LOG_DBG("MAIN", "Power-button wake not held through the window, sleeping");
+      halTiltSensor.deepSleep();
+      display.deepSleep();
+      Storage.prepareForDeepSleep();
+      sleepUntilPowerButton();
+    }
+  }
+
+  // A wake on its way to Home, with the hold just judged and the "Wake-up notice" setting on (off by
+  // default): the sleep screen stays and takes the notice the going-to-sleep one has, in one fast
+  // refresh over the kept frame that the first screen then cleans. Not with the quick press on Sleep
+  // (no window was waited out, so the notice would only delay Home). Off, nothing here runs.
+  const bool wakeNotice = SETTINGS.wakeNotice != 0 && watchWakeHold && renderer.diffOnlyPanel() &&
+                          SETTINGS.shortPwrBtn != CrossPointSettings::SLEEP && !recoveryFirmwareMode &&
+                          !rebootedFromPanic && !updateBoot && !wakeToBook;
+  // Not without the frame (what the glass shows is not known).
+  if (wakeNotice && sleepFrameKept) {
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("BOOT", "Wake label kick=%lu", static_cast<unsigned long>(millis()));
+#endif
+    SleepActivity::showStartingUp(renderer);
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("BOOT", "Wake label started=%lu", static_cast<unsigned long>(millis()));
+#endif
+  }
+#ifdef TENOR_WAKE_LABEL_GRAY
+  // The same for a sleep screen the card keeps no frame of (a gray one): off unless the build asks.
+  if (wakeNotice && resume == BootResume::SplashlessWake && !sleepFrameKept) {
+    SleepActivity::showStartingUpOverGray(renderer);
+  }
+#endif
 
   switch (resume) {
     case BootResume::Silent:
       // Splash skipped: the routing block below picks the target activity; the
       // panel keeps showing the pre-reboot popup until that first paint lands.
       break;
-    case BootResume::SplashlessWake: {
-      // One-shot flag: re-arm the splash for the next ordinary boot. Set here,
-      // written once the first frame is up (HomeActivity::render); every other
-      // first screen writes it now, before it paints. Until then the card still
-      // says "asleep", so a wake cut off before its first frame (power lost, a
-      // hang) is simply repeated from the same kept frame. Writing in memory
-      // first means a sleep started meanwhile clears it again, and whichever
-      // save runs last writes that. A crash reboot shows the splash and
-      // re-arms the flag below.
-      APP_STATE.showBootScreen = true;
+    case BootResume::SplashlessWake:
       if (recoveryFirmwareMode || rebootedFromPanic || wakeToBook) APP_STATE.saveToFile();
-      const uint32_t wakeStarted = millis();
-      if (Storage.exists(SLEEP_FRAME_FILE) && loadSleepFrameBuffer()) {
-        if (gpio.deviceIsX3()) {
-          // Restore controller RAM without activating a waveform. The first
-          // Home/Reader paint cleans directly from this retained sleep frame.
-          renderer.cleanupGrayscaleWithFrameBuffer();
-        }
-        LOG_DBG("MAIN", "Restored sleep frame baseline");
-      } else {
-        // Nothing says what the glass holds: the first paint drives every pixel.
-        renderer.redriveNextRefresh();
-      }
-      LOG_INF("BOOT", "Wake frame=%lu ms", static_cast<unsigned long>(millis() - wakeStarted));
       needsWakeRefresh = true;
       break;
-    }
     case BootResume::Splash:
       if (!APP_STATE.showBootScreen) {
         APP_STATE.showBootScreen = true;
@@ -784,9 +1014,26 @@ void setup() {
   } else if (rebootedFromPanic) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
+  } else if (trialBoot) {
+    // Check a simple screen before a saved book can rebuild its index.
+    activityManager.goHome(HomeMenuItem::SETTINGS_MENU, true);
+  } else if (updateBoot) {
+    // Straight to the update, on the heap of a fresh boot; the screen restarts on its way out.
+    auto update = makeUniqueNoThrow<OtaUpdateActivity>(renderer, mappedInputManager, otaBoot);
+#ifdef TENOR_PRESS_PROBE
+    probeDryRunUrl[sizeof(probeDryRunUrl) - 1] = '\0';
+    if (update && otaBoot.dryRun()) update->setDryRun(probeDryRunUrl);
+#endif
+    if (update)
+      activityManager.replaceActivity(std::move(update));
+    else
+      activityManager.goHome();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_SETTINGS) {
+    // Back out of the WiFi rows and the user is where they left off, not on Home.
+    activityManager.goToSettings();
   } else if (resume == BootResume::Silent) {
     // target == home (or reader with no open book): land on home - don't fall
     // through to the wake-into-book branch below.
@@ -797,9 +1044,18 @@ void setup() {
     // which is the pass that takes the retained sleep frame off the panel.
     activityManager.goToReader(wakeBook);
   } else {
-    activityManager.goHome(HomeMenuItem::RECENT_CONTINUE, needsWakeRefresh);
+    const HomeMenuItem startHome = shell::isUgly() && uglyStart == CrossPointSettings::UGLY_START_RECENT
+                                       ? HomeMenuItem::RECENTS
+                                       : HomeMenuItem::RECENT_CONTINUE;
+    activityManager.goHome(startHome, needsWakeRefresh);
   }
 
+#ifdef TENOR_PRESS_PROBE
+  if (resume == BootResume::Silent)
+    LOG_INF("FTX", "silent boot target=%u home=%u screen=%s t=%lu", static_cast<unsigned>(snapshotTarget),
+            static_cast<unsigned>(snapshotHomeMenu), activityManager.currentName() ? activityManager.currentName() : "-",
+            millis());
+#endif
   if (resume == BootResume::Silent) {
     // Block until the first paint physically completes. refreshDisplay()
     // waits on the panel BUSY pin so when this returns the user can see the
@@ -807,6 +1063,9 @@ void setup() {
     // during boot dispatches against an invisible Home and the default
     // selectorIndex=0 opens the most-recent book.
     activityManager.requestFirstPaintAndWait();
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("FTX", "silent boot first paint t=%lu", millis());
+#endif
     // Absorb any button held at this point into currentState as a non-edge:
     // two gpio.update() calls separated by > InputManager's 5ms debounce
     // transition the held bit through lastDebounceTime into currentState
@@ -823,8 +1082,12 @@ void setup() {
       otaState == ESP_OTA_IMG_PENDING_VERIFY) {
     // SD, settings and activity startup succeeded. Wait for the first physical paint.
     activityManager.requestUpdateAndWait();
+#if FREEINK_DEVICE_X4PRO
+    boot_trial::passed(gpio.hasTouch());
+#else
     const esp_err_t verified = esp_ota_mark_app_valid_cancel_rollback();
     LOG_INF("OTA", "Boot self-check complete: %s", esp_err_to_name(verified));
+#endif
   }
 #endif
   allowSleepAt = millis() + 2000;
@@ -836,7 +1099,8 @@ static bool visitDiagnosticSetting(const String& key, Visitor&& visitor) {
   if (key == "blePageTurnerEnabled") {
     SettingInfo info;
     info.key = "blePageTurnerEnabled";
-    info.valuePtr = &CrossPointSettings::blePageTurnerEnabled;
+    info.valueGetter = []() -> uint8_t { return SETTINGS.ble.enabled; };
+    info.valueSetter = [](const uint8_t v) { SETTINGS.ble.enabled = v; };
     return visitor(info);
   }
   if (key == "fontFamily") return visitor(buildFontFamilySetting(&sdFontSystem.registry()));
@@ -853,7 +1117,7 @@ static void updateTiltSensorForForegroundActivity(const bool foregroundReader,
   halTiltSensor.setStrength(SETTINGS.tiltStrengthH, SETTINGS.tiltStrengthV);
   halTiltSensor.configureShake(SETTINGS.shakeAction, SETTINGS.shakeStrength);
   halTiltSensor.configureFlip(SETTINGS.faceDownAction, SETTINGS.faceUpAction);
-  halTiltSensor.configureDoubleTap(SETTINGS.doubleTapAction);
+  halTiltSensor.configureDoubleTap(SETTINGS.doubleTapAction, SETTINGS.screenTapAction, SETTINGS.edgeTapAction);
   // Menus wait for a side flick to come back (picking the device up is not a tab
   // step); the reader keeps page turns immediate.
   halTiltSensor.confirmSideFlicks(!foregroundReader);
@@ -869,7 +1133,55 @@ static void updateTiltSensorForForegroundActivity(const bool foregroundReader,
 }
 
 // Runs a short action on the screen in front, or nothing where it has no meaning there.
+#if defined(TENOR_TAP_LOG) && !defined(SIMULATOR)
+// Measurement build only: every double tap the gestures act on, and one line a minute awake, kept in
+// RAM and rewritten whole to /v1019/tap/<boot>-<part>.csv. Worn with no tap made on purpose, every
+// tap line is a false one and the minute lines are the hours it was measured over.
+static void tapLog(const char* const what) {
+  static std::string lines;
+  static unsigned part = 0;
+  static long boot = 0;
+  if (boot == 0) boot = static_cast<long>(time(nullptr));
+  char row[96];
+  snprintf(row, sizeof(row), "%ld,%lu,%s,%s\n", static_cast<long>(time(nullptr)), millis(), what,
+           activityManager.isReaderActivity() ? "doc" : "khac");
+  lines += row;
+  Storage.mkdir("/v1019");
+  Storage.mkdir("/v1019/tap");
+  char path[64];
+  snprintf(path, sizeof(path), "/v1019/tap/%ld-%u.csv", boot, part);
+  HalFile file;
+  if (Storage.openFileForWrite("TLOG", path, file)) {
+    file.print("epoch,ms,su_kien,man\n");
+    file.write(reinterpret_cast<const uint8_t*>(lines.data()), lines.size());
+    file.close();
+  }
+  if (lines.size() > 6000) {
+    lines.clear();
+    part++;
+  }
+}
+
+static void tapLogTick() {
+  static unsigned long last = 0;
+  if (last != 0 && millis() - last < 60000) return;
+  last = millis();
+  tapLog("phut");
+}
+#endif
+
+// The side button that turns the page forward (or back), as the side button layout sets it.
+[[maybe_unused]] static uint8_t sideButton(const bool forward) {
+  const bool swapped = SETTINGS.sideButtonLayout == CrossPointSettings::NEXT_PREV;
+  return forward != swapped ? HalGPIO::BTN_DOWN : HalGPIO::BTN_UP;
+}
+
 static void runQuickAction(const uint8_t action, const quickaction::Trigger trigger) {
+#if defined(TENOR_TAP_LOG) && !defined(SIMULATOR)
+  if (trigger == quickaction::Trigger::DoubleTap) tapLog("lung");
+  if (trigger == quickaction::Trigger::ScreenTap) tapLog("man-hinh");
+  if (trigger == quickaction::Trigger::EdgeTap) tapLog("canh");
+#endif
   // Long enough for two 10 ms samples to agree, short of any hold action.
   [[maybe_unused]] static constexpr uint16_t QUICK_PRESS_HOLD_MS = 60;
   const quickaction::Outcome outcome =
@@ -893,6 +1205,11 @@ static void runQuickAction(const uint8_t action, const quickaction::Trigger trig
       activityManager.readerShortcut(outcome == quickaction::Outcome::ReaderMenu ? ReaderShortcut::Menu
                                                                                  : ReaderShortcut::Quote);
       break;
+    case quickaction::Outcome::SideForward:
+#ifndef SIMULATOR  // no motion sensor there, so no double tap reaches this
+      gpio.injectPresses(sideButton(true), QUICK_PRESS_HOLD_MS, 1, 0);
+#endif
+      break;
     case quickaction::Outcome::Back:
     case quickaction::Outcome::Confirm:
 #ifndef SIMULATOR  // no motion sensor there, so no shake reaches this
@@ -907,6 +1224,138 @@ static void runQuickAction(const uint8_t action, const quickaction::Trigger trig
 }
 
 #if defined(TENOR_PRESS_PROBE) && !defined(SIMULATOR)
+static HalFile tapRecFile;
+static void tapRecFrames(const Imu::RawFrame* const frames, const bool* const gaps, const uint16_t count) {
+  if (!tapRecFile.isOpen()) return;
+  uint8_t record[13];
+  for (uint16_t i = 0; i < count; ++i) {
+    record[0] = gaps[i] ? 1 : 0;
+    memcpy(&record[1], &frames[i], 12);
+    tapRecFile.write(record, sizeof(record));
+  }
+}
+static void tapRecCommand(const String& cmd) {
+  if (cmd == "TAP_REC_START") {
+    Storage.mkdir("/v1019");
+    const bool ok = Storage.openFileForWrite("TREC", "/v1019/fifo.bin", tapRecFile);
+    halTiltSensor.probeFrameSink(ok ? tapRecFrames : nullptr);
+    logSerial.printf("TAP_REC:start,%d,t=%lu\n", ok, millis());
+  } else if (cmd == "TAP_REC_STOP") {
+    halTiltSensor.probeFrameSink(nullptr);
+    const size_t size = tapRecFile.isOpen() ? tapRecFile.size() : 0;
+    tapRecFile.close();
+    logSerial.printf("TAP_REC:stop,bytes=%u,t=%lu\n", static_cast<unsigned>(size), millis());
+  } else if (tapRecFile.isOpen()) {
+    uint8_t record[13] = {2};
+    const String label = cmd.substring(9);
+    memcpy(&record[1], label.c_str(), std::min<size_t>(12, label.length()));
+    tapRecFile.write(record, sizeof(record));
+    tapRecFile.flush();
+    logSerial.printf("TAP_MARK:%s,bytes=%u,t=%lu\n", label.c_str(), static_cast<unsigned>(tapRecFile.size()), millis());
+  }
+}
+
+// CMD:CAT <path>: a file from the card over the cable, "CAT_START:<bytes>", the bytes as they are,
+// then "CAT_END:<crc32>" (zlib's). The 1 ms send timeout is raised for the transfer
+// only, so a full USB buffer waits for the host instead of dropping bytes.
+static void catCommand(const String& path) {
+  [[maybe_unused]] LogSerialBinary binary;
+  HalFile file;
+  if (!Storage.openFileForRead("CAT", path.c_str(), file)) {
+    logSerial.printf("CAT_FAIL:%s\n", path.c_str());
+    return;
+  }
+  static uint8_t buf[1024];
+  uint32_t crc = 0xFFFFFFFFu;
+#if LOG_SERIAL_HAS_TX_TIMEOUT
+  logSerial.setTxTimeoutMs(500);
+#endif
+  logSerial.printf("CAT_START:%u\n", static_cast<unsigned>(file.size()));
+  int n;
+  bool sending = true;
+  while (sending && (n = file.read(buf, sizeof(buf))) > 0) {
+    for (int i = 0; i < n; ++i) {
+      crc ^= buf[i];
+      for (int b = 0; b < 8; ++b) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    for (int sent = 0; sent < n;) {
+      const size_t w = logSerial.write(buf + sent, n - sent);
+      if (w == 0) {
+        sending = false;  // The host stopped reading: the CRC tells it the file is short.
+        break;
+      }
+      sent += static_cast<int>(w);
+    }
+  }
+  file.close();
+  logSerial.printf("\nCAT_END:%08lx\n", static_cast<unsigned long>(~crc));
+#if LOG_SERIAL_HAS_TX_TIMEOUT
+  logSerial.setTxTimeoutMs(1);
+#endif
+}
+
+// CMD:PUT <path> <size> <crc32 as 8 hex digits>: the file comes over the cable and is written to the card.
+// "PUT:READY <size>" says the card is open; the host then sends <size> raw bytes, at most 4096 before it
+// reads "PUT:ACK <bytes so far>". The bytes go to <path>.tmp in 1024 byte pieces (nothing is allocated by
+// size), the sum is checked, and a match renames the file over <path>: "PUT:OK <size> <crc>". Otherwise
+// the .tmp is removed and the line is "PUT:FAIL <reason>". 10 s without a byte is a failure.
+static void putCommand(const String& args) {
+  putfile::Command cmd;
+  if (!putfile::parse(args.c_str(), cmd)) {
+    logSerial.printf("PUT:FAIL bad command\n");
+    return;
+  }
+  const std::string tmpPath = cmd.path + ".tmp";
+  HalFile file;
+  if (!Storage.openFileForWrite("PUT", tmpPath.c_str(), file)) {
+    logSerial.printf("PUT:FAIL cannot open %s\n", tmpPath.c_str());
+    return;
+  }
+  struct Port {
+    size_t sinceAck = 0, total = 0;
+    size_t read(uint8_t* buf, size_t max) {
+      const int waiting = logSerial.available();
+      if (waiting <= 0) {
+        delay(1);
+        return 0;
+      }
+      return logSerial.readBytes(buf, std::min<size_t>(max, static_cast<size_t>(waiting)));
+    }
+  } port;
+  struct Sink {
+    HalFile& file;
+    Port& port;
+    bool write(const uint8_t* buf, size_t n) {
+      if (file.write(buf, n) != n) return false;
+      port.total += n;
+      port.sinceAck += n;
+      if (port.sinceAck >= 4096) {
+        port.sinceAck = 0;
+        logSerial.printf("PUT:ACK %u\n", static_cast<unsigned>(port.total));
+      }
+      return true;
+    }
+  } sink{file, port};
+  struct Clock {
+    uint32_t now() { return millis(); }
+  } clock;
+  static uint8_t buf[1024];
+#if LOG_SERIAL_HAS_TX_TIMEOUT
+  logSerial.setTxTimeoutMs(500);
+#endif
+  logSerial.printf("PUT:READY %u\n", static_cast<unsigned>(cmd.size));
+  uint32_t crc = 0;
+  const putfile::Result received = putfile::receive(cmd, port, sink, clock, buf, sizeof(buf), 10000, &crc);
+  const putfile::Result result = putfile::finish(received, Storage, file, tmpPath, cmd.path);
+  if (result == putfile::Result::Ok)
+    logSerial.printf("PUT:OK %u %08lx\n", static_cast<unsigned>(cmd.size), static_cast<unsigned long>(crc));
+  else
+    logSerial.printf("PUT:FAIL %s\n", putfile::reason(result));
+#if LOG_SERIAL_HAS_TX_TIMEOUT
+  logSerial.setTxTimeoutMs(1);
+#endif
+}
+
 // CMD:CUR_LOG <s>: for the next <s> seconds, one fuel gauge line every 10 s (average and
 // instant current in mA, voltage, whether the motion sensor samples, the shake action),
 // kept in RAM too, so a run with the cable out is read back with CMD:CUR_LOG and no number.
@@ -916,7 +1365,11 @@ struct CurLogRow {
   uint16_t mv;
   uint8_t imuAwake, shakeAction;
 };
+#ifdef TENOR_PROBE_LITE
+static CurLogRow curLogRows[8];
+#else
 static CurLogRow curLogRows[96];
+#endif
 static uint8_t curLogCount = 0;
 static unsigned long curLogUntilMs = 0, curLogNextMs = 0;
 
@@ -989,11 +1442,21 @@ static void gaugeLogTick() {
 }
 #endif
 
+#ifdef SIMULATOR
+#include "platform/SimulatorPathScreens.h"
+#endif
+
 void loop() {
+#ifdef SIMULATOR
+  simulatorPathScreen(renderer, mappedInputManager);
+#endif
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
 
+#ifdef TENOR_PRESS_PROBE
+  probeReprintDryRunLine();
+#endif
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
   mappedInputManager.update();
 #ifndef SIMULATOR
@@ -1001,6 +1464,9 @@ void loop() {
   powerManager.pollGauge();
   // The battery's capacity into the gauge, once the first screen is up; never blocks.
   if (activityManager.hasDrawnFrame()) halGaugeCapacity.tick();
+#endif
+#if defined(TENOR_TAP_LOG) && !defined(SIMULATOR)
+  tapLogTick();
 #endif
 #if defined(TENOR_GAUGE_LOG) && !defined(SIMULATOR)
   gaugeLogTick();
@@ -1010,34 +1476,36 @@ void loop() {
 #endif
 
 #if CROSSPOINT_BLE_HID_HOST
-  // Resolve the radio handoff before USB's early return. Activity onEnter() can
-  // already have done blocking storage or Wi-Fi work before this loop resumes.
+  // Page turner BLE (lib/BlePageTurner): one pass before USB's early return, so a card handed
+  // over to USB or a file transfer stops the radio before anything else. Activity onEnter()
+  // can already have done blocking storage or Wi-Fi work before this loop resumes.
   bool bleInputActivity = false;
-  static bool bleReaderBeginAttempted = false;
-  static bool bleReaderReconnectConfigured = false;
-  // A start refused for memory is retried a few times once the reader has
-  // settled: the first page build holds the heap the radio needs and gives it
-  // back a few seconds later when the builder parks.
-  static constexpr unsigned long BLE_READER_RETRY_MS = 5000;
-  static constexpr uint8_t BLE_READER_RETRY_LIMIT = 6;
-  static unsigned long bleReaderRetryAtMs = 0;
-  static uint8_t bleReaderRetries = 0;
-  static uint32_t bleReaderGeneration = 0;
-  auto& bleHid = freeink::BleKeyboardHost::getInstance();
-  static uint32_t lastBleCleanupMs = 0;
-  static uint32_t bleIdleSinceMs = 0;
-  // Remote with a button table (learned, or the built-in default for its kind): the
-  // table picked once per link, and the tap/hold decision still waiting.
-  static blebinding::Router bleRouter;
-  if (bleHid.isStopping() && millis() - lastBleCleanupMs >= 250) {
-    lastBleCleanupMs = millis();
-    freeink::ble::suspendForTransition();  // Poll cancellation without blocking input.
+  {
+    bleturner::Scene scene{};
+    // A sheet over the page (the reader menu) puts the book out of front: the radio stopped before
+    // the sheet was drawn (EpubReaderActivity::stopRadioForSheet) and starts again on the page.
+    const bool bookInFront = activityManager.isForegroundReaderActivity() && !activityManager.foregroundReaderCoversPage();
+    const bool homeInFront = !bookInFront && activityManager.isForegroundHomePainted();
+    scene.where = bookInFront ? bleturner::Where::Reader
+                              : (homeInFront ? bleturner::Where::Home : bleturner::Where::Elsewhere);
+    scene.visit = activityManager.activityGeneration();
+    scene.pageShown = homeInFront || activityManager.isForegroundReaderReady();
+    // A book still building its index in the background keeps the radio off until the index
+    // is whole (EpubReaderActivity::holdsRadio); the device keys work meanwhile.
+    scene.bookIndexing = activityManager.foregroundReaderHoldsRadio();
+    scene.storageBusy = activityManager.requiresExclusiveStorageLoop() || filetransfer::isActive();
+    scene.wifiOn = WiFi.getMode() != WIFI_MODE_NULL;
+    scene.sleeping = activityManager.isSleepTransition();
+    // A page-key release or touch in the book grants one fresh start after the idle stop.
+    scene.localKey = mappedInputManager.wasReleased(MappedInputManager::Button::PageBack) ||
+                     mappedInputManager.wasReleased(MappedInputManager::Button::PageForward) ||
+                     mappedInputManager.wasReleased(MappedInputManager::Button::Left) ||
+                     mappedInputManager.wasReleased(MappedInputManager::Button::Right) || gpio.wasTouchActivity();
+    bleInputActivity = bleturner::tick(scene);
   }
-  const bool dangChiemStorage = activityManager.requiresExclusiveStorageLoop() || filetransfer::isActive();
-  if (dangChiemStorage) {
-    bleIdleSinceMs = 0;
-    freeink::ble::suspendForTransition();
-  }
+#ifdef TENOR_HEAP_BIG
+  heapBigProbeTick(bleturner::status().running);
+#endif
 #endif
 
   if (activityManager.requiresExclusiveStorageLoop()) {
@@ -1064,202 +1532,10 @@ void loop() {
   const bool foregroundActivityManagesTiltSensor = activityManager.isForegroundActivityManagingTiltSensor();
   updateTiltSensorForForegroundActivity(foregroundReader, foregroundActivityManagesTiltSensor);
 
-#if CROSSPOINT_BLE_HID_HOST
-  // Page turner BLE: callbacks only queue HID reports. Map each new report on
-  // main, then let the foreground reader coalesce one pending direction in its
-  // current activity generation. Unmapped/modifier reports do not reset timers.
-  {
-    // A saved opt-in starts only after the foreground reader has produced a
-    // page. Home needs its own cover/font memory before we can assess BLE's
-    // headroom. Each reader visit gets one attempt, avoiding allocation churn
-    // after a low-memory rejection. Pairing remains an explicit settings action.
-    const bool foregroundReader = activityManager.isForegroundReaderActivity();
-    const uint32_t generation = activityManager.activityGeneration();
-    if (!foregroundReader || !SETTINGS.blePageTurnerEnabled || generation != bleReaderGeneration) {
-      // A build hold belongs to one reader visit; the next visit may start the radio again.
-      if (generation != bleReaderGeneration) freeink::ble::setRadioHeldForBuild(false);
-      bleReaderBeginAttempted = false;
-      bleReaderReconnectConfigured = false;
-      bleRouter = blebinding::Router();  // settings may have changed the tables while away
-      bleReaderRetryAtMs = 0;
-      bleReaderRetries = 0;
-    }
-    bleReaderGeneration = generation;
-    // A page-key release or touch on the foreground reader grants one fresh
-    // attempt after idle-off. Repeated idle ticks never allocate/retry BLE.
-    const bool localReaderInput =
-        mappedInputManager.wasReleased(MappedInputManager::Button::PageBack) ||
-        mappedInputManager.wasReleased(MappedInputManager::Button::PageForward) ||
-        mappedInputManager.wasReleased(MappedInputManager::Button::Left) ||
-        mappedInputManager.wasReleased(MappedInputManager::Button::Right) || gpio.wasTouchActivity();
-    // A radio the reader stopped for a starved build restarts on the reader's request once
-    // its page is shown. Restarting it on a key release starved the build again and the
-    // start task held this loop for 2.85 s (X3, 23/09/2026).
-    if (foregroundReader && SETTINGS.blePageTurnerEnabled && freeink::ble::idleStopped() &&
-        ((localReaderInput && !freeink::ble::radioHeldForBuild()) || freeink::ble::takeRearmRequest())) {
-      freeink::ble::setIdleStopped(false);
-      bleReaderBeginAttempted = false;
-      bleReaderReconnectConfigured = false;
-      LOG_INF("BLE", "Reader input rearmed idle radio");
-    }
-    if (dangChiemStorage || !SETTINGS.blePageTurnerEnabled) {
-      bleIdleSinceMs = 0;
-      freeink::ble::suspendForTransition();
-    } else {
-      if (foregroundReader && bleReaderBeginAttempted && freeink::ble::readerStartDeferred() && !bleHid.isRunning() &&
-          !freeink::ble::initializing() && !freeink::ble::idleStopped() && bleReaderRetries < BLE_READER_RETRY_LIMIT) {
-        if (bleReaderRetryAtMs == 0) {
-          bleReaderRetryAtMs = millis() + BLE_READER_RETRY_MS;
-        } else if (millis() >= bleReaderRetryAtMs) {
-          bleReaderRetryAtMs = 0;
-          ++bleReaderRetries;
-          bleReaderBeginAttempted = false;
-          LOG_INF("BLE", "Retrying reader BLE start after memory refusal (%u)", static_cast<unsigned>(bleReaderRetries));
-        }
-      } else {
-        bleReaderRetryAtMs = 0;
-        if (bleHid.isRunning()) bleReaderRetries = 0;
-      }
-      // A book still building its index in the background keeps the radio off until the index
-      // is whole (EpubReaderActivity::holdsRadio); the device keys work meanwhile.
-      if (foregroundReader && activityManager.isForegroundReaderReady() && !bleReaderBeginAttempted &&
-          !freeink::ble::idleStopped() && !bleHid.isStopping() && !activityManager.foregroundReaderHoldsRadio() &&
-          (bleHid.isRunning() || activityManager.readyForegroundReaderForRadio())) {
-        bleReaderBeginAttempted = true;
-        if (!bleHid.isRunning()) {
-          const bool started = freeink::ble::beginAsync(renderer);
-          freeink::ble::setReaderStartDeferred(!started);
-          if (started) {
-            LOG_INF("BLE", "Reader BLE start requested");
-          } else {
-            LOG_ERR("BLE", "Reader BLE start deferred: insufficient memory or unavailable radio");
-          }
-        }
-      }
-      // Lau khong ai noi thi ha radio xuong. Khong co moc nay thi bat mot lan la
-      // radio chay mai, ma vong tiet kiem dien ben duoi co chu y giu CPU o toc do
-      // day chung nao radio con song, nen may nam im van an pin. Luat o BleIdleOff.h.
-      if (!freeink::ble::initializing() && bleHid.isRunning()) {
-        if (bleHid.isConnected() || bleIdleSinceMs == 0) bleIdleSinceMs = millis();
-        if (bleidle::shouldStop(true, bleHid.isConnected(), millis() - bleIdleSinceMs)) {
-          LOG_INF("BLE", "Radio idle for %u ms with nothing connected; stopping", bleidle::kIdleOffMs);
-          freeink::ble::stopForIdle();
-          bleIdleSinceMs = 0;
-        }
-      } else {
-        bleIdleSinceMs = 0;
-      }
-
-      if (foregroundReader && !freeink::ble::initializing() && bleHid.isRunning()) {
-        freeink::ble::setReaderStartDeferred(false);
-        if (!bleReaderReconnectConfigured && !bleHid.isStopping()) {
-          bleReaderReconnectConfigured = true;
-          if (SETTINGS.blePeerAddr[0] != '\0' &&
-              !bleHid.armSelectedPeerReconnect(SETTINGS.blePeerAddr)) {
-            LOG_INF("BLE", "Selected reader peer was not armed");
-          }
-        }
-        bleHid.poll();
-        // A remote with a table goes by RAW edges: each edge checks at most 8 slots of
-        // the connected remote's table, and a button the table does not name falls back
-        // to the old usage mapping. Without a table the raw ring is only drained and the
-        // key path below runs exactly as before.
-        freeink::RawButtonEvent tho;
-        bleRouter.follow(bleHid.isConnected());
-        if (bleRouter.linked && !bleRouter.chosen) {
-          // Edges queued while the reader was not in front (the remote stays linked on
-          // Home) do not belong to this page: drop them, so an old press cannot skip a
-          // chapter when the book opens.
-          while (bleHid.popRawButton(tho)) {
-          }
-          bleRouter.table = blebinding::tableFor(SETTINGS.bleRemotes, SETTINGS.bleRemoteCount, bleHid.connectedAddr(),
-                                                 bleHid.connectedName());
-          bleRouter.chosen = true;
-        }
-        const bool quaBang = blebinding::routes(bleRouter.table);
-        const auto lam = [&](const blebinding::Action a) {
-          if (a == blebinding::Action::None) return;
-          if (a == blebinding::Action::ReaderMenu || a == blebinding::Action::SaveQuote) {
-            // Catalog actions: the remote asks for them like every other trigger does.
-            runQuickAction(a == blebinding::Action::ReaderMenu ? CrossPointSettings::READER_MENU
-                                                               : CrossPointSettings::SAVE_QUOTE,
-                           quickaction::Trigger::Remote);
-            bleInputActivity = true;
-            return;
-          }
-          const bool toi = a == blebinding::Action::NextPage || a == blebinding::Action::NextChapter;
-          const bool chuong = a == blebinding::Action::NextChapter || a == blebinding::Action::PrevChapter;
-          if (chuong ? activityManager.chapterSkip(toi) : activityManager.pageTurn(toi)) bleInputActivity = true;
-        };
-        while (bleHid.popRawButton(tho)) {
-          if (!quaBang) continue;
-          const auto cu = SETTINGS.blePageActionFor(tho.keycode, tho.mods);
-          const auto hanhDong = blebinding::onRawEdge(
-              *bleRouter.table, tho.code(), tho.pressed, tho.atMs,
-              cu == CrossPointSettings::BlePageAction::NextPage       ? blebinding::Action::NextPage
-              : cu == CrossPointSettings::BlePageAction::PreviousPage ? blebinding::Action::PrevPage
-                                                                      : blebinding::Action::None,
-              bleRouter.wait);
-          lam(hanhDong);  // act first, log after: the log line is not on the page's clock
-          LOG_INF("BLE", "raw %u:%u=%02X %s -> %s", tho.reportId, tho.byteIndex, tho.value, tho.pressed ? "down" : "up",
-                  blebinding::actionName(hanhDong));
-        }
-        if (quaBang) {
-          const auto giu = blebinding::pollHold(bleRouter.wait, millis());
-          lam(giu);
-          if (giu != blebinding::Action::None) LOG_INF("BLE", "raw hold -> %s", blebinding::actionName(giu));
-        }
-        freeink::KeyEvent ev;
-        while (bleHid.popKey(ev)) {
-          // With a table the raw edge already decided this frame: its key event is only logged.
-          const auto hanhDong =
-              quaBang ? CrossPointSettings::BlePageAction::None : SETTINGS.blePageActionFor(ev.keycode, ev.mods);
-          // Mot dong cho MOI phim lay ra: day la duong chan doan cho nguoi cam
-          // dieu khien that (doc qua serial la biet remote gui ma nao).
-          LOG_INF("BLE", "key 0x%02X mods 0x%02X %s -> %s", ev.keycode, ev.mods, ev.pressed ? "down" : "up",
-                  hanhDong == CrossPointSettings::BlePageAction::PreviousPage  ? "previous"
-                  : hanhDong == CrossPointSettings::BlePageAction::NextPage    ? "next"
-                                                                               : "none");
-          if (hanhDong != CrossPointSettings::BlePageAction::PreviousPage &&
-              hanhDong != CrossPointSettings::BlePageAction::NextPage) {
-            continue;
-          }
-          // Only the press edge acts. Free3 reports a fixed release 60-100 ms after
-          // every press regardless of how long the button is held, so a hold cannot
-          // be told from a tap and the release frame carries nothing to act on.
-          if (!ev.pressed) continue;
-          // Enqueue once per new mapped report. A deferred repaint never
-          // generates another activity-timer reset on subsequent ticks.
-          if (activityManager.pageTurn(hanhDong == CrossPointSettings::BlePageAction::NextPage)) {
-            bleInputActivity = true;
-          }
-        }
-      }
-    }
-  }
-#endif
-
-#if CROSSPOINT_BLE_HID_HOST
-  // A heap in pieces keeps the radio off until a restart (BleHeapRestart.h). Restart into the book
-  // only from a shown page with no radio start in flight, no sleep, no card or Wi-Fi session; the
-  // close waits out a paint and writes the reading place and every deferred write first.
-  if (freeink::ble::heapRestartWanted() && SETTINGS.blePageTurnerEnabled && bleReaderBeginAttempted &&
-      activityManager.isForegroundReaderReady() && !activityManager.isSleepTransition() && !dangChiemStorage &&
-      !freeink::ble::busy() && WiFi.getMode() == WIFI_MODE_NULL) {
-    const auto heap = HalMemory::getInternalHeap();
-    LOG_INF("BLE", "Heap fragmented for radio: free=%u largest=%u; silent restart to reader",
-            static_cast<unsigned>(heap.freeBytes), static_cast<unsigned>(heap.largestBlockBytes));
-    freeink::ble::markHeapRestart();
-    activityManager.closeForRestart();
-    silentRestartToReader();
-    // Only a board that keeps its rails (touch) gets here without a restart: reopen the book.
-    activityManager.goToReader(APP_STATE.openEpubPath);
-  }
-#endif
-
   renderer.setFadingFix(SETTINGS.fadingFix);
 
-  if (Serial && millis() - lastMemPrint >= 10000) {
+  // The ROM console does not depend on Arduino USB CDC's connection state.
+  if ((Serial || FREEINK_LOG_TRANSPORT == FREEINK_LOG_TRANSPORT_ROM_PRINTF) && millis() - lastMemPrint >= 10000) {
     const auto heap = HalMemory::getInternalHeap();
     LOG_INF("MEM", "Free: %zu bytes, Total: %zu bytes, Min Free: %zu bytes, MaxAlloc: %zu bytes", heap.freeBytes,
             heap.totalBytes, heap.minFreeBytes, heap.largestBlockBytes);
@@ -1273,13 +1549,20 @@ void loop() {
 
   // Handle incoming serial commands,
   // nb: we use logSerial from logging to avoid deprecation warnings
-  if (logSerial.available() > 0) {
-    String line = logSerial.readStringUntil('\n');
+  // In the X4 Pro probe build a line can also come from the card's script (platform/ColdLog.h).
+  String line;
+  if (logSerial.available() > 0) line = logSerial.readStringUntil('\n');
+#if TENOR_COLD_LOG
+  else
+    line = coldlog::nextLine(activityManager.hasDrawnFrame());
+#endif
+  if (line.length() > 0) {
     if (line.startsWith("CMD:")) {
       powerManager.setPowerSaving(false);
       String cmd = line.substring(4);
       cmd.trim();
       if (cmd == "SCREENSHOT") {
+        [[maybe_unused]] LogSerialBinary binary;
         const uint32_t bufferSize = display.getBufferSize();
         logSerial.printf("SCREENSHOT_START:%d\n", bufferSize);
         uint8_t* buf = display.getFrameBuffer();
@@ -1364,20 +1647,40 @@ void loop() {
         // mid-render. Names follow the portrait reader mapping of the current settings.
         char name[12] = {};
         unsigned hold = 0, count = 0, gap = 0;
-        const bool sideSwapped = SETTINGS.sideButtonLayout == CrossPointSettings::NEXT_PREV;
         int button = -1;
         if (SCAN_COMMAND(cmd.c_str() + 6, "%11s %u %u %u", name, &hold, &count, &gap) == 4) {
           const String n(name);
           if (n == "NEXT") button = SETTINGS.frontButtonRight;
           if (n == "PREV") button = SETTINGS.frontButtonLeft;
-          if (n == "SIDE_NEXT") button = sideSwapped ? HalGPIO::BTN_UP : HalGPIO::BTN_DOWN;
-          if (n == "SIDE_PREV") button = sideSwapped ? HalGPIO::BTN_DOWN : HalGPIO::BTN_UP;
+          if (n == "SIDE_NEXT") button = sideButton(true);
+          if (n == "SIDE_PREV") button = sideButton(false);
           if (n == "POWER") button = HalGPIO::BTN_POWER;
           if (n == "BACK") button = mappedInputManager.physicalBack();
           if (n == "CONFIRM") button = SETTINGS.frontButtonConfirm;
         }
         if (button >= 0) gpio.injectPresses(button, hold, count, gap);
         logSerial.printf("PRESS:button=%d,hold=%u,count=%u,gap=%u,t=%lu\n", button, hold, count, gap, millis());
+#if FREEINK_CAP_TOUCH && !defined(SIMULATOR)
+      } else if (cmd.startsWith("TAP ") || cmd.startsWith("SWIPE ")) {
+        // CMD:TAP <x> <y> [holdMs] and CMD:SWIPE <x0> <y0> <x1> <y1> <ms>, in the coordinates the app
+        // draws in (portrait 480 x 800): one finger down, held or moved over the given time, then lifted.
+        const bool tap = cmd.startsWith("TAP ");
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        unsigned ms = 80;
+        bool ok = false;
+        if (tap) {
+          ok = SCAN_COMMAND(cmd.c_str() + 4, "%d %d %u", &x0, &y0, &ms) >= 2;
+          x1 = x0;
+          y1 = y0;
+        } else {
+          ok = SCAN_COMMAND(cmd.c_str() + 6, "%d %d %d %d %u", &x0, &y0, &x1, &y1, &ms) == 5;
+        }
+        if (ok) {
+          probeTouchPlan = touchprobe::swipe(x0, y0, x1, y1, ms);
+          InputManager::setTouchProbeHook(probeTouchHook);
+        }
+        logSerial.printf("TOUCH:ok=%d,from=%d,%d,to=%d,%d,ms=%u,t=%lu\n", ok, x0, y0, x1, y1, ms, millis());
+#endif
 #endif
 #if defined(TENOR_UI_ACCEPTANCE) || defined(TENOR_PRESS_PROBE)
       } else if (cmd == "UI_READER_NEXT" || cmd == "UI_READER_PREV") {
@@ -1387,24 +1690,21 @@ void loop() {
 #if CROSSPOINT_BLE_HID_HOST
       } else if (cmd == "BLE_TEST_BEGIN") {
         // In-memory only. A reset restores the saved user preference.
-        SETTINGS.blePageTurnerEnabled = 1;
-        const bool ok = freeink::ble::begin(renderer);
+        SETTINGS.ble.enabled = 1;
+        const bool ok = bleturner::switchOn();
         logSerial.printf("BLE_TEST:begin=%d,heap=%u,largest=%u\n", ok, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
       } else if (cmd == "BLE_TEST_END") {
-        SETTINGS.blePageTurnerEnabled = 0;
-        freeink::ble::setIdleStopped(false);
-        freeink::ble::setReaderStartDeferred(false);
-        const bool ended = freeink::ble::suspendForTransition(1000);
+        SETTINGS.ble.enabled = 0;
+        const bool ended = bleturner::switchOff();
         logSerial.printf("BLE_TEST:end=%d,heap=%u,largest=%u\n", ended, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
       } else if (cmd == "BLE_TEST_SCAN") {
-        auto& host = freeink::BleKeyboardHost::getInstance();
-        if (host.isRunning()) host.startScan(5000);
+        if (bleturner::status().running) bleturner::scan(5000);
       } else if (cmd == "BLE_TEST_STATUS") {
-        const auto& host = freeink::BleKeyboardHost::getInstance();
+        const auto ble = bleturner::status();
         logSerial.printf("BLE_TEST:enabled=%u,running=%d,scanning=%d,connected=%d,busy=%d,initializing=%d,heap=%u,largest=%u\n",
-                         SETTINGS.blePageTurnerEnabled, host.isRunning(), host.isScanning(), host.isConnected(),
-                         freeink::ble::busy(), freeink::ble::initializing(),
-                         ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+                         SETTINGS.ble.enabled, ble.running, ble.scanning, ble.connected,
+                         ble.starting || ble.running || ble.stopping, ble.starting, ESP.getFreeHeap(),
+                         ESP.getMaxAllocHeap());
 #endif
 #ifdef TENOR_UI_ACCEPTANCE
       } else if (cmd == "FILE_TRANSFER_AUTOCONNECT") {
@@ -1445,6 +1745,10 @@ void loop() {
         }
         if (dat) {
           SETTINGS.saveToFile();
+          // The clock zone is pushed into HalClock by the screens that change it; a SET has to do
+          // the same. Note that clockAutoTimezone=1 (the default) overrides clockTimezone.
+          if (kv.startsWith("clockTimezone=") || kv.startsWith("clockDst=") || kv.startsWith("clockAutoTimezone="))
+            timezones::applyToClock();
           logSerial.printf("SET:%s\n", kv.c_str());
         } else {
           logSerial.printf("SET:INVALID:%s\n", kv.c_str());
@@ -1503,10 +1807,7 @@ void loop() {
         // a burst of taps queued while the reader is busy.
         uint8_t frame[16];
         const char* p = cmd.c_str() + 7;
-        if (!bleHid.isConnected()) {
-          bleRouter.table = blebinding::defaultTableFor("Free3");
-          bleRouter.chosen = true;
-        }
+        bleturner::injectFrame(nullptr, 0);
         const unsigned long t0 = micros();
         size_t n = 0;
         unsigned frames = 0;
@@ -1519,7 +1820,7 @@ void loop() {
             p += used;
           }
           if (len > 0) {
-            bleHid.onReportIngest(frame, len);
+            bleturner::injectFrame(frame, len);
             ++frames;
             n = len;
           }
@@ -1528,21 +1829,96 @@ void loop() {
           ++p;
         }
         logSerial.printf("BLE_RAW:len=%u,frames=%u,ingest_us=%lu,running=%d,overflow=%u,t=%lu\n",
-                         static_cast<unsigned>(n), frames, micros() - t0, bleHid.isRunning(), bleHid.rawOverflows(),
-                         millis());
+                         static_cast<unsigned>(n), frames, micros() - t0, bleturner::status().running,
+                         bleturner::rawOverflows(), millis());
 #endif
 #endif
 #ifdef TENOR_PRESS_PROBE
+      } else if (cmd.startsWith("OTA_DRYRUN ")) {
+        // CMD:OTA_DRYRUN <manifest-url> [runs]: restarts into the update boot like a confirmed update,
+        // joins the saved Wi-Fi, then runs the real check and download from a manifest under
+        // cross.tenor.vn/firmware/ into the spare slot, verified and closed like an install, whatever
+        // the version, never switching the boot slot. One run a boot and one OTA_DRYRUN_RESULT line
+        // a run (1-20 runs); after the last run the device restarts to Home. Send it from Home.
+        String arg = cmd.substring(11);
+        arg.trim();
+        const int space = arg.indexOf(' ');
+        const String url = space < 0 ? arg : arg.substring(0, space);
+        const int runs = space < 0 ? 1 : std::max(1L, std::min(20L, arg.substring(space + 1).toInt()));
+        if (url.length() >= sizeof(probeDryRunUrl)) {
+          logSerial.printf("OTA_DRYRUN_RESULT ok=0 step=url err=HTTP_ERROR run=0/%d\n", runs);
+        } else {
+          // The path of a confirmed update: restart into the update boot, one run a boot.
+          std::memcpy(probeDryRunUrl, url.c_str(), url.length() + 1);
+          logSerial.printf("OTA_DRYRUN_START runs=%d heap=%u largest=%u\n", runs, ESP.getFreeHeap(),
+                           ESP.getMaxAllocHeap());
+          delay(3000);  // the serial reader takes this line before the port drops for the restart
+          activityManager.closeForRestart();
+          silentRestartToOta(static_cast<uint8_t>(runs), static_cast<uint8_t>(runs));
+          activityManager.goHome();  // only when a sleep superseded the restart
+        }
       } else if (cmd.startsWith("WAKE_TIMER ")) {
         probeWakeSeconds = static_cast<uint32_t>(cmd.substring(11).toInt());
         probeWakeMagic = PROBE_WAKE_MAGIC;
         logSerial.printf("WAKE_TIMER:%u\n", static_cast<unsigned>(probeWakeSeconds));
+      } else if (cmd.startsWith("WAKE_HOLD ")) {
+        probeWakeHoldMs = static_cast<uint32_t>(cmd.substring(10).toInt());
+        probeWakeHoldMagic = PROBE_WAKE_MAGIC;
+        logSerial.printf("WAKE_HOLD:%u\n", static_cast<unsigned>(probeWakeHoldMs));
+      } else if (cmd.startsWith("STARVE_BUILD ")) {
+        // CMD:STARVE_BUILD <n>: the n-th heap check of a chapter build step fails once (once, then
+        // the count is spent). Sends the build down the starved path: park, shed the font caches,
+        // resume. Send it before the press that builds.
+        buildprobe::starveAfterSteps = static_cast<uint32_t>(std::max(0L, cmd.substring(13).toInt()));
+        logSerial.printf("STARVE_BUILD:%u\n", static_cast<unsigned>(buildprobe::starveAfterSteps));
       } else if (cmd.startsWith("KEEP_HEAP ")) {
         probeKeepHeap = cmd.substring(10).toInt() != 0;
         logSerial.printf("KEEP_HEAP:%d\n", probeKeepHeap ? 1 : 0);
       } else if (cmd == "LOGDUMP") {
         probeLogDump();
+#if LOG_SERIAL_HAS_TX_TIMEOUT
+      } else if (cmd.startsWith("TXTIMEOUT ")) {
+        // CMD:TXTIMEOUT <ms>: the serial write timeout until the next restart, for the long dumps
+        // (LOGDUMP, CAT, SCREENSHOT) over a CDC port that drops bytes at the load-bearing 1 ms.
+        const long ms = std::max(1L, std::min(5000L, cmd.substring(10).toInt()));
+        logSerial.setTxTimeoutMs(static_cast<uint32_t>(ms));
+        logSerial.printf("TXTIMEOUT:%ld\n", ms);
+#endif
+#if FREEINK_DEVICE_X4PRO && !defined(SIMULATOR)
+      } else if (fwprobe::command(cmd)) {
+        // EFUSE, OTA_STATE, FLASH_DUMP, SD_FLASH, ROLLBACK_TEST: handled there
+      } else if (cmd.startsWith("SHOT ")) {
+        // CMD:SHOT <path>: the framebuffer to the card as the screenshot keys save it, a 1-bit BMP
+        // turned to the panel's portrait orientation.
+        String path = cmd.substring(5);
+        path.trim();
+        RenderLock lock;
+        const bool ok = ScreenshotUtil::saveFramebufferAsBmp(path.c_str(), renderer.getFrameBuffer(),
+                                                             renderer.getDisplayWidth(), renderer.getDisplayHeight());
+        logSerial.printf("SHOT:ok=%d,path=%s\n", ok, path.c_str());
+      } else if (cmd == "USB_DRIVE") {
+        // CMD:USB_DRIVE: USB Drive, opened as the menu opens it. The log goes to the card first, the
+        // host owns the card from here; its eject restarts the unit, which then runs the next script.
+        logSerial.printf("USB_DRIVE:t=%lu\n", millis());
+        coldlog::flush("usb-drive");
+        activityManager.goToUsbDrive();
+#endif
+#if FREEINK_DEVICE_X4PRO
+      } else if (cmd.startsWith("STROKE_LOG ")) {
+        // CMD:STROKE_LOG 1 <label> / STROKE_LOG 0: every stroke drawn on the glass and what the
+        // scribble recognizer made of it (STROKE, SCRIBBLE lines), the label naming what the person
+        // was asked to draw (strike, circle, swipe, tap). test/scribble/log_to_samples.py turns the
+        // lines into test samples.
+        const String arg = cmd.substring(11);
+        const int space = arg.indexOf(' ');
+        const String label = space > 0 ? arg.substring(space + 1) : String("-");
+        mappedInputManager.setStrokeLog(arg.toInt() != 0, label.c_str());
+        logSerial.printf("STROKE_LOG:%d,%s\n", arg.toInt() != 0 ? 1 : 0, label.c_str());
+#endif
       } else if (cmd == "PANIC") {
+#if TENOR_COLD_LOG
+        coldlog::flush("panic");
+#endif
         abort();  // a crash reboot, for the paths that follow one
       } else if (cmd.startsWith("I2C_RACE ")) {
         // Two tasks on the gauge at once, as the render task and the loop did: a second task
@@ -1635,6 +2011,22 @@ void loop() {
       } else if (cmd.startsWith("IMU_MARK ")) {
         // CMD:IMU_MARK <label>: names the part of an IMU_LOG run that follows (do-lac/phan_tich_lac.py).
         logSerial.printf("IMU_MARK:%lu,%s\n", millis(), cmd.substring(9).c_str());
+      } else if (cmd == "TAP_REC_START" || cmd == "TAP_REC_STOP" || cmd.startsWith("TAP_MARK ")) {
+        // CMD:TAP_REC_START / TAP_MARK <label> / TAP_REC_STOP: every FIFO frame the tap detector
+        // gets, to /v1019/fifo.bin on the card (the USB link stalls under a stream of them). 13 bytes
+        // a frame: a flag (0, or 1 after lost frames) then ax ay az gx gy gz, int16 little endian raw
+        // counts; a mark is a flag 2 then 12 bytes of its label.
+#ifndef SIMULATOR
+        tapRecCommand(cmd);
+#endif
+#ifndef SIMULATOR
+      } else if (cmd.startsWith("CAT ")) {
+        catCommand(cmd.substring(4));
+#endif
+#ifndef SIMULATOR
+      } else if (cmd.startsWith("PUT ")) {
+        putCommand(cmd.substring(4));
+#endif
       } else if (cmd.startsWith("TAP_LOG ")) {
         // CMD:TAP_LOG <s>: for <s> seconds (at most 600), with double tap on, one "IMU_FIFO:" line
         // per poll (frames read, microseconds the read took, free and lowest heap) and one
@@ -1683,7 +2075,7 @@ void loop() {
         // ban nghiem thu qua USB). Duong dan tinh tu goc the nho.
         const String duongDan = cmd.substring(10);
         if (duongDan.startsWith("/")) {
-          activityManager.goToReader(duongDan.c_str());
+          activityManager.goToReader(duongDan.c_str(), fastFirstPaint(BoardConfig::isX4Pro(), ReaderOpen::FromMenu));
           logSerial.printf("OPEN_BOOK:%s\n", duongDan.c_str());
         } else {
           logSerial.printf("OPEN_BOOK:INVALID\n");
@@ -1691,7 +2083,7 @@ void loop() {
       } else if (cmd == "READ_RECENT") {
         const auto& books = RECENT_BOOKS.getBooks();
         if (!books.empty()) {
-          activityManager.goToReader(books.front().path);
+          activityManager.goToReader(books.front().path, fastFirstPaint(BoardConfig::isX4Pro(), ReaderOpen::FromMenu));
           // Named on the cable so a test can reopen this book afterwards and leave Recent as found.
           logSerial.printf("READ_RECENT:%s\n", books.front().path.c_str());
         }
@@ -1747,8 +2139,9 @@ void loop() {
 #ifdef TENOR_UI_ACCEPTANCE
         logSerial.printf("STACK_INFO:render_free=%u,ble_start_min_free=%u,ble_busy=%d,ble_initializing=%d\n",
                          static_cast<unsigned>(activityManager.renderStackHighWaterMark()),
-                         static_cast<unsigned>(freeink::ble::startStackHighWaterMark()),
-                         freeink::ble::busy(), freeink::ble::initializing());
+                         static_cast<unsigned>(bleturner::startStackLeft()),
+                         bleturner::status().starting || bleturner::status().running || bleturner::status().stopping,
+                         bleturner::status().starting);
 #endif
 #endif
       } else if (cmd == "NETWORK") {
@@ -1809,6 +2202,14 @@ void loop() {
 #endif
       }
     }
+#if TENOR_CABLE_FLASH
+    else if (line.startsWith("TCF1 ")) {
+      // The cable flash channel of the release (platform/CableFlash.h), apart from the probe's commands.
+      line.trim();
+      powerManager.setPowerSaving(false);
+      cableflash::onLine(line.c_str(), renderer, mappedInputManager);
+    }
+#endif
   }
 
   // Hai dong ho, khong phai mot. `lastActivityTime` chi do NGUOI dung cham vao may,
@@ -1874,16 +2275,38 @@ void loop() {
     return;
   }
 
+  const bool x4ProDoubleClickPwrLight = BoardConfig::isX4Pro() && SETTINGS.doubleClickPwrLight;
+
 #if FREEINK_CAP_TOUCH
   // A single X4 Pro power click becomes Confirm only after the frontlight
   // double-click window expires without a second click.
   mappedInputManager.setPowerConfirmClickFrame(false);
-  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PWR_CONFIRM && BoardConfig::isX4Pro() &&
-      lastX4ProPowerClickAt != 0 && millis() - lastX4ProPowerClickAt > X4PRO_POWER_DOUBLE_CLICK_MS) {
-    lastX4ProPowerClickAt = 0;
-    mappedInputManager.setPowerConfirmClickFrame(true);
+  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PWR_CONFIRM && x4ProDoubleClickPwrLight) {
+    if (lastX4ProPowerClickAt != 0 && millis() - lastX4ProPowerClickAt > X4PRO_POWER_DOUBLE_CLICK_MS) {
+      lastX4ProPowerClickAt = 0;
+      mappedInputManager.setPowerConfirmClickFrame(true);
+    }
+    // A release held too long to be a double-click candidate (but still within
+    // the normal Confirm press duration) never reaches handleX4ProFrontlightDoubleClick's
+    // click tracking above, so it needs its own Confirm check here.
+    if (mappedInputManager.wasReleased(MappedInputManager::Button::Power) &&
+        gpio.getPowerButtonHeldTime() > X4PRO_POWER_CLICK_MAX_HOLD_MS &&
+        gpio.getPowerButtonHeldTime() <= SETTINGS.getPowerButtonDuration()) {
+      mappedInputManager.setPowerConfirmClickFrame(true);
+    }
   }
 #endif
+
+  // Same deferral for SLEEP: getPowerButtonDuration() drops to 10ms so a quick
+  // tap sleeps the device, which otherwise fires on button-down and never lets
+  // a second click land. Sleep only once the double-click window has passed.
+  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP && x4ProDoubleClickPwrLight &&
+      lastX4ProPowerClickAt != 0 && millis() - lastX4ProPowerClickAt > X4PRO_POWER_DOUBLE_CLICK_MS) {
+    lastX4ProPowerClickAt = 0;
+    enterDeepSleep();
+    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+    return;
+  }
 
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
   if (sleepTimeoutMs > 0 && !autoSleepBlockedUntilInput &&
@@ -1900,8 +2323,15 @@ void loop() {
   static bool powerReleasedSinceWake = false;
   if (!gpio.isPressed(HalGPIO::BTN_POWER)) powerReleasedSinceWake = true;
 
-  if (powerReleasedSinceWake && millis() >= allowSleepAt && gpio.isPressed(HalGPIO::BTN_POWER) &&
-      gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
+  // On X4 Pro with SLEEP, a press still within the click window is a
+  // double-click candidate - let it be released and evaluated above instead
+  // of sleeping on button-down.
+  const bool x4ProAwaitingClickWindow = x4ProDoubleClickPwrLight &&
+                                        SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP &&
+                                        gpio.getPowerButtonHeldTime() <= X4PRO_POWER_CLICK_MAX_HOLD_MS;
+
+  if (!x4ProAwaitingClickWindow && powerReleasedSinceWake && millis() >= allowSleepAt &&
+      gpio.isPressed(HalGPIO::BTN_POWER) && gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
     // If the screenshot combination is potentially being pressed, don't sleep
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
@@ -1923,9 +2353,10 @@ void loop() {
   }
 #endif
 
-  // Short power press, hard shake, face down, face up and double tap: the same actions, one
-  // decision (quickaction::resolve).
-  if (mappedInputManager.wasReleased(MappedInputManager::Button::Power)) {
+  // Short power press, hard shake, face down, face up and the double taps: the same actions, one
+  // decision (quickaction::resolve). A release before the first frame is on the glass is dropped:
+  // the action would run on top of the frame being drawn and flash the screen once more.
+  if (mappedInputManager.wasReleased(MappedInputManager::Button::Power) && activityManager.hasDrawnFrame()) {
     runQuickAction(SETTINGS.shortPwrBtn, quickaction::Trigger::PowerRelease);
   }
   if (halTiltSensor.wasShaken()) {
@@ -1939,6 +2370,19 @@ void loop() {
   }
   if (halTiltSensor.wasDoubleTapped()) {
     runQuickAction(quickaction::shakeAsPowerAction(SETTINGS.doubleTapAction), quickaction::Trigger::DoubleTap);
+  }
+  if (halTiltSensor.wasScreenTapped()) {
+    runQuickAction(quickaction::shakeAsPowerAction(SETTINGS.screenTapAction), quickaction::Trigger::ScreenTap);
+  }
+  if (halTiltSensor.wasEdgeTapped()) {
+    runQuickAction(quickaction::shakeAsPowerAction(SETTINGS.edgeTapAction), quickaction::Trigger::EdgeTap);
+  }
+  // Home key shortcuts (a board with a Home key; on X3 and X4 the action is always Ignore).
+  if (mappedInputManager.homeButtonAction() == HomeButtonAction::ToggleFrontlight) {
+    toggleFrontlight();
+  }
+  if (mappedInputManager.homeButtonAction() == HomeButtonAction::Refresh) {
+    runQuickAction(CrossPointSettings::FORCE_REFRESH, quickaction::Trigger::PowerRelease);
   }
 
   // Refresh the battery icon when USB is plugged or unplugged.
@@ -1971,10 +2415,21 @@ void loop() {
   gpio.startBackgroundSampling();
 #endif
 
+  bool skipLoopDelay = false;
+  {
+    RenderLock lock(RenderLock::Mode::Try);
+    if (!lock.ownsLock()) {
+      // Let rendering advance without treating lock contention as idle.
+      delay(10);
+      return;
+    }
+    skipLoopDelay = activityManager.skipLoopDelay();
+  }
+
   // Add delay at the end of the loop to prevent tight spinning
   // When an activity requests skip loop delay (e.g., webserver running), use yield() for faster response
   // Otherwise, use longer delay to save power
-  if (activityManager.skipLoopDelay()) {
+  if (skipLoopDelay) {
     powerManager.setPowerSaving(false);  // Make sure we're at full performance when skipLoopDelay is requested
     yield();                             // Give FreeRTOS a chance to run tasks, but return immediately
   } else {
@@ -1982,11 +2437,12 @@ void loop() {
     // The BLE controller needs a steady clock: dropping the CPU to 80 MHz while
     // it connects ended in an HCI ack failure and an interrupt watchdog reset
     // (X3, 18/09/2026). Keep full speed while the radio is up.
-    const bool radioActive = freeink::ble::busy();
+    const auto ble = bleturner::status();
+    const bool radioActive = ble.starting || ble.running || ble.stopping;
 #else
     const bool radioActive = false;
 #endif
-    if (!radioActive && millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
+    if (!radioActive && !gpio.rawInputActive() && millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
       // If we've been inactive for a while, increase the delay to save power
       powerManager.setPowerSaving(true);  // Lower CPU frequency after extended inactivity
       // Sleep in short slices and wake the poll as soon as a button contact closes.
@@ -1995,7 +2451,12 @@ void loop() {
       const unsigned long idleStart = millis();
       while (millis() - idleStart < 50) {
         delay(10);
-        if (gpio.rawInputActive()) break;
+        if (gpio.rawInputActive()) {
+          // Full clock before the press is even committed: at 10 MHz the next pass alone took
+          // 40-60 ms on the X3, so a key after a pause answered 30 ms later than one without.
+          powerManager.setPowerSaving(false);
+          break;
+        }
       }
     } else {
       if (radioActive) powerManager.setPowerSaving(false);

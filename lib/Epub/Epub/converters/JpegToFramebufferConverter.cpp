@@ -4,6 +4,7 @@
 #include <GfxRenderer.h>
 #include <GrayThumb.h>
 #include <HalStorage.h>
+#include <HeapFloor.h>
 #include <JPEGDEC.h>
 #include <JpegScale.h>
 #include <Logging.h>
@@ -473,7 +474,7 @@ bool JpegToFramebufferConverter::getDimensionsStatic(const std::string& imagePat
     return false;
   }
 
-  std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
+  auto jpeg = heapfloor::make<JPEGDEC>("jpeg");
   if (!jpeg) {
     LOG_ERR("JPG", "Failed to allocate JPEG decoder for dimensions");
     return false;
@@ -504,7 +505,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     return false;
   }
 
-  std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
+  auto jpeg = heapfloor::make<JPEGDEC>("jpeg");
   if (!jpeg) {
     LOG_ERR("JPG", "Failed to allocate JPEG decoder");
     return false;
@@ -606,15 +607,24 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   if (config.thumbs) {
     const int rows = 16 / jpegScaleDenom;
     LOG_INF("IMG", "THUMB_START grid=%dx%d rows=%d bytes=%u ok=%u free=%u", ctx.scaledSrcWidth, ctx.scaledSrcHeight,
-            rows, static_cast<unsigned>(GrayThumb::bufferBytes(356, ctx.scaledSrcWidth, ctx.scaledSrcHeight, rows)),
+            rows,
+            static_cast<unsigned>(
+                GrayThumb::bufferBytes(config.thumbs->targetHeight(), ctx.scaledSrcWidth, ctx.scaledSrcHeight, rows)),
             ctx.thumbs ? 1u : 0u, static_cast<unsigned>(ESP.getFreeHeap()));
   }
 #endif
 
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("IMG", "COVER_DECODE_START free=%u largest=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
   unsigned long decodeStart = millis();
   ctx.lastYieldMs = decodeStart;
   rc = jpeg->decode(0, 0, jpegScaleOption);
   unsigned long decodeTime = millis() - decodeStart;
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("IMG", "COVER_DECODE ms=%lu ok=%u thumb=%u free=%u largest=%u", decodeTime, rc == 1 ? 1u : 0u,
+          ctx.thumbs ? 1u : 0u, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
 
   if (rc != 1) {
     LOG_ERR("JPG", "Decode failed (rc=%d, lastError=%d)", rc, jpeg->getLastError());

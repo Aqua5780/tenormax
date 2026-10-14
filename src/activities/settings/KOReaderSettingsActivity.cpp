@@ -1,4 +1,5 @@
 #include "KOReaderSettingsActivity.h"
+#include "activities/settings/X3SettingsLayout.h"
 
 #include <GfxRenderer.h>
 #include <I18n.h>
@@ -36,10 +37,30 @@ int KOReaderSettingsActivity::listCount() const { return MENU_ITEMS; }
 
 const char* KOReaderSettingsActivity::headerTitle() const { return tr(STR_KOREADER_SYNC); }
 
+void KOReaderSettingsActivity::render(RenderLock&& lock) {
+  if (optionPopup_.processRender(renderer, mappedInput)) return;
+  UiListActivity::render(std::move(lock));
+}
+
 void KOReaderSettingsActivity::activateIndex(const int index) {
   // Activation opens a keyboard/sub-activity or repaints a new value; a
   // lingering flash would gray an unrelated row.
   app.clearTapFlash();
+  if (rowChoiceStyle(index) == SettingsChoiceStyle::Popup) {
+    static constexpr StrId matching[] = {StrId::STR_FILENAME, StrId::STR_BINARY};
+    static constexpr StrId behavior[] = {StrId::STR_ASK_EVERY_TIME, StrId::STR_SMART_SYNC};
+    const bool match = index == 3;
+    const int selected = match ? (KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::BINARY)
+                               : (KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART);
+    showSettingsChoices(optionPopup_, menuNames[index], match ? matching : behavior, settingsChoiceCount(index),
+                        selected, index, [this, match](const int value) {
+      if (match) KOREADER_STORE.setMatchMethod(value ? DocumentMatchMethod::BINARY : DocumentMatchMethod::FILENAME);
+      else KOREADER_STORE.setSyncBehavior(value ? KOReaderSyncBehavior::SMART : KOReaderSyncBehavior::ASK_EVERY_TIME);
+      KOREADER_STORE.saveToFile();
+      requestUpdate();
+    });
+    return;
+  }
   if (index == 0) {
     // Username
     startActivityForResult(std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_KOREADER_USERNAME),
@@ -54,7 +75,12 @@ void KOReaderSettingsActivity::activateIndex(const int index) {
   } else if (index == 1) {
     // Password
     startActivityForResult(std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_KOREADER_PASSWORD),
-                                                                   KOREADER_STORE.getPassword(), 64, InputType::Text),
+                                                                   KOREADER_STORE.getPassword(), 64,
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+                                                                   InputType::Password),
+#else
+                                                                   InputType::Text),
+#endif
                            [this](const ActivityResult& result) {
                              if (!result.isCancelled) {
                                const auto& kb = std::get<KeyboardResult>(result.data);
@@ -119,9 +145,13 @@ void KOReaderSettingsActivity::activateIndex(const int index) {
 void KOReaderSettingsActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   // Content below the GUI.drawHeader band, above the button hints.
-  screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
-                                                static_cast<int16_t>(metrics.buttonHintsHeight), 0});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  if (x3settings::beginScreen(screen, renderer)) {
+    tabBandDrawn = true;
+  } else {
+    screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
+                                                  static_cast<int16_t>(metrics.buttonHintsHeight), 0});
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   // rowItems_'s labels/actionValue were set once in the constructor; only the
   // live value text needs refreshing here, by assigning into the existing
@@ -160,6 +190,9 @@ void KOReaderSettingsActivity::buildScreen(UiScreen& screen) {
     const bool accountAction = i >= 6;
     rowItems_[i].value = accountAction || rowValues_[i].empty() ? nullptr : rowValues_[i].c_str();
     rowItems_[i].subtitle = accountAction && !rowValues_[i].empty() ? rowValues_[i].c_str() : nullptr;
+    rowItems_[i].toggle = rowChoiceStyle(i) == SettingsChoiceStyle::Inline && i == 4;
+    rowItems_[i].toggleChecked = i == 3 ? KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::BINARY
+        : i == 4 ? KOREADER_STORE.getSendMetadata() : KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART;
   }
 
   fui::ListProps props;
@@ -168,10 +201,9 @@ void KOReaderSettingsActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
   props.valueInset = 8;               // air between the value and the row edge
-  // Label at the value's font size: both sides of the row read as one unit.
-  // maxLines=2 also marks the style caller-owned (see textStyleUnset).
   props.labelText = uiMenuLabelText(screen.theme());
-  props.labelText.maxLines = 2;
+  props.labelText.maxLines = 2;  // a label that does not fit goes to a second line, as on the X4 Pro
+  props.balanceWrappedLabelWithValue = !tenorchrome::x3ScreenLayoutEnabled();
   props.subtitleText = screen.theme().smallText;
   syncListViewport(screen, props);
   screen.list(props);

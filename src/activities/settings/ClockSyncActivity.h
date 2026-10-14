@@ -1,4 +1,5 @@
 #pragma once
+#include "activities/X3ActivityLayout.h"
 
 #include <cstdint>
 
@@ -26,7 +27,11 @@ inline bool idleExitDue(const uint32_t now, const bool waiting, const bool radio
 // reports success/failure, then waits for Back. If WiFi is not connected yet, it reuses the
 // normal WiFi selection flow first.
 class ClockSyncActivity final : public Activity {
+  x3activity::InfoPages x3Info;
+
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Device; }
+  std::string x3NavigationLabel() const override { return I18N.get(StrId::STR_CLOCK_SYNC); }
   explicit ClockSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : Activity("ClockSync", renderer, mappedInput) {}
 
@@ -46,6 +51,7 @@ class ClockSyncActivity final : public Activity {
   bool idleTimerStarted = false;
 
   void runSync();
+  void renderUgly();
   void launchWifiSelection();
   void onWifiSelectionComplete(bool connected);
   bool idleExitDue(unsigned long now, bool interaction);

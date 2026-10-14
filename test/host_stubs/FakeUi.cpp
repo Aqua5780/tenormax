@@ -5,6 +5,7 @@
 #include <HalDisplay.h>
 #include <HalFrontlight.h>
 #include <HalGPIO.h>
+#include <InlineSymbols.h>
 
 #include <cstring>
 #include <string>
@@ -18,6 +19,9 @@
 #include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "components/UiAppHost.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyChrome.h"
+#include "shells/ugly/UglyInk.h"
 
 // Dieu huong: bai kiem chi quan tam man hien tai, nen moi loi goi la khong lam gi.
 void ActivityManager::goToReader(std::string, bool) {}
@@ -27,12 +31,16 @@ void ActivityManager::popActivity() {}
 bool ActivityManager::switchSettingsSibling(int) { return false; }
 void ActivityManager::requestUpdate(bool) {}
 void ActivityManager::requestUpdateAndWait() {}
+std::vector<tenorchrome::X3PathNode> ActivityManager::x3NavigationPath(const char* title) const {
+  return {{tenorchrome::X3PathIcon::Recent, ""}, {tenorchrome::X3PathIcon::More, title ? title : ""}};
+}
 
 // Bo ve: moi lenh ve la khong lam gi. Dung nguon that thi no keo tiep sang tang
 // font, bitmap va chu hai chieu, tuc cai duoi cu dai ra; gia o day cat dut chuoi.
 // Bai kiem dau vao khong doc diem anh, chi doc trang thai sau moi lan bam.
 void GfxRenderer::clearScreen(unsigned char) const {}
 void GfxRenderer::displayBuffer(HalDisplay::RefreshMode) const {}
+void GfxRenderer::displayWindow(int, int, int, int) const {}
 int GfxRenderer::getScreenWidth() const { return 528; }
 int GfxRenderer::getScreenHeight() const { return 792; }
 void GfxRenderer::tapToLogical(float, float, int& outX, int& outY) const {
@@ -46,6 +54,7 @@ void GfxRenderer::getOrientedViewableTRBL(int* t, int* r, int* b, int* l) const 
   if (l) *l = 0;
 }
 void GfxRenderer::drawPixel(int, int, bool) const {}
+void inlineSymbols::drawShape(const GfxRenderer&, inlineSymbols::Shape, int, int, int, bool) {}
 void GfxRenderer::drawLine(int, int, int, int, int, bool) const {}
 void GfxRenderer::drawLine(int, int, int, int, bool) const {}
 void GfxRenderer::drawRect(int, int, int, int, int, bool) const {}
@@ -88,12 +97,61 @@ int GfxRenderer::getTextWidth(int, const char* text, EpdFontFamily::Style, BidiU
   return text ? static_cast<int>(strlen(text)) * 8 : 0;
 }
 int GfxRenderer::getLineHeight(int) const { return 20; }
+int GfxRenderer::getTextAdvanceX(int font, const char* text, EpdFontFamily::Style style, int, uint8_t) const {
+  return getTextWidth(font, text, style);
+}
+int GfxRenderer::getTextInkTop(int, const char*, EpdFontFamily::Style) const { return 0; }
+int GfxRenderer::getTextInkBottom(int, const char*, EpdFontFamily::Style) const { return 20; }
+int GfxRenderer::getFontAscenderSize(int) const { return 16; }
+// No font is loaded on the host, so a single-glyph label never takes the centred-glyph path.
+const EpdGlyph* EpdFontFamily::getGlyph(uint32_t, Style) const { return nullptr; }
+const EpdFontData* EpdFontFamily::getData(Style) const { return nullptr; }
+const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData*, const EpdGlyph*) const { return nullptr; }
 std::string GfxRenderer::truncatedText(int, const char* text, int, EpdFontFamily::Style, int) const {
   return text ? std::string(text) : std::string();
 }
 std::vector<std::string> GfxRenderer::wrappedText(int, const char* text, int, int, EpdFontFamily::Style) const {
   return {text ? std::string(text) : std::string()};
 }
+
+// Input/navigation suites keep the same fake text metrics and observable labels.
+// Production Ugly paint is covered by test/ugly_reader/popup.py (96 pairs),
+// native-font checks and simulator captures; these bindings provide no pixel acceptance.
+namespace ugly {
+uint32_t iconFrameSeed() { return 0; }
+bool iconAsset(const GfxRenderer&, const uint8_t*, icons::Rect, uint32_t, int, int, bool) { return false; }
+Box inkBounds(const GfxRenderer&, Box area) { return area; }
+void pageHints(const GfxRenderer&, const char*, const char*, int) {}
+void pathHints(const GfxRenderer&, const char*, const char*, bool) {}
+int width(const GfxRenderer& r, Size, const char* text, bool) { return r.getTextWidth(0, text); }
+int ascent(Size) { return 16; }  // Same ascender as the renderer stub above.
+Box textBounds(const GfxRenderer& r, Size size, const char* label) {
+  return {0, -ascent(size), width(r, size, label), 4};
+}
+int text(const GfxRenderer& r, Size size, int x, int baseline, const char* label, bool black, bool) {
+  r.drawText(0, x, baseline - ascent(size), label, black);
+  return width(r, size, label);
+}
+std::string fit(const GfxRenderer& r, Size, const std::string& label, int maxWidth) {
+  return r.truncatedText(0, label.c_str(), maxWidth);
+}
+void line(const GfxRenderer&, int, int, int, int, uint32_t, int) {}
+void circle(const GfxRenderer&, Circle, const Box&, int, int, int) {}
+}  // namespace ugly
+
+// The host suites run tenor/cross; the hand-drawn list of tenor/ugly is measured in the simulator
+// (test/reading_stats_simulator/test_ugly_parts_x3.py).
+namespace shell {
+Kind current() { return Kind::Cross; }
+}  // namespace shell
+namespace uglychrome {
+freeink::ui::Rect words(const GfxRenderer&, const freeink::ui::Rect&, const char*, freeink::ui::TextAlign, bool, int) {
+  return {};
+}
+void marks(const GfxRenderer&, const freeink::ui::Rect&, const Marks&, uint32_t) {}
+void ring(const GfxRenderer&, const freeink::ui::Rect&, uint32_t) {}
+void apart(const GfxRenderer&, freeink::ui::Rect&, const char*, freeink::ui::Rect&, const char*) {}
+}  // namespace uglychrome
 
 RenderLock::RenderLock(Activity&) {}
 RenderLock::RenderLock() { isLocked = true; }
@@ -104,6 +162,14 @@ const ThemeMetrics& UITheme::getMetrics() const {
   static const ThemeMetrics metrics{};
   return metrics;
 }
+
+// UITheme holds a BaseTheme as its fallback (#3657), so its vtable must link. The theme
+// never draws here: every virtual is a no-op, like the renderer calls above.
+int BaseTheme::getMenuRowHeight(const GfxRenderer&) const { return 20; }
+void BaseTheme::drawHeader(const GfxRenderer&, Rect, const char*, const char*, bool) const {}
+Rect BaseTheme::drawPopup(const GfxRenderer&, const char*, bool) const { return Rect(); }
+void BaseTheme::fillPopupProgress(const GfxRenderer&, const Rect&, const int) const {}
+void BaseTheme::drawTextField(const GfxRenderer&, Rect, const int, bool, int, int) const {}
 
 // UiAppHost dung nguon THAT: no co san file rieng, gia lai re hon dung.
 
@@ -143,14 +209,33 @@ HalDisplay& hostTestDisplay() { return fakeDisplay; }
 // The input harness stubs pixel rendering; simulator journeys cover the header.
 HalGPIO gpio;
 namespace tenorchrome {
+bool x3ScreenLayoutEnabled() { return false; }
+X3ScreenLayout x3ScreenLayout(const GfxRenderer&, int, int) { return {}; }
+void drawTipInRect(const GfxRenderer&, const char*, X3ScreenRect, int) {}
+void drawInfoInRect(const GfxRenderer&, const char*, X3ScreenRect, int) {}
 int tipY(const GfxRenderer&, bool) { return 726; }
 int tipTopY(const GfxRenderer&, const char*, int, int, bool) { return 700; }
 int tipHeight(const GfxRenderer&, const char*, int) { return 28; }
 void drawTip(const GfxRenderer&, const char*, int, int, bool) {}
-void drawHeader(const GfxRenderer&, const char*, const char*) {}
+void drawHeader(const GfxRenderer&, const char*, const char*, const char*) {}
+void drawX3ActivityPath(const GfxRenderer&, const char*) {}
 int moreBelowChevronTopY(const GfxRenderer&, int) { return 696; }
 void drawMoreBelowChevron(const GfxRenderer&, int) {}
+void fadeBand(const GfxRenderer&, int, int, bool, int, int) {}
 void drawMoreChevron(const GfxRenderer&, int, int, ChevronDir, int) {}
+void drawRoundRing(const GfxRenderer&, int, int, int, int, int, int, bool) {}
+void drawRowChevron(const GfxRenderer&, int, int) {}
+void drawSettingsPopupMark(const GfxRenderer&, int, int) {}
+void drawBarIcon(const GfxRenderer&, const uint8_t*, int, int, int, int, bool) {}
+void drawPillRing(const GfxRenderer&, int, int, int, int, int, bool) {}
+void drawBarFrame(const GfxRenderer&, int, int, int, int) {}
+void drawPanel(const GfxRenderer&, int, int) {}
+FrameSpan frameSpan(const GfxRenderer&) { return {FOOT_BACK_X, 448}; }
+void drawRowRule(const GfxRenderer&, int, int, int) {}
+void drawBarTab(const GfxRenderer&, int, int, int, const uint8_t*, int, int, bool) {}
+FootBar footBarFor(const char*) { return FootBar::None; }
+void noteFootActions(const char*, const char*) {}
+int footActionAt(int, int) { return -1; }
 }  // namespace tenorchrome
 
 // Persist only in memory in the input harness; simulator tests cover SD failures.

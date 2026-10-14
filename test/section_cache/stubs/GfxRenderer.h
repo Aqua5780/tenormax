@@ -1,9 +1,13 @@
 #pragma once
+#include <array>
 
 #include <DropCap.h>
 #include <EpdFontFamily.h>
 
-#include <deque>
+#include <FontCacheManager.h>
+
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace BidiUtils {
@@ -12,6 +16,18 @@ enum class BidiBaseDir : signed char { AUTO = -1, LTR = 0, RTL = 1 };
 
 class GfxRenderer {
  public:
+  enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
+  RenderMode getRenderMode() const { return BW; }
+  bool isStripTargetActive() const { return false; }
+  bool glyphIntersectsStrip(int, int, int, int) const { return true; }
+  bool extendTextBounds(std::array<int, 4>&, int, int, int, const char*, EpdFontFamily::Style,
+                        BidiUtils::BidiBaseDir, int = 0, int = 0) const { return false; }
+
+  mutable uint64_t textAdvanceCalls = 0;
+  class FrameBufferLoan {
+   public:
+    explicit FrameBufferLoan(GfxRenderer&) {}
+  };
   int getDropCapAdvance(int, const char* text, EpdFontFamily::Style, int height, int = 0) const {
     return dropcap::initial(text).codepoint ? height / 2 + 4 : 0;
   }
@@ -39,6 +55,7 @@ class GfxRenderer {
   // parser tests measure line breaks, not the space delta.
   int getSpaceWidth(int, EpdFontFamily::Style, uint8_t = 0) const { return 4; }
   int getTextAdvanceX(int, const char* text, EpdFontFamily::Style, int spacing = 0, uint8_t = 0) const {
+    ++textAdvanceCalls;
     int width = 0;
     while (*text++) {
       if (width) width += spacing;
@@ -49,5 +66,7 @@ class GfxRenderer {
   int getKerning(int, uint32_t, uint32_t, EpdFontFamily::Style) const { return 0; }
   int getSpaceAdvance(int, uint32_t, uint32_t, EpdFontFamily::Style, uint8_t = 0) const { return 4; }
   bool isSdCardFont(int) const { return false; }
-  void ensureSdCardFontReady(int, const std::deque<std::string>&, bool, uint8_t) const {}
+  void ensureSdCardFontReady(int, const char* const*, const size_t*, size_t, bool, bool, uint8_t) const {}
+  // No SD font caches on the host: Section::startBuild finds nothing to release.
+  FontCacheManager* getFontCacheManager() const { return nullptr; }
 };

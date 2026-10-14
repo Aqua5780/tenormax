@@ -24,14 +24,22 @@ int SdCardFontManager::computeFontId(uint32_t contentHash, const char* familyNam
   }
   hash ^= pointSize;
   hash *= FNV_PRIME;
-  if (weight) {
-    hash ^= 0x57475431u;  // outline recipe namespace v1; keep all base IDs unchanged
-    hash *= FNV_PRIME;
-    hash ^= weight;
-    hash *= FNV_PRIME;
-  }
+  static_cast<void>(weight);
   int id = static_cast<int>(hash);
   return id != 0 ? id : 1;  // 0 is reserved as "not found" sentinel
+}
+
+uint8_t SdCardFontManager::selectWeight(const uint8_t availableMask, const uint8_t requested) {
+  if (requested == 0) return 0;
+  if (requested == 1) return (availableMask & (1u << 1)) ? 1 : 0;
+  if (requested > 6) return 0;
+  for (int weight = requested; weight >= 2; --weight) {
+    if (availableMask & (1u << weight)) return static_cast<uint8_t>(weight);
+  }
+  // weight-1 belongs to the old pack format. Keep it usable when the pack has
+  // no current-format variant, while never selecting a stronger level.
+  if ((availableMask & 0x7cu) == 0 && (availableMask & (1u << 1))) return 1;
+  return 0;
 }
 
 int SdCardFontManager::loadFile(const SdCardFontFamilyInfo& family, const SdCardFontFileInfo& file,
@@ -70,31 +78,63 @@ int SdCardFontManager::loadFile(const SdCardFontFamilyInfo& family, const SdCard
 
 bool SdCardFontManager::loadFamily(const SdCardFontFamilyInfo& family, GfxRenderer& renderer, uint8_t pointSize,
                                    uint8_t weight) {
-  // Unload any previously loaded family first
-  if (!loadedFamilyName_.empty()) {
-    unloadAll(renderer);
-  }
-
   const SdCardFontFileInfo* selected = family.findNearestSize(pointSize);
   if (!selected) {
+    if (!loadedFamilyName_.empty()) unloadAll(renderer);
     LOG_ERR("SDMGR", "Family %s has no files to load", family.name.c_str());
     return false;
   }
 
+  const uint8_t available = family.weights(*selected);
+  uint8_t effectiveWeight = selectWeight(available, weight);
+  if (!loadedFamilyName_.empty()) {
+    unloadAll(renderer);
+  }
+
   loaded_.reserve(4);  // reader plus up to three UI fallback sizes
   int id = 0;
-  if (weight > 0 && weight <= 4 && (family.weights(*selected) & (1u << weight))) {
-    id = loadFile(family, *selected, renderer, weight);
+  for (int candidate = effectiveWeight; candidate >= 2 && id == 0; --candidate) {
+    if (available & (1u << candidate)) {
+      id = loadFile(family, *selected, renderer, static_cast<uint8_t>(candidate));
+      if (id != 0) effectiveWeight = static_cast<uint8_t>(candidate);
+    }
   }
+  if (id == 0 && effectiveWeight == 1) id = loadFile(family, *selected, renderer, 1);
   if (id == 0) {
-    weight = 0;
+    effectiveWeight = 0;
     id = loadFile(family, *selected, renderer);
   }
   if (id == 0) return false;
-  loadedWeight_ = weight;
+  loadedWeight_ = effectiveWeight;
 
   loadedFamilyName_ = family.name;
   loadedPointSize_ = selected->pointSize;
+  return true;
+}
+
+bool SdCardFontManager::loadBuiltinFamily(const SdCardFontFamilyInfo& family, GfxRenderer& renderer,
+                                         uint8_t pointSize, uint8_t weight, int builtinId) {
+  unloadAll(renderer);
+  const auto original = renderer.getFontMap().find(builtinId);
+  if (original == renderer.getFontMap().end() || !family.findFile(pointSize)) return false;
+  const EpdFontFamily builtin = original->second;
+  if (!loadFamily(family, renderer, pointSize, weight)) return false;
+  auto& active = loaded_.front();
+  if (loadedWeight_ == 0 || !active.font->matchesBuiltinLayout(builtin)) {
+    unloadAll(renderer);
+    return false;
+  }
+  EpdFontFamily raster(active.font->getEpdFont(0), active.font->getEpdFont(1), active.font->getEpdFont(2),
+                       active.font->getEpdFont(3));
+  if (!renderer.replaceBuiltinFont(builtinId, raster)) {
+    unloadAll(renderer);
+    return false;
+  }
+  renderer.removeFont(active.fontId);
+  active.fontId = builtinId;
+  builtinFamily_ = builtin;
+  builtinId_ = builtinId;
+  renderer.registerBuiltinRaster(builtinId, active.font);
   return true;
 }
 
@@ -116,12 +156,28 @@ void SdCardFontManager::unloadExtraSizes(GfxRenderer& renderer) {
   // Clear mappings before deleting their objects. The first entry is always
   // the reader font; a UI alias may have reused it and it stays registered.
   renderer.clearFallbackFonts();
-  while (loaded_.size() > 1) {
+  while (loaded_.size() > (readerReleased_ ? 0u : 1u)) {
     auto& extra = loaded_.back();
     renderer.removeFont(extra.fontId);
     delete extra.font;
     loaded_.pop_back();
   }
+}
+
+void SdCardFontManager::releaseReaderForDownload(GfxRenderer& renderer) {
+  if (readerReleased_ || loaded_.empty() || renderer.hasFallbackFont(loaded_.front().fontId)) return;
+  auto& reader = loaded_.front();
+  renderer.removeFont(reader.fontId);
+  delete reader.font;
+  loaded_.erase(loaded_.begin());
+  if (builtinFamily_) {
+    renderer.insertFont(builtinId_, *builtinFamily_);
+    builtinFamily_.reset();
+    builtinId_ = 0;
+  }
+  loadedPointSize_ = 0;
+  loadedWeight_ = 0;
+  readerReleased_ = true;
 }
 
 void SdCardFontManager::unloadAll(GfxRenderer& renderer) {
@@ -133,12 +189,18 @@ void SdCardFontManager::unloadAll(GfxRenderer& renderer) {
     delete lf.font;
   }
   loaded_.clear();
+  if (builtinFamily_) {
+    renderer.insertFont(builtinId_, *builtinFamily_);
+    builtinFamily_.reset();
+    builtinId_ = 0;
+  }
   loadedFamilyName_.clear();
   loadedPointSize_ = 0;
   loadedWeight_ = 0;
+  readerReleased_ = false;
 }
 
 int SdCardFontManager::getFontId(const std::string& familyName) const {
-  if (familyName != loadedFamilyName_ || loaded_.empty()) return 0;
+  if (readerReleased_ || familyName != loadedFamilyName_ || loaded_.empty()) return 0;
   return loaded_.front().fontId;
 }

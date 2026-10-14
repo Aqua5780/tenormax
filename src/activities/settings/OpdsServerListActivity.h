@@ -1,4 +1,5 @@
 #pragma once
+#include "activities/settings/X3SettingsLayout.h"
 
 #include <vector>
 
@@ -13,6 +14,7 @@
  */
 class OpdsServerListActivity final : public UiListActivity {
  public:
+  tenorchrome::X3PathIcon navigationIcon() const override { return tenorchrome::X3PathIcon::Network; }
   explicit OpdsServerListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool pickerMode = false);
 
   void onEnter() override;
@@ -28,10 +30,16 @@ class OpdsServerListActivity final : public UiListActivity {
   bool handleCustomInput() override;
   // Picker mode backs out to the home menu rather than finishing.
   void onBackButton() override;
+  void drawChrome() override {
+    if (tenorchrome::x3ScreenLayoutEnabled()) x3settings::drawPath(renderer, headerTitle());
+    else UiListActivity::drawChrome();
+  }
   const char* headerTitle() const override;
+  int settingsChoiceCount(int row) const override;
 
   bool pickerMode = false;
   OptionPopup optionPopup;
+  OptionPopup* tiltPopup() override { return &optionPopup; }
 
   // Row structure (labels, actionValue; server subtitles), rebuilt only when
   // the server list itself reloads (rebuildRowItems(), called from onEnter()

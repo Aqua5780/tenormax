@@ -23,10 +23,10 @@ from cai_dat_truoc_tenor import truoc_tenor
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = Path(os.environ.get('TEST_PROGRAM', REPO / '.pio/build/simulator_x3_uc8279/program'))
 
-# Home: Up opens the Settings tab; four Right from "File transfer" reach Controls; Select.
-HOME_TO_CONTROLS = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '3000:RIGHT', '3500:CONFIRM']
-# Motion sensor follows Controls: five Right.
-HOME_TO_MOTION = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '2800:RIGHT', '3100:RIGHT', '3500:CONFIRM']
+# Home: Up opens Settings on Display; 3 Right reach Controls; Select.
+HOME_TO_CONTROLS = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '3500:CONFIRM']
+# Motion sensor follows Controls: 4 Right from Display.
+HOME_TO_MOTION = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '2800:RIGHT', '3500:CONFIRM']
 # Home: Select opens the recent book; Select again opens the reader menu; three Down to Tools.
 BOOK_TO_TOOLS = ['1000:CONFIRM', '3200:CONFIRM', '4400:DOWN', '5000:DOWN', '5600:DOWN']
 
@@ -89,9 +89,10 @@ class QuickActionsV1012Test(unittest.TestCase):
     # ---- Settings > Motion sensor, Controls ----
 
     def test_side_flick_strength_row_saves_strong(self):
-        # Rows: page tilt, tab tilt, row tilt, side strength. Three Right reach it. A three-choice
-        # row steps in place, so one Select moves Medium to Strong and leaves up/down alone.
-        log = self.run_sim([*HOME_TO_MOTION, '4500:RIGHT', '5000:RIGHT', '5500:RIGHT', '6500:CONFIRM'],
+        # Three Right reach side strength. U11 opens its three-choice picker;
+        # choose Strong and keep the independent vertical strength unchanged.
+        log = self.run_sim([*HOME_TO_MOTION, '4500:RIGHT', '5000:RIGHT', '5500:RIGHT',
+                            '6500:CONFIRM', '7000:RIGHT', '7500:CONFIRM'],
                            shots=[(4300, 'motion-rows'), (7700, 'motion-side-strong')])
         self.assertIn('Entering activity: Settings', log)
         saved = self.saved()
@@ -122,8 +123,11 @@ class QuickActionsV1012Test(unittest.TestCase):
         # Off, then back on to the Inverted mode it had, not to Normal.
         self.assertEqual(saved['tiltPageTurn'], 2, log[-4000:])
         end = self.shot('tools-tab-end')
-        self.assertGreaterEqual(len(filled_rows(end, 40, end.width - 60, 600, 700)), 30,
-                                'the last Tools row is not selected')
+        # The selection is a white pill ringed in black (v1.0.52), not a filled block: its two ring lines
+        # are the full-width rows, 3 each. v1.0.53: the last page fills to the list's foot, so the last row
+        # sits lower (to y 740).
+        self.assertEqual(len(filled_rows(end, 80, end.width - 100, 600, 750)), 6,
+                         'the last Tools row is not selected')
 
     def test_tools_tab_tilt_toggle_remembers_inverted_across_restart(self):
         self.write_settings(tiltPageTurn=2)

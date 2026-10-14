@@ -1,4 +1,6 @@
 #include "KeyboardEntryActivity.h"
+#include "activities/X3ActivityLayout.h"
+
 #include "components/UIScale.h"
 
 #include <BidiUtils.h>
@@ -14,12 +16,65 @@
 #include "components/UITheme.h"
 #include "components/themes/TenorRadius.h"
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyInk.h"
+#include "shells/ugly/UglyWords.h"
+#include "UIFontTiers.h"
 
 namespace fui = freeink::ui;
 
 namespace {
 
 constexpr fui::ActionId ACTION_KEY = 1;
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+constexpr int16_t TELEX_KEY = -5;
+
+struct TelexKeyText {
+  fui::GfxRendererTarget& target;
+  const GfxRenderer& renderer;
+  int font;
+};
+
+void drawTelexKeyText(void* context, fui::Rect rect, const char* text, const fui::TextStyle& style) {
+  auto& key = *static_cast<TelexKeyText*>(context);
+  auto centered = style;
+  if (strcmp(text, "VI") == 0 || strcmp(text, "EN") == 0) {
+    const auto fontStyle = style.bold ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR;
+    const auto ink = key.renderer.getTextInkBounds(key.font, text, fontStyle);
+    const int width = key.renderer.getTextWidth(key.font, text, fontStyle);
+    rect.x += (rect.width - (ink[2] - ink[0])) / 2 - ink[0] - (rect.width - width) / 2;
+    centered.centerInkY = true;
+  }
+  key.target.setTextSink(nullptr, nullptr);
+  key.target.text(rect, text, centered);
+  key.target.setTextSink(drawTelexKeyText, context);
+}
+
+
+const fui::KeyboardLayout& telexLayout(const bool shifted, const bool enabled) {
+  const fui::KeyboardLayout& base = fui::builtinKeyboardLayout(fui::KeyboardLayoutId::QwertyEn, shifted, false, true, false);
+  static fui::KeyboardKey bottom[2][5];
+  static fui::KeyboardRow rows[2][5];
+  static fui::KeyboardLayout layouts[2][2];
+  const int shift = shifted ? 1 : 0;
+  const int mode = enabled ? 1 : 0;
+  const char* label = enabled ? "VI" : "EN";
+  bottom[mode][0] = {"?123", nullptr, fui::KeyKind::Mode, fui::StateNormal, fui::QWERTY_KEY_MODE, 4, true, nullptr};
+  bottom[mode][1] = {"Shift", nullptr, fui::KeyKind::Shift, fui::StateNormal, fui::QWERTY_KEY_SHIFT, 3, true, nullptr};
+  bottom[mode][2] = {label, nullptr, fui::KeyKind::Normal, fui::StateNormal, TELEX_KEY, 3, true, nullptr};
+  bottom[mode][3] = {"Space", nullptr, fui::KeyKind::Space, fui::StateNormal, fui::QWERTY_KEY_SPACE, 6, true, nullptr};
+  bottom[mode][4] = {"OK", nullptr, fui::KeyKind::Ok, fui::StateNormal, fui::QWERTY_KEY_ENTER, 4, true, nullptr};
+  for (int i = 0; i < 4; ++i) rows[mode][i] = base.rows[i];
+  rows[mode][4] = {bottom[mode], 5, 0};
+  layouts[mode][shift] = {rows[mode], 5};
+  return layouts[mode][shift];
+}
+#endif
+
+bool singleLineInput(const GfxRenderer& renderer) {
+  return tenorchrome::x3ScreenLayoutEnabled() || normalizedUiTextSize(SETTINGS.uiTextSize) != 0 ||
+         (tenorchrome::kTouchShell && renderer.getScreenWidth() > renderer.getScreenHeight());
+}
 
 // ---------------------------------------------------------------------------
 // URL layers. The SDK builtin layouts have no URL variant (":", "/", ".", the
@@ -114,9 +169,54 @@ const fui::KeyboardLayout URL_LAYOUT{URL_ROWS, 5};
 const fui::KeyboardLayout URL_SHIFT_LAYOUT{URL_SHIFT_ROWS, 5};
 const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
 
+
+// tenor/ugly on the button readers: every key written by hand in the box the FreeInkUI keyboard laid out for it (the
+// keyboard registered its hits with its own painting off). The pen circles the key under the cursor. The letters are
+// straight at every level: each key read right, and a frame per cursor move as quick as before.
+void paintUglyKeys(const GfxRenderer& r, const fui::KeyboardProps& props, const fui::Interaction* hits, const size_t count,
+                   const int rowHeight, uint32_t seed) {
+  const fui::KeyboardLayout& layout = *props.layout;
+  for (size_t i = 0; i < count; ++i) {
+    const fui::KeyboardKey* key = nullptr;
+    int index = 0, logical = -1;
+    for (int row = 0; row < layout.rowCount && !key; ++row)
+      for (int col = 0; col < layout.rows[row].count; ++col, ++index)
+        if (layout.rows[row].keys[col].value == hits[i].value) {
+          key = &layout.rows[row].keys[col];
+          logical = index;
+          break;
+        }
+    if (!key) continue;
+    const fui::Rect& box = hits[i].rect;
+    const int cx = box.x + box.width / 2, cy = box.y + rowHeight / 2;
+    const char* label = key->label;
+    if (key->kind == fui::KeyKind::Ok && props.okLabel) label = props.okLabel;
+    if (key->kind == fui::KeyKind::Shift && props.shiftLabel) label = props.shiftLabel;
+    if (key->kind == fui::KeyKind::Mode && props.modeLabel) label = props.modeLabel;
+    ugly::Box ink{cx - 10, cy - 10, cx + 10, cy + 10};
+    if (key->kind == fui::KeyKind::Space) {
+      ugly::underline(r, cx - box.width * 9 / 20, cx + box.width * 9 / 20, cy + 6, 700 + static_cast<uint32_t>(i), 2);
+      ink = {cx - box.width * 9 / 20, cy - 4, cx + box.width * 9 / 20, cy + 10};
+    } else if (key->kind == fui::KeyKind::Delete || key->kind == fui::KeyKind::Lang) {
+      ugly::mark(r, key->kind == fui::KeyKind::Delete ? ugly::Mark::Left : ugly::Mark::Right, cx, cy);
+    } else if (label) {
+      const ugly::Size size =
+          ugly::width(r, ugly::Size::S30, label, ugly::STRAIGHT) <= box.width - 6 ? ugly::Size::S30 : ugly::Size::S22;
+      const int w = ugly::width(r, size, label, ugly::STRAIGHT), up = ugly::ascent(size);
+      ugly::text(r, size, cx - w / 2, cy + up / 2, label, true, ugly::STRAIGHT);
+      ink = {cx - w / 2, cy - up / 2, cx + w / 2, cy + up / 2};
+    }
+    if (key->kind == fui::KeyKind::Normal && key->alt)
+      ugly::text(r, ugly::Size::S22, box.x + box.width - 2 - ugly::width(r, ugly::Size::S22, key->alt, ugly::STRAIGHT), box.y + 20,
+                 key->alt, true, ugly::STRAIGHT);
+    if (logical == props.selectedIndex) ugly::circle(r, ugly::Circle::Word, ink, 6, 4, seed, 2);
+  }
+}
+
 }  // namespace
 
 void KeyboardEntryActivity::onEnter() {
+  mark_.reset();
   Activity::onEnter();
   idleSince = static_cast<uint32_t>(millis());
   // ActivityManager publishes the activity before calling onEnter unlocked.
@@ -135,6 +235,10 @@ void KeyboardEntryActivity::onEnter() {
   cursorMode = false;
   togglePos = false;
   passwordVisible = false;
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  telexState = {};
+  telexEnabled = inputType == InputType::Text && I18N.getLanguage() == Language::VI;
+#endif
   selRow = 0;
   selCol = 0;
   delPressCount = 0;
@@ -155,6 +259,10 @@ void KeyboardEntryActivity::onExit() { Activity::onExit(); }
 
 const fui::KeyboardLayout& KeyboardEntryActivity::currentLayout() const {
   if (symbols) return fui::builtinKeyboardLayout(layoutId, shifted, true);
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  if (inputType == InputType::Text)
+    return telexLayout(shifted, telexEnabled);
+#endif
   if (inputType == InputType::Url) {
     if (urlPanel) return URL_SNIPPET_LAYOUT;
     return shifted ? URL_SHIFT_LAYOUT : URL_LAYOUT;
@@ -210,6 +318,7 @@ void KeyboardEntryActivity::moveSelectionRow(const int delta) {
                  : (colAnchor * newCols + colAnchorWidth / 2) / colAnchorWidth;
   }
   clampSelection();
+  selectionMarkSeed();
 }
 
 void KeyboardEntryActivity::moveSelectionCol(const int delta) {
@@ -219,6 +328,13 @@ void KeyboardEntryActivity::moveSelectionCol(const int delta) {
   if (cols <= 0) return;
   selCol = (selCol + delta + cols) % cols;
   setColumnAnchor();
+  selectionMarkSeed();
+}
+
+uint32_t KeyboardEntryActivity::selectionMarkSeed() const {
+  return mark_.get((static_cast<uint64_t>(layoutId) << 36) | (static_cast<uint64_t>(shifted) << 35) |
+                   (static_cast<uint64_t>(symbols) << 34) | (static_cast<uint64_t>(urlPanel) << 33) |
+                   static_cast<uint32_t>(cursorMode ? -1 : selectedLogicalIndex()));
 }
 
 void KeyboardEntryActivity::setColumnAnchor() {
@@ -237,6 +353,7 @@ bool KeyboardEntryActivity::syncSelectionToValue(const int16_t value) {
         selRow = r;
         selCol = c;
         setColumnAnchor();
+        selectionMarkSeed();
         return true;
       }
     }
@@ -261,6 +378,11 @@ size_t KeyboardEntryActivity::utf8Next(const std::string& s, size_t pos) {
 void KeyboardEntryActivity::insertUtf8(const char* out) {
   if (!out || !*out) return;
   const size_t n = strlen(out);
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  if (cursorPos > text.length()) cursorPos = text.length();
+  if (telexEnabled && inputType == InputType::Text && out[1] == '\0' &&
+      telex::insert(telexState, text, cursorPos, out[0], maxLength)) return;
+#endif
   if (maxLength != 0 && text.length() + n > maxLength) return;
   if (cursorPos > text.length()) cursorPos = text.length();
   text.insert(cursorPos, out, n);
@@ -268,6 +390,9 @@ void KeyboardEntryActivity::insertUtf8(const char* out) {
 }
 
 bool KeyboardEntryActivity::backspaceUtf8() {
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  telexState = {};
+#endif
   if (text.empty() || cursorPos == 0) return false;
   const size_t prev = utf8Prev(text, cursorPos);
   text.erase(prev, cursorPos - prev);
@@ -277,6 +402,13 @@ bool KeyboardEntryActivity::backspaceUtf8() {
 
 bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPress, bool& complete) {
   switch (value) {
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+    case TELEX_KEY:
+      if (inputType != InputType::Text) return false;
+      telexState = {};
+      telexEnabled = !telexEnabled;
+      return true;
+#endif
     case fui::QWERTY_KEY_SHIFT:
       delPressCount = 0;
       hintVisible = false;
@@ -501,7 +633,7 @@ bool KeyboardEntryActivity::cursorPositionFromPoint(const int x, const int y, si
       return true;
     }
 
-    if (normalizedUiTextSize(SETTINGS.uiTextSize) != 0 || lineEndIdx == static_cast<int>(displayText.length())) {
+    if (singleLineInput(renderer) || lineEndIdx == static_cast<int>(displayText.length())) {
       break;
     }
 
@@ -521,8 +653,49 @@ bool KeyboardEntryActivity::cursorPositionFromPoint(const int x, const int y, si
   return false;
 }
 
+std::string KeyboardEntryActivity::x3TipText() const {
+  if (normalizedUiTextSize(SETTINGS.uiTextSize) != 0) {
+    const char* contextual = cursorMode ? tr(STR_KB_HINT_RETURN_KEYBOARD) : tr(STR_KB_HINT_EDIT_ENTRY);
+    if (cursorMode && inputType == InputType::Password)
+      contextual = passwordVisible ? tr(STR_KB_HINT_HIDE_PASSWORD) : tr(STR_KB_HINT_SHOW_PASSWORD);
+    return std::string(contextual) + "\n" + tr(STR_KB_HINT_CLEAR_TEXT);
+  }
+  std::string tips = cursorMode ? tr(STR_KB_HINT_MOVE_CURSOR) :
+      urlPanel ? tr(STR_KB_HINT_EXIT_URL_MODE) : symbols ? "" :
+      inputType == InputType::Url ? tr(STR_KB_HINT_SECONDARY_CHAR) :
+      shifted ? tr(STR_KB_HINT_LOWER_SECONDARY) : tr(STR_KB_HINT_UPPER_SECONDARY);
+  if (cursorMode && inputType == InputType::Password && togglePos)
+    tips = std::string(passwordVisible ? tr(STR_KB_HINT_TOGGLE_HIDE_PASSWORD) : tr(STR_KB_HINT_TOGGLE_SHOW_PASSWORD)) +
+        "\n" + tr(STR_KB_HINT_RETURN_CURSOR);
+  if (!cursorMode && !symbols && !urlPanel) {
+    tips += "\n";
+    tips += tr(STR_KB_HINT_QUICK_SPACE);
+    tips += "\n";
+    tips += tr(STR_KB_HINT_QUICK_BACKSPACE);
+    tips += "\n";
+    tips += tr(STR_KB_HINT_EDIT_ENTRY);
+  }
+  if (inputType == InputType::Password) {
+    tips += "\n";
+    tips += passwordVisible ? tr(STR_KB_HINT_HIDE_PASSWORD) : tr(STR_KB_HINT_SHOW_PASSWORD);
+  }
+  if (cursorMode) {
+    tips += "\n";
+    tips += tr(STR_KB_HINT_RETURN_KEYBOARD);
+  }
+  if (inputType == InputType::Url && !symbols && !urlPanel && !cursorMode) {
+    tips += "\n";
+    tips += tr(STR_KB_HINT_URL_SNIPPETS);
+  }
+  tips += "\n";
+  tips += tr(STR_KB_HINT_CLEAR_TEXT);
+  return tips;
+}
+
 int KeyboardEntryActivity::inputTop() const {
   const auto& metrics = UITheme::getInstance().getMetrics();
+  if (tenorchrome::x3ScreenLayoutEnabled()) return tenorchrome::x3ScreenLayout(renderer).bodyRect.y;
+  if (tenorchrome::kTouchShell) return tenorchrome::contentTop();
   if (normalizedUiTextSize(SETTINGS.uiTextSize) != 0)
     return metrics.topPadding + (tenorchrome::enabled() ? tenorchrome::headerHeight() : metrics.headerHeight) +
            metrics.verticalSpacing;
@@ -530,7 +703,7 @@ int KeyboardEntryActivity::inputTop() const {
 }
 
 int KeyboardEntryActivity::inputWindowStart(std::string& displayText, int maxWidth) const {
-  if (normalizedUiTextSize(SETTINGS.uiTextSize) == 0) return 0;
+  if (!singleLineInput(renderer)) return 0;
   int start = 0;
   while (start < static_cast<int>(displayText.size())) {
     const int end = lineBreakEnd(displayText, start, maxWidth);
@@ -545,21 +718,45 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
   const int pageWidth = renderer.getScreenWidth();
   const int pageHeight = renderer.getScreenHeight();
   const int rows = currentLayout().rowCount;
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const std::string tips = x3TipText();
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tips.c_str(), 8));
+    const int top = layout.bodyRect.y + renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing + 16;
+    // 8 px of margin on each side, so the selection ring of the first and the last key of a row keeps clear of the edge.
+    constexpr int side = 8;
+    return fui::Rect{static_cast<int16_t>(side), static_cast<int16_t>(top), static_cast<int16_t>(pageWidth - 2 * side),
+        static_cast<int16_t>(layout.bodyRect.bottom() - top)};
+  }
   const int gap = metrics.keyboardKeySpacing;
+  const bool landscape = pageWidth > pageHeight;
+  const int rowGap = tenorchrome::kTouchShell ? (landscape ? 0 : fui::KeyboardProps{}.rowGap) : gap;
   const bool enlarged = normalizedUiTextSize(SETTINGS.uiTextSize) != 0;
-  const int keyHeight = enlarged ? renderer.getLineHeight(UI_12_FONT_ID) + renderer.getLineHeight(SMALL_FONT_ID) + 8
-                                 : metrics.keyboardKeyHeight;
-  const int height = rows * keyHeight + (rows > 1 ? (rows - 1) * gap : 0);
+  int keyHeight = enlarged ? renderer.getLineHeight(UI_12_FONT_ID) + renderer.getLineHeight(SMALL_FONT_ID) + 8
+                           : metrics.keyboardKeyHeight;
+  if (tenorchrome::kTouchShell) {
+    const int inputBottom = inputTop() + renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing + (landscape ? 2 : 8);
+    const int bottomGap = landscape ? 4 : metrics.verticalSpacing + 8;
+    const int available = tenorchrome::footBackTop(pageHeight) - bottomGap - inputBottom;
+    keyHeight = std::min(landscape ? 60 : std::max(60, keyHeight),
+                         std::max(1, (available - (rows - 1) * rowGap) / rows));
+  }
+  const int height = rows * keyHeight + (rows > 1 ? (rows - 1) * rowGap : 0);
   const int width = pageWidth * metrics.keyboardWidthPercent / 100;
   const int x = (pageWidth - width) / 2;
   int insetTop = 0, insetRight = 0, insetBottom = 0, insetLeft = 0;
   if (enlarged) renderer.getOrientedViewableTRBL(&insetTop, &insetRight, &insetBottom, &insetLeft);
-  const int footerReserve = std::max(metrics.buttonHintsHeight, insetBottom);
-  const int y = enlarged ? pageHeight - footerReserve - height -
+  // Touch: the keys sit over the foot of the screen, where "<" keeps a place of its own.
+  const int hints = tenorchrome::kTouchShell ? tenorchrome::footBackReserve() : metrics.buttonHintsHeight;
+  const int footerReserve = std::max(hints, insetBottom);
+  const int y = tenorchrome::kTouchShell ? tenorchrome::footBackTop(pageHeight) - height -
+                                             (landscape ? 4 : metrics.verticalSpacing + 8)
+                : enlarged ? pageHeight - footerReserve - height -
                                (12 + 2 * renderer.getLineHeight(SMALL_FONT_ID))
-                         : pageHeight - metrics.buttonHintsHeight - metrics.verticalSpacing - height +
+                         : pageHeight - hints - metrics.verticalSpacing - height +
                                metrics.keyboardVerticalOffset -
-                               (tenorchrome::enabled() ? 28 + 6 * renderer.getLineHeight(SMALL_FONT_ID) : 0);
+                               (tenorchrome::enabled() && !tenorchrome::kTouchShell
+                                    ? 28 + 6 * renderer.getLineHeight(SMALL_FONT_ID)
+                                    : 0);
   return fui::Rect{static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<int16_t>(width),
                    static_cast<int16_t>(height)};
 }
@@ -655,7 +852,8 @@ void KeyboardEntryActivity::loopLocked(const InputFrame& input, bool& complete) 
     if (result.activeChanged) {
       requestUpdate();
     }
-    if (input.touchDown || input.tapped) {
+    // A tap on "<" in the bar is Back (input.back), not a touch on the keys.
+    if ((input.touchDown || input.tapped) && !input.back.released) {
       return;
     }
   }
@@ -847,7 +1045,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto& metrics = UITheme::getInstance().getMetrics();
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, title.c_str());
+  if (!tenorchrome::x3ScreenLayoutEnabled())
+    GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, title.c_str());
 
   const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
   const int inputStartY = inputTop();
@@ -947,7 +1146,7 @@ void KeyboardEntryActivity::render(RenderLock&&) {
       } else {
         renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, lineText.c_str());
       }
-      if (normalizedUiTextSize(SETTINGS.uiTextSize) != 0 || lineEndIdx == static_cast<int>(displayText.length())) {
+      if (singleLineInput(renderer) || lineEndIdx == static_cast<int>(displayText.length())) {
         break;
       }
 
@@ -994,7 +1193,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
     }
   }
 
-  if (normalizedUiTextSize(SETTINGS.uiTextSize) == 0 && hintVisible && !text.empty()) {
+  // The tips below name front buttons; the touch shell has none.
+  if (!tenorchrome::x3ScreenLayoutEnabled() && !tenorchrome::kTouchShell && normalizedUiTextSize(SETTINGS.uiTextSize) == 0 && hintVisible && !text.empty()) {
     const int hintLh = renderer.getLineHeight(SMALL_FONT_ID);
     const int underlineY = inputStartY + inputHeight + lineHeight + metrics.verticalSpacing;
     const int hintY = underlineY + 4;
@@ -1036,7 +1236,13 @@ void KeyboardEntryActivity::render(RenderLock&&) {
     tipCount = 5 + (inputType == InputType::Url ? 1 : 0);
   }
 
-  if (normalizedUiTextSize(SETTINGS.uiTextSize) != 0) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const std::string tips = x3TipText();
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tips.c_str(), 8));
+    tenorchrome::drawTipInRect(renderer, tips.c_str(), layout.tipRect, 8);
+    x3activity::drawBar(renderer, layout.barRect, title.c_str(), navigationPrefix.c_str());
+  } else if (tenorchrome::kTouchShell) {
+  } else if (normalizedUiTextSize(SETTINGS.uiTextSize) != 0) {
     const char* contextual = cursorMode ? tr(STR_KB_HINT_RETURN_KEYBOARD) : tr(STR_KB_HINT_EDIT_ENTRY);
     if (cursorMode && inputType == InputType::Password)
       contextual = passwordVisible ? tr(STR_KB_HINT_HIDE_PASSWORD) : tr(STR_KB_HINT_SHOW_PASSWORD);
@@ -1048,46 +1254,45 @@ void KeyboardEntryActivity::render(RenderLock&&) {
     fit(contextual, tipY);
     fit(tr(STR_KB_HINT_CLEAR_TEXT), tipY + tipsLh);
   } else if (tipCount > 0) {
-    int y = tenorchrome::enabled() ? tenorchrome::tipY(renderer) - tipCount * tipsLh
-                                   : (underlineBottom + kbRect.y) / 2 - (tipCount + 1) * tipsLh / 2;
-    drawTip(tr(STR_KB_TIPS), y);
-    y += tipsLh;
+    const char* tips[8];
+    int n = 0;
+    tips[n++] = shell::uglyParts() ? ugly::words::keyboardTips() : tr(STR_KB_TIPS);
     if (cursorMode) {
-      drawTip(tr(STR_KB_HINT_RETURN_KEYBOARD), y);
+      tips[n++] = tr(STR_KB_HINT_RETURN_KEYBOARD);
     } else if (urlPanel) {
-      drawTip(tr(STR_KB_HINT_EXIT_URL_MODE), y);
-      y += tipsLh;
-      if (!text.empty()) {
-        drawTip(tr(STR_KB_HINT_CLEAR_TEXT), y);
-      }
+      tips[n++] = tr(STR_KB_HINT_EXIT_URL_MODE);
+      if (!text.empty()) tips[n++] = tr(STR_KB_HINT_CLEAR_TEXT);
     } else if (symbols) {
-      if (!text.empty()) {
-        drawTip(tr(STR_KB_HINT_CLEAR_TEXT), y);
-      }
+      if (!text.empty()) tips[n++] = tr(STR_KB_HINT_CLEAR_TEXT);
     } else {
-      const char* altCharTip;
       if (inputType == InputType::Url) {
-        altCharTip = tr(STR_KB_HINT_SECONDARY_CHAR);
+        tips[n++] = tr(STR_KB_HINT_SECONDARY_CHAR);
       } else if (shifted) {
-        altCharTip = tr(STR_KB_HINT_LOWER_SECONDARY);
+        tips[n++] = tr(STR_KB_HINT_LOWER_SECONDARY);
       } else {
-        altCharTip = tr(STR_KB_HINT_UPPER_SECONDARY);
+        tips[n++] = tr(STR_KB_HINT_UPPER_SECONDARY);
       }
-      drawTip(altCharTip, y);
-      y += tipsLh;
-      drawTip(tr(STR_KB_HINT_QUICK_SPACE), y);
-      y += tipsLh;
-      drawTip(tr(STR_KB_HINT_QUICK_BACKSPACE), y);
-      y += tipsLh;
-      drawTip(tr(STR_KB_HINT_EDIT_ENTRY), y);
-      y += tipsLh;
-      if (inputType == InputType::Url) {
-        drawTip(tr(STR_KB_HINT_URL_SNIPPETS), y);
-        y += tipsLh;
-      }
+      tips[n++] = tr(STR_KB_HINT_QUICK_SPACE);
+      tips[n++] = tr(STR_KB_HINT_QUICK_BACKSPACE);
+      tips[n++] = tr(STR_KB_HINT_EDIT_ENTRY);
+      if (inputType == InputType::Url) tips[n++] = tr(STR_KB_HINT_URL_SNIPPETS);
       // Always shown: a tap on Back saves, and that is the one thing a reader
       // must know before typing, empty field or not.
-      drawTip(tr(STR_KB_HINT_CLEAR_TEXT), y);
+      tips[n++] = tr(STR_KB_HINT_CLEAR_TEXT);
+    }
+    if (shell::uglyParts()) {
+      // In hand, one tip a line over the key bar. The hand is taller than the small font: when the lines outgrow the
+      // room under the keys, the title goes first, then the tips at the top; the one about Back stays.
+      if (n > 0 && tenorchrome::tipShown(tips[n - 1])) {
+        int room = 1;
+        while (tenorchrome::uglyTipTop(renderer, 1, room) + ugly::ascent(ugly::Size::S22) >= kbRect.y + kbRect.height + 24) ++room;
+        const int first = std::max(0, n - room);
+        for (int i = first; i < n; ++i) tenorchrome::drawTip(renderer, tips[i], n - 1 - i, 1);
+      }
+    } else {
+      int y = tenorchrome::enabled() ? tenorchrome::tipY(renderer) - tipCount * tipsLh
+                                     : (underlineBottom + kbRect.y) / 2 - (tipCount + 1) * tipsLh / 2;
+      for (int i = 0; i < n; ++i, y += tipsLh) drawTip(tips[i], y);
     }
   }
 
@@ -1101,6 +1306,28 @@ void KeyboardEntryActivity::render(RenderLock&&) {
   fui::GfxRendererTarget target(renderer);
   target.setFont(fui::GfxRendererTarget::FONT_SMALL, SMALL_FONT_ID);
   target.setFont(fui::GfxRendererTarget::FONT_BODY, UI_12_FONT_ID);
+  // Compact landscape rows keep both digit and alternate complete. Reuse the
+  // existing fixed families without rebinding the user's input/status fonts.
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  int telexKeyFont = UI_12_FONT_ID;
+#endif
+  const int rowGap = renderer.getScreenWidth() > renderer.getScreenHeight() ? 0 : fui::KeyboardProps{}.rowGap;
+  const int rowHeight = (kbRect.height - (currentLayout().rowCount - 1) * rowGap) /
+                        currentLayout().rowCount;
+  if ((tenorchrome::kTouchShell || tenorchrome::x3ScreenLayoutEnabled()) &&
+      normalizedUiTextSize(SETTINGS.uiTextSize) != 0 &&
+      rowHeight < renderer.getLineHeight(UI_12_FONT_ID) + renderer.getLineHeight(SMALL_FONT_ID) + 8) {
+    constexpr int KEY_BODY_FONT_ID = 0x4b424f44, KEY_ALT_FONT_ID = 0x4b414c54;
+    if (renderer.getFontMap().find(KEY_BODY_FONT_ID) == renderer.getFontMap().end()) {
+      renderer.insertFont(KEY_BODY_FONT_ID, uiFontTierFamily(UIFontRole::Subtitle, 0));
+      renderer.insertFont(KEY_ALT_FONT_ID, uiFontTierFamily(UIFontRole::Caption, 0));
+    }
+    target.setFont(fui::GfxRendererTarget::FONT_BODY, KEY_BODY_FONT_ID);
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+    telexKeyFont = KEY_BODY_FONT_ID;
+#endif
+    target.setFont(fui::GfxRendererTarget::FONT_SMALL, KEY_ALT_FONT_ID);
+  }
   const fui::DeviceContext device = target.deviceContext();
   const fui::InputSnapshot noInput{};
   fui::Frame<56> frame(target, device, noInput, interactions);
@@ -1117,11 +1344,16 @@ void KeyboardEntryActivity::render(RenderLock&&) {
   props.modeLabel =
       (symbols || (inputType == InputType::Url && urlPanel)) ? tr(STR_KEY_MODE_ABC) : tr(STR_KEY_MODE_SYMBOLS);
   props.inputMask = static_cast<uint16_t>(fui::InputTouch | fui::InputLongPress);
-  props.selectedIndex = cursorMode ? -1 : static_cast<int16_t>(selectedLogicalIndex());
+  // Touch: a finger picks the key, no key cursor (no black key).
+  props.selectedIndex = cursorMode || tenorchrome::kTouchShell ? -1 : static_cast<int16_t>(selectedLogicalIndex());
   props.labelText.font = fui::GfxRendererTarget::FONT_BODY;
   props.altText.font = fui::GfxRendererTarget::FONT_SMALL;
   props.stackAlternates = normalizedUiTextSize(SETTINGS.uiTextSize) != 0;
   props.gap = static_cast<int16_t>(metrics.keyboardKeySpacing);
+  if (tenorchrome::kTouchShell && renderer.getScreenWidth() > renderer.getScreenHeight()) {
+    props.rowGap = 0;
+    props.minTouchSize = 60;
+  }
   // The key cursor is a leaf of a key's short side (keys of one unit: ten to the widest row);
   // unselected keys have no fill or border, so only the cursor shows it.
   if (metrics.roundedMarks) {
@@ -1130,14 +1362,36 @@ void KeyboardEntryActivity::render(RenderLock&&) {
     const int keyWidth = (kbRect.width - 9 * props.gap) / 10;
     props.keyRadius = static_cast<uint8_t>(tenorradius::leaf(std::min(keyHeight, keyWidth)));
   }
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    props.keyStyles = fui::plainStyles(fui::Paint::solid(fui::Color::Black));
+    props.keyStyles.selected.border = fui::Paint::solid(fui::Color::Black);
+    props.keyStyles.selected.borderWidth = 3;
+    props.keyRadius = 8;
+  }
   props.padding = fui::Insets{0, 0, 0, 0};
   // Fingers land low on the bottom row (occlusion) and there is no key below
   // to catch the miss - extend its hit band down to the button hints bar.
-  const int hintsTop = renderer.getScreenHeight() - metrics.buttonHintsHeight;
+  const int hintsTop = renderer.getScreenHeight() -
+                       (tenorchrome::kTouchShell ? tenorchrome::footBackReserve() : metrics.buttonHintsHeight);
   props.bottomHitOverflow = static_cast<int16_t>(std::max(0, hintsTop - (kbRect.y + kbRect.height)));
+  if (tenorchrome::x3ScreenLayoutEnabled()) props.bottomHitOverflow = 0;
+  const bool handwritten = shell::uglyParts();
+  target.setPaintingEnabled(!handwritten);
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  TelexKeyText telexKeyText{target, renderer, telexKeyFont};
+  if (!handwritten && inputType == InputType::Text && !symbols)
+    target.setTextSink(drawTelexKeyText, &telexKeyText);
+#endif
   fui::keyboard(frame, kbRect, props);
+  target.setPaintingEnabled(true);
   interactions.publish();
   interactionsReady = true;
+  if (handwritten) {
+    const int rows = std::max<int>(1, layout.rowCount);
+    paintUglyKeys(renderer, props, interactions.publishedData(), interactions.publishedCount(),
+                  (kbRect.height - props.rowGap * (rows - 1)) / rows,
+                  selectionMarkSeed());
+  }
 
   // Hints follow the live axis, not the button names: with keyboardAxisSwapped
   // the front pair walks rows and the edge buttons walk columns. On the X3 the
@@ -1152,7 +1406,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
   // reader sees: passing "^" shows "<" and passing "v" shows ">". Measured off
   // the panel on 13/09/2026 rather than derived, the rotation helper reads as
   // clockwise but lands counter-clockwise on this board.
-  GUI.drawSideButtonHints(renderer, swapAxis ? "^" : ">", swapAxis ? "v" : "<");
+  if (!tenorchrome::x3ScreenLayoutEnabled())
+    GUI.drawSideButtonHints(renderer, swapAxis ? "^" : ">", swapAxis ? "v" : "<");
 
   renderer.displayBuffer();
 }

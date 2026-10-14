@@ -8,8 +8,18 @@ python3 test/menu_sleep_split/run.py --repo . --output /tmp/menu-sleep-split --s
 
 The harness compiles unmodified production category rebuilding, favorite key lookup, the Home settings branch, web settings serializer, SettingsTabs, and MenuCustomization persistence. Rendering, radio, storage, GPIO, dictionaries and font discovery use explicit host boundaries. Storage faults run against an in-memory filesystem. This test does not claim a physical-device journey.
 
-Coverage: 24 board/theme/IMU/optional-row cases, unique row ownership, Sleep ID7, existing tab IDs, Home entries, old pin routing, the retired wake row and its old pin, conditional light row, default order, legacy order migration, save/reload, invalid/duplicate IDs, backup recovery, reordering and failed-save rollback. The web fixture hashes symbolic string IDs so translation regeneration does not change the category/key/value contract. The serializer body is production code. Comparing its output before and after menu navigation also checks byte equivalence within each run.
+Coverage: 12 board/IMU/optional-row cases plus 1 persistence case, unique row ownership, Sleep ID7, existing tab IDs, Home entries, old pin routing, the retired wake row and its old pin, conditional light row, default order, legacy order migration, save/reload, invalid/duplicate IDs, backup recovery, reordering and failed-save rollback. The web fixture hashes symbolic string IDs so translation regeneration does not change the category/key/value contract. The serializer body is production code. Comparing its output before and after menu navigation also checks byte equivalence within each run.
 
-`web-schema-sha256.json` records pre-split serializer output for those 24 cases. Change it only for a deliberate web schema/value change, with independent review. `--web-baseline` additionally compares a directory of complete recorded `*-web.json` outputs.
+`web-schema-sha256.json` records pre-split serializer output for those 12 cases. Change it only for a deliberate web schema/value change, with independent review. `--web-baseline` additionally compares a directory of complete recorded `*-web.json` outputs.
+
+The 12 hashes now include 6 reader ink options. Starting from each base c1087f0 web payload and appending STR_READER_INK_4 and STR_READER_INK_5 to that row reproduces the entire updated payload. Every other row and value stays unchanged.
+
+All 12 hashes include the header clock's 3 values in 82183a56 (Hide, Time, Time and date): `clockShowHeader` is an
+enum of STR_HIDE, STR_CLOCK_HEADER_TIME and STR_CLOCK_HEADER_TIME_DATE instead of a toggle. Putting only that row
+back to the toggle reproduces each earlier hash.
+
+The start-screen regression adds 12 `-ugly` cases with the same board, sensor and optional-row matrix. The 12 cross hashes stay unchanged. Each ugly schema omits `wakeIntoBook` and `tipsEnabled`, and appends `uglyStartScreen` with Book, Root and Recent, default Root (1), plus `uglyRootScreen` with Diary and Desk, default Diary (0). With `--web-baseline`, the test derives this exact change from the recorded cross schemas before checking the new hashes. Device rows and pinned settings expose Root only in ugly, in Display, and the start row for the active shell, in Sleep.
+
+The 4 Pro hashes include the dynamic bar default change in 3afef460: `homeButtonDoubleTapAction` is Ignore (1). Replacing only that value with the earlier ToggleFrontlight (10) reproduces each earlier hash; all other fields retain the same oracle. The harness also asserts Ignore directly.
 
 Recommended CTest registration: `MenuSleepSplitRegression`, `RUN_SERIAL TRUE`, `TIMEOUT 180`. Root owns CMake registration.

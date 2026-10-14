@@ -1,5 +1,6 @@
 #include "CrossPointSettings.h"
 
+#include <BlePageTurnerJson.h>
 #include <Epub/ReaderSpacing.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -9,6 +10,8 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <new>
 #include <string>
 
 #include "I18nKeys.h"
@@ -26,7 +29,7 @@ constexpr size_t OBF_KEY_BUF = 64;
 
 // Null-terminated copy into a fixed-size settings field.
 void copyToField(char* dest, const char* src, const size_t maxLen) {
-  strncpy(dest, src, maxLen - 1);
+  if (dest != src) strncpy(dest, src, maxLen - 1);
   dest[maxLen - 1] = '\0';
 }
 
@@ -49,6 +52,12 @@ void CrossPointSettings::validateFrontButtonMapping(CrossPointSettings& settings
 }
 
 CrossPointSettings::CrossPointSettings() { applyTenorPreset(); }
+
+uint8_t CrossPointSettings::defaultOf(uint8_t CrossPointSettings::* field) {
+  // A fresh instance holds the defaults; it lives on the heap for the moment it takes to read one.
+  const std::unique_ptr<CrossPointSettings> fresh(new (std::nothrow) CrossPointSettings());
+  return fresh ? (*fresh).*field : getInstance().*field;
+}
 
 uint8_t CrossPointSettings::sleepTimeoutEnumToMinutes(const uint8_t legacyValue) {
   switch (legacyValue) {
@@ -76,17 +85,19 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   doc["paragraphIndentVersion"] = 1;
   doc["readerInkWeightVersion"] = readerInk::SCHEMA_VERSION;
   doc["tenorPresetVersion"] = TENOR_PRESET_VERSION;
+  doc["tapZonesVersion"] = 1;
+  doc["buttonHintsVersion"] = 1;
   const CrossPointSettings& s = *this;
 
   // Duyet THANG bang tinh, khong chep ra vector rieng: duong nay chay moi lan
   // nguoi dung bat mot tuy chon hay xep lai mot dong ghim, va cu chep cu doi mot
   // khoi lien ~16 KB. Loc theo phan cung bang cung mot vi ngu ma getSettingsList
   // dung, nen nhung dong duoc ghi xuong khong doi.
-  for (const auto& info : getBaseSettingsList()) {
-    if (settingHiddenOnThisBoard(info)) continue;
-    if (!info.key) continue;
+  forEachBaseSetting([&](const SettingInfo& info) {
+    if (settingHiddenOnThisBoard(info)) return;
+    if (!info.key) return;
     // Dynamic entries (KOReader etc.) are stored in their own files - skip.
-    if (!info.valuePtr && !info.stringOffset) continue;
+    if (!info.valuePtr && !info.stringOffset) return;
 
     if (info.stringOffset) {
       const char* strPtr = (const char*)&s + info.stringOffset;
@@ -100,7 +111,7 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
     } else {
       doc[info.key] = s.*(info.valuePtr);
     }
-  }
+  });
 
   // The file always carries the switches in effect, marked as this mode's, so the
   // next boot and the web page read what the reader draws.
@@ -111,6 +122,13 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
     doc["statusBarBookProgressPercentage"] = static_cast<uint8_t>(spec.showBookProgressPercent);
   }
   doc["statusBarItemsMode"] = readerStatusBarMode;
+  const auto status = statusBarSpec();
+  doc["readerStatusSlotsEnabled"] = static_cast<uint8_t>(status.slotsEnabled);
+  doc["readerStatusTop"] = status.topTitleMode;
+  doc["readerStatusLeft"] = status.slots[0];
+  doc["readerStatusCenter"] = status.slots[1];
+  doc["readerStatusRight"] = status.slots[2];
+  doc["readerStatusVersion"] = 1;
 
   // Front button remap - managed by RemapFrontButtons sub-activity, not in SettingsList.
   doc["frontButtonBack"] = frontButtonBack;
@@ -121,6 +139,9 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   // option lists depend on the SD font registry), so the generic loop skips them.
   doc["fontFamily"] = fontFamily;
   doc["fontSize"] = fontPointSize;
+  // Hold-Select function - list position differs from the number on a board without an IMU, so the
+  // row in SettingsList is dynamic and the generic loop skips it. Saved as the number.
+  doc["longPressMenuFunction"] = longPressMenuFunction;
   // SD card font family name - not in SettingsList, save manually
   doc["sdFontFamilyName"] = sdFontFamilyName;
   // Dictionary folder name - uses dynamic getter/setter in SettingsList, save manually
@@ -146,32 +167,24 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   if (readerFavoritesDaDat) {
     JsonArray yeuThich = doc["readerFavorites"].to<JsonArray>();
     for (uint8_t i = 0; i < readerFavoriteCount && i < READER_FAVORITE_MAX; i++) {
-      yeuThich.add(readerFavorites[i]);
+      const uint8_t pin = readerFavorites[i];
+      if (pin & readermenu::PIN_TEXT)
+        yeuThich.add(std::string("text/") + readermenu::TEXT_KEYS[(pin & ~readermenu::PIN_TEXT) % readermenu::TEXT_KEY_COUNT]);
+      else
+        yeuThich.add(pin);
     }
   }
 
   // BLE page turner (BTH2) - managed by BlePageTurnerActivity, not SettingsList.
-  doc["blePageTurnerEnabled"] = blePageTurnerEnabled;
-  doc["blePeerAddr"] = blePeerAddr;
-  doc["blePeerName"] = blePeerName;
-  doc["blePrevKeyUsage"] = blePrevKeyUsage;
-  doc["bleNextKeyUsage"] = bleNextKeyUsage;
-  // One entry per remote: its address and its 32-bit slots. An empty table is written
-  // too: the user cleared it, and the built-in default must not come back.
-  if (bleRemoteCount > 0) {
-    JsonArray remotes = doc["bleRemotes"].to<JsonArray>();
-    for (uint8_t i = 0; i < bleRemoteCount && i < blebinding::kMaxRemotes; i++) {
-      JsonObject r = remotes.add<JsonObject>();
-      r["addr"] = bleRemotes[i].addr;
-      JsonArray binds = r["binds"].to<JsonArray>();
-      for (uint8_t j = 0; j < bleRemotes[i].count && j < blebinding::kMaxBindings; j++) binds.add(bleRemotes[i].bindings[j]);
-    }
-  }
+  bleturner::writeJson(ble, doc);
 }
 
 bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   CrossPointSettings& s = *this;
   bool needsResave = false;
+  if (doc["homeStyle"].isNull()) homeStyle = 0;
+  if (doc["tipsEnabled"].isNull()) tipsEnabled = 1;
+  if (doc["tenorButtonHints"].isNull()) tenorButtonHints = 1;
 
   auto clamp = [](uint8_t val, uint8_t maxVal, uint8_t def) -> uint8_t { return val < maxVal ? val : def; };
 
@@ -179,11 +192,11 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // nguoi dung bat mot tuy chon hay xep lai mot dong ghim, va cu chep cu doi mot
   // khoi lien ~16 KB. Loc theo phan cung bang cung mot vi ngu ma getSettingsList
   // dung, nen nhung dong duoc ghi xuong khong doi.
-  for (const auto& info : getBaseSettingsList()) {
-    if (settingHiddenOnThisBoard(info)) continue;
-    if (!info.key) continue;
+  forEachBaseSetting([&](const SettingInfo& info) {
+    if (settingHiddenOnThisBoard(info)) return;
+    if (!info.key) return;
     // Dynamic entries (KOReader etc.) are stored in their own files - skip.
-    if (!info.valuePtr && !info.stringOffset) continue;
+    if (!info.valuePtr && !info.stringOffset) return;
 
     if (info.stringOffset) {
       // destPtr starts out holding the struct-initializer default; it stays that
@@ -193,7 +206,7 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
         LOG_ERR("CPS", "Misconfigured SettingInfo: stringMaxLen is 0 for key '%s'", info.key);
         destPtr[0] = '\0';
         needsResave = true;
-        continue;
+        return;
       }
 
       bool loaded = false;
@@ -228,7 +241,7 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
       const uint8_t fieldDefault = s.*(info.valuePtr);  // struct-initializer default, read before we overwrite it
       uint8_t v = doc[info.key] | fieldDefault;
       if (info.type == SettingType::ENUM) {
-        v = clamp(v, (uint8_t)info.enumValues.size(), fieldDefault);
+        v = clamp(v, (uint8_t)info.enumLabels().size(), fieldDefault);
       } else if (info.type == SettingType::TOGGLE) {
         v = clamp(v, (uint8_t)2, fieldDefault);
       } else if (info.type == SettingType::VALUE) {
@@ -239,7 +252,12 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
       }
       s.*(info.valuePtr) = v;
     }
-  }
+  });
+
+  const uint8_t storedUglyStart = doc["uglyStartScreen"].is<uint8_t>()
+                                     ? doc["uglyStartScreen"].as<uint8_t>()
+                                     : static_cast<uint8_t>(UGLY_START_ROOT);
+  needsResave |= migrateUglyRoot(!doc["uglyRootScreen"].isNull(), storedUglyStart);
 
   if (doc["uiTextSize"].isNull()) {
     uiTextSize = UI_TEXT_SMALL;
@@ -255,12 +273,18 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   if (inkVersion < readerInk::SCHEMA_VERSION) {
     readerInkWeight = doc["readerInkWeight"].isNull()
                           ? uint8_t{0}
-                          : readerInk::fromLegacy(doc["readerInkWeight"].as<int>());
+                          : inkVersion == 0 ? readerInk::fromLegacy(doc["readerInkWeight"].as<int>())
+                                            : (doc["readerInkWeight"].as<int>() >= 1 &&
+                                                       doc["readerInkWeight"].as<int>() <= 3
+                                                   ? uint8_t{1}
+                                                   : uint8_t{0});
     needsResave = true;
   } else if (!doc["readerInkWeight"].isNull()) {
     const int storedInkWeight = doc["readerInkWeight"].as<int>();
     readerInkWeight = readerInk::clamp(storedInkWeight);
     if (storedInkWeight != readerInkWeight) needsResave = true;
+  } else {
+    readerInkWeight = 0;
   }
 
   // v1.0.2 luu hai co an rieng cho thanh trang thai ngoai/trong trinh doc. Quy doi
@@ -271,6 +295,13 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
         (doc["hideGlobalStatusBar"] | uint8_t{0}) ? GLOBAL_STATUS_BAR_OFF : GLOBAL_STATUS_BAR_SMALL;
     needsResave = true;
   }
+  // v1.0.59 Button hints: before the switch, General status bar Off was the only way to hide the button hints. A file
+  // from then with the bar Off starts with the hints off too, so turning the bar back on later does not bring them
+  // back. Stamped once: after that the two settings stay apart.
+  if (doc["buttonHintsVersion"].isNull()) {
+    if (globalStatusBarMode == GLOBAL_STATUS_BAR_OFF) tenorButtonHints = 0;
+    needsResave = true;
+  }
   if (doc["readerStatusBarMode"].isNull() && !doc["hideReaderStatusBar"].isNull()) {
     readerStatusBarMode =
         (doc["hideReaderStatusBar"] | uint8_t{0}) ? READER_STATUS_BAR_OFF : READER_STATUS_BAR_DEFAULT;
@@ -279,6 +310,23 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // A file from before the switches carries switch values nothing ever read (the
   // web page could still set them), so the switches start from what the stored
   // mode showed.
+  const auto statusValue = [&](const char* key, int count, uint8_t fallback) {
+    const int value = doc[key] | static_cast<int>(fallback);
+    return value >= 0 && value < count ? static_cast<uint8_t>(value) : fallback;
+  };
+  readerStatusSlotsEnabled = statusValue("readerStatusSlotsEnabled", 2, 0);
+  readerStatusTop = statusValue("readerStatusTop", STATUS_BAR_TITLE_COUNT, HIDE_TITLE);
+  readerStatusLeft = statusValue("readerStatusLeft", STATUS_SLOT_CHAPTER_NAME, STATUS_SLOT_NONE);
+  readerStatusCenter = statusValue("readerStatusCenter", STATUS_SLOT_COUNT, STATUS_SLOT_NONE);
+  readerStatusRight = statusValue("readerStatusRight", STATUS_SLOT_CHAPTER_NAME, STATUS_SLOT_NONE);
+  // Version 1: a centre of chapter pages was what was left once the custom bar dropped the book
+  // percent, so it gets both once, unless a corner already shows the percent.
+  if ((doc["readerStatusVersion"] | uint8_t{0}) < 1) {
+    if (readerStatusSlotsEnabled && readerStatusCenter == STATUS_SLOT_CHAPTER_PAGES &&
+        readerStatusLeft != STATUS_SLOT_BOOK_PERCENT && readerStatusRight != STATUS_SLOT_BOOK_PERCENT)
+      readerStatusCenter = STATUS_SLOT_CHAPTER_AND_BOOK_PROGRESS;
+    needsResave = true;
+  }
   statusBarItemsMode = doc["statusBarItemsMode"] | uint8_t{0xFF};
   if (statusBarItemsMode != readerStatusBarMode) {
     adoptReaderStatusItems();
@@ -288,6 +336,29 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // Retire the experimental hold-to-resize shortcut without delaying page turns.
   if ((doc["longPressButtonBehavior"] | uint8_t{OFF}) == FONT_SIZE_STEP) {
     longPressButtonBehavior = OFF;
+    needsResave = true;
+  }
+
+  // Older files stored one combined touch mode under "touchReaderControls":
+  // 0=off, 1=tap, 2=swipe, 3=inverted tap. Split it into the master toggle
+  // plus the per-direction gesture pair (the generic loop above already folded
+  // out-of-range toggle values back to the On default).
+  if (doc["pageTurnGesture"].isNull() && doc["previousPageGesture"].isNull() &&
+      doc["touchReaderControls"].is<uint8_t>()) {
+    const uint8_t mode = doc["touchReaderControls"].as<uint8_t>();
+    if (mode >= 1 && mode <= 3) {
+      touchReaderControls = TOUCH_READER_ON;
+      pageTurnGesture = mode == 1 ? TAP_ONLY : mode == 2 ? SWIPE_ONLY : INVERTED_TAP;
+      previousPageGesture = pageTurnGesture;
+      needsResave = true;
+    }
+  }
+
+  // v1.0.53 tap zones: a tap on the page edge turns it. A file from before them that turned one way by
+  // swipe only takes taps too, once; the stamp keeps a swipe-only choice made later.
+  if (doc["tapZonesVersion"].isNull()) {
+    if ((doc["pageTurnGesture"] | uint8_t{0xFF}) == SWIPE_ONLY) pageTurnGesture = TAP_AND_SWIPE;
+    if ((doc["previousPageGesture"] | uint8_t{0xFF}) == SWIPE_ONLY) previousPageGesture = TAP_AND_SWIPE;
     needsResave = true;
   }
 
@@ -341,7 +412,9 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
       const auto repairLevel = [&doc, &needsResave](const char* key, uint8_t& field) {
         if (doc[key].isNull()) return;  // absent keeps the default level
         const uint8_t raw = doc[key].as<uint8_t>();
-        if (raw < readerSpacing::LEVEL_COUNT) {
+        const uint8_t count = strcmp(key, "lineSpacing") == 0 ? readerSpacing::lineLevelCount()
+                                                                  : static_cast<uint8_t>(readerSpacing::LEVEL_COUNT);
+        if (raw < count) {
           field = raw;
         } else {
           field = readerSpacing::LEVEL_DEFAULT;
@@ -400,9 +473,30 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // Font family - uses dynamic getter/setter in SettingsList so the generic loop skips it.
   const uint8_t storedFontFamily = doc["fontFamily"] | (uint8_t)0;
   fontFamily = clamp(storedFontFamily, BUILTIN_FONT_COUNT, 0);
+  // Hold-Select function - dynamic row too. A number this board does not offer (the tilt toggle without an IMU,
+  // or one from a newer file) keeps the default, as the generic loop's clamp did.
+  const uint8_t storedLongPress = doc["longPressMenuFunction"] | longPressMenuFunction;
+  if (storedLongPress < LONG_PRESS_MENU_FUNCTION_COUNT &&
+#if !FREEINK_CAP_BLE_HID_HOST
+      storedLongPress != LP_MENU_CONNECT_REMOTE &&
+#endif
+      (halTiltSensor.isAvailable() || storedLongPress != LP_MENU_TILT_PAGE_TURN)) {
+    longPressMenuFunction = storedLongPress;
+  }
+  if (BoardConfig::hasHomeKey() && doc["homeButtonLongPressAction"].isNull() &&
+      !doc["longPressMenuFunction"].isNull()) {
+    static constexpr HomeButtonAction LEGACY[] = {HomeButtonAction::Sync, HomeButtonAction::Ignore,
+                                                  HomeButtonAction::Bookmark, HomeButtonAction::Dictionary,
+                                                  HomeButtonAction::ReaderMenu};
+    if (s.longPressMenuFunction < sizeof(LEGACY) / sizeof(LEGACY[0])) {
+      s.homeButtonLongPressAction = static_cast<uint8_t>(LEGACY[s.longPressMenuFunction]);
+      needsResave = true;
+    }
+  }
+
   // SD card font family name - not in SettingsList, load manually
   const char* sfn = doc["sdFontFamilyName"] | "";
-  strncpy(sdFontFamilyName, sfn, sizeof(sdFontFamilyName) - 1);
+  if (sfn != sdFontFamilyName) strncpy(sdFontFamilyName, sfn, sizeof(sdFontFamilyName) - 1);
   sdFontFamilyName[sizeof(sdFontFamilyName) - 1] = '\0';
   if (storedFontFamily == LEGACY_OPENDYSLEXIC && sdFontFamilyName[0] == '\0') {
     fontFamily = NOTOSERIF;
@@ -436,6 +530,11 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
     readerFavoriteCount = 0;
     for (const JsonVariantConst o : doc["readerFavorites"].as<JsonArrayConst>()) {
       if (readerFavoriteCount >= READER_FAVORITE_MAX) break;
+      // X4 Pro: a pinned text setting, "text/<key>".
+      if (const uint8_t text = o.is<const char*>() ? readermenu::textPin(o.as<const char*>()) : 0) {
+        readerFavorites[readerFavoriteCount++] = text;
+        continue;
+      }
       if (!o.is<uint8_t>()) continue;
       const uint8_t v = o.as<uint8_t>();
       if (v >= static_cast<uint8_t>(readermenu::ACTION_COUNT)) {
@@ -451,26 +550,7 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // trong struct (tat, khong peer, chua hoc nut) va ghi lai file MOT lan de nam
   // khoa co mat tu day. Cac truong cu di qua vong lap chung o tren nen khong
   // truong nao bi mat.
-  blePageTurnerEnabled = (doc["blePageTurnerEnabled"] | uint8_t{0}) ? 1 : 0;
-  copyToField(blePeerAddr, doc["blePeerAddr"] | "", sizeof(blePeerAddr));
-  copyToField(blePeerName, doc["blePeerName"] | "", sizeof(blePeerName));
-  blePrevKeyUsage = doc["blePrevKeyUsage"] | uint8_t{0};
-  bleNextKeyUsage = doc["bleNextKeyUsage"] | uint8_t{0};
-  bleRemoteCount = 0;
-  for (const JsonObjectConst r : doc["bleRemotes"].as<JsonArrayConst>()) {
-    if (bleRemoteCount >= blebinding::kMaxRemotes) break;
-    const char* addr = r["addr"] | "";
-    if (addr[0] == '\0') continue;
-    // Build the entry aside first: the document's string may point into this very slot.
-    blebinding::RemoteTable t{};
-    copyToField(t.addr, addr, sizeof(t.addr));
-    for (const JsonVariantConst b : r["binds"].as<JsonArrayConst>()) {
-      if (t.count >= blebinding::kMaxBindings) break;
-      if (b.is<uint32_t>() && blebinding::valid(b.as<uint32_t>())) t.bindings[t.count++] = b.as<uint32_t>();
-    }
-    bleRemotes[bleRemoteCount++] = t;
-  }
-  if (doc["blePageTurnerEnabled"].isNull()) {
+  if (!bleturner::readJson(ble, doc)) {
     needsResave = true;
   }
 
@@ -503,6 +583,8 @@ constexpr uint8_t READER_MODE_ITEMS[CrossPointSettings::READER_STATUS_BAR_MODE_C
     SB_TITLE | SB_PAGES,                                      // Chapter name & chapter progress
     SB_TITLE | SB_CLOCK,                                      // Chapter name & clock
     SB_TITLE | SB_BATTERY,                                    // Chapter name & battery
+    SB_PAGES | SB_CLOCK,
+    SB_TITLE | SB_PAGES | SB_CLOCK,
 };
 }  // namespace
 
@@ -528,7 +610,44 @@ CrossPointSettings::StatusBarSpec CrossPointSettings::statusBarSpec() const {
     spec.clockMode = statusBarClock == STATUS_BAR_CLOCK_LEFT ? STATUS_BAR_CLOCK_LEFT : STATUS_BAR_CLOCK_RIGHT;
   spec.xtcMode = XTC_STATUS_BAR_BOTTOM;
   spec.clock12h = clockFormat == 1;
-  spec.clockUtcOffsetQ = clockUtcOffsetQ;
+  // StatusBarSpec has no clockUtcOffsetQ field (#3562 removed it upstream);
+  // clock rendering reads SETTINGS.clockUtcOffsetQ directly (TenorMenuChrome.cpp).
+  spec.progressBarMode = statusBarProgressBar;
+  spec.progressBarHeightPx =
+      statusBarProgressBar != HIDE_PROGRESS ? static_cast<uint8_t>((statusBarProgressBarThickness + 1) * 2) : 0;
+  spec.xtcMode = xtcStatusBarMode;
+  spec.topTitleMode = spec.titleMode;
+  // The corners the default bar draws: the clock on the side it was asked for, the battery opposite.
+  const bool clockLeft = spec.clockMode == STATUS_BAR_CLOCK_LEFT;
+  const uint8_t clockSlot = spec.showsClock() ? STATUS_SLOT_CLOCK : STATUS_SLOT_NONE;
+  const uint8_t batterySlot = spec.showBattery ? STATUS_SLOT_BATTERY : STATUS_SLOT_NONE;
+  spec.slots = {clockLeft ? clockSlot : batterySlot,
+                spec.showChapterPageCount ? (spec.showBookProgressPercent ? STATUS_SLOT_CHAPTER_AND_BOOK_PROGRESS
+                                                                         : STATUS_SLOT_CHAPTER_PAGES)
+                                         : spec.showBookProgressPercent ? STATUS_SLOT_BOOK_PERCENT : STATUS_SLOT_NONE,
+                clockLeft ? batterySlot : clockSlot};
+  if (statusBarItemsMode == readerStatusBarMode && readerStatusSlotsEnabled) {
+    spec.slotsEnabled = true;
+    spec.topTitleMode = readerStatusTop;
+    spec.slots = {readerStatusLeft, readerStatusCenter, readerStatusRight};
+  } else if (readerStatusBarMode == READER_STATUS_BAR_CLOCK_CHAPTER_PROGRESS) {
+    spec.slotsEnabled = true;
+    spec.topTitleMode = HIDE_TITLE;
+    spec.slots = {STATUS_SLOT_CLOCK, STATUS_SLOT_CHAPTER_PAGES, STATUS_SLOT_NONE};
+  } else if (readerStatusBarMode == READER_STATUS_BAR_BOOK_DETAILS) {
+    spec.slotsEnabled = true;
+    spec.topTitleMode = BOOK_TITLE;
+    spec.slots = {STATUS_SLOT_CLOCK, STATUS_SLOT_CHAPTER_PAGES, STATUS_SLOT_BOOK_ETA};
+  }
+  if (spec.slotsEnabled) {
+    spec.titleMode = spec.topTitleMode;
+    spec.showChapterPageCount = spec.hasSlot(STATUS_SLOT_CHAPTER_PAGES);
+    spec.showBookProgressPercent = spec.hasSlot(STATUS_SLOT_BOOK_PERCENT);
+    spec.showBattery = spec.showBatteryPercent = spec.hasSlot(STATUS_SLOT_BATTERY);
+    spec.clockMode = spec.hasSlot(STATUS_SLOT_CLOCK) ? STATUS_BAR_CLOCK_LEFT : STATUS_BAR_CLOCK_HIDE;
+    spec.progressBarMode = HIDE_PROGRESS;
+    spec.progressBarHeightPx = 0;
+  }
   return spec;
 }
 
@@ -540,8 +659,39 @@ void CrossPointSettings::adoptReaderStatusItems() {
     statusBarTitle = spec.titleMode;
     statusBarChapterPageCount = spec.showChapterPageCount;
     statusBarBookProgressPercentage = spec.showBookProgressPercent;
+    readerStatusSlotsEnabled = spec.slotsEnabled;
+    readerStatusTop = spec.topTitleMode;
+    readerStatusLeft = spec.slots[0];
+    readerStatusCenter = spec.slots[1];
+    readerStatusRight = spec.slots[2];
   }
   statusBarItemsMode = readerStatusBarMode;
+}
+
+uint8_t CrossPointSettings::readerStatusItem(const int row) const {
+  const auto spec = statusBarSpec();
+  return row == 0 ? spec.topTitleMode : row >= 1 && row <= 3 ? spec.slots[row - 1] : STATUS_SLOT_NONE;
+}
+
+bool CrossPointSettings::setReaderStatusItem(const int row, const uint8_t value) {
+  const int count = row == 0 ? static_cast<int>(STATUS_BAR_TITLE_COUNT)
+                            : row == 2 ? static_cast<int>(STATUS_SLOT_COUNT) : static_cast<int>(STATUS_SLOT_CHAPTER_NAME);
+  if (row < 0 || row > 3 || value >= count) return false;
+  if (readerStatusBarHidden()) readerStatusBarMode = READER_STATUS_BAR_BOOK_DETAILS;
+  adoptReaderStatusItems();
+  if (!readerStatusSlotsEnabled) {
+    const auto spec = statusBarSpec();
+    readerStatusTop = spec.topTitleMode;
+    readerStatusLeft = spec.slots[0];
+    readerStatusCenter = spec.slots[1];
+    readerStatusRight = spec.slots[2];
+  }
+  readerStatusSlotsEnabled = 1;
+  if (row == 0) readerStatusTop = value;
+  else if (row == 1) readerStatusLeft = value;
+  else if (row == 2) readerStatusCenter = value;
+  else readerStatusRight = value;
+  return true;
 }
 
 ReaderRenderSpec CrossPointSettings::readerRenderSpec(const uint16_t viewportWidth,
@@ -549,6 +699,11 @@ ReaderRenderSpec CrossPointSettings::readerRenderSpec(const uint16_t viewportWid
   ReaderRenderSpec spec;
   spec.fontId = getReaderFontId();
   spec.lineCompression = getReaderLineCompression();
+  // Level-based spacing (see the field comments in CrossPointSettings.h): not
+  // upstream's percent-scale wordSpacing/characterSpacing, which would need a
+  // different "wordSpacing" JSON meaning. ReaderRenderSpec keeps these fields
+  // (extraParagraphSpacing as a level, letterSpacing in pixels, wordSpacing as
+  // a level) rather than upstream's wordSpacingPercent/characterSpacing.
   spec.extraParagraphSpacing = extraParagraphSpacing;
   spec.paragraphIndent = paragraphIndent;
   spec.letterSpacing = readerSpacing::letterPixels(letterSpacing);
@@ -569,6 +724,15 @@ float CrossPointSettings::getReaderLineCompression() const {
   // 0.90/0.95/1.00; with one five-level table the base is now expressed once and
   // each level adds a fixed step, so a Noto Sans reader keeps the 0.95 default
   // they already had and the other four levels move evenly around it.
+  //
+  // NOTE (cross-cluster, see RESOLUTION.md): upstream retuned the SD/vector-font
+  // WIDE/EXTRA_WIDE steps to 1.3/1.6 (vs the Bookerly-derived 1.1/1.2 baked into
+  // this formula) because those faces carry their own generous line height. That
+  // switch-based tuning was not ported into this unified formula - lineFactorOffset()
+  // in ReaderSpacing.h does not distinguish SD/vector fonts from built-ins. Worth
+  // revisiting there.
+  if (lineSpacing >= readerSpacing::LEVEL_COUNT)
+    return readerSpacing::lineFactor(readerSpacing::clampLineLevel(lineSpacing));
   const float base = (sdFontFamilyName[0] == '\0' && fontFamily == NOTOSANS) ? 0.95f : 1.00f;
   return base + readerSpacing::lineFactorOffset(lineSpacing);
 }

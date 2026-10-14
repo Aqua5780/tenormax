@@ -1,5 +1,7 @@
 """Keep the pinned simulator tilt facade aligned with the vertical gesture and shake HAL."""
 from pathlib import Path
+import subprocess
+import sys
 
 Import("env")
 root = Path(env["PROJECT_LIBDEPS_DIR"]) / env["PIOENV"] / "simulator" / "src"
@@ -70,4 +72,16 @@ patch(root / "HalTiltSensor.h", [(
     "  // The screen in front: no flick ever waits for the hand without a gyro.\n"
     "  void noteScreen(const uint32_t /*screen*/) {}\n",
     1,
+), (
+    "  void noteScreen(const uint32_t /*screen*/) {}\n",
+    "  void noteScreen(const uint32_t /*screen*/) {}\n"
+    "  // Double tap on the back, the screen and a side edge: none without an accelerometer.\n"
+    "  void configureDoubleTap(const uint8_t /*back*/, const uint8_t /*screen*/, const uint8_t /*edge*/) {}\n"
+    "  bool wasScreenTapped() { return false; }\n"
+    "  bool wasEdgeTapped() { return false; }\n",
+    1,
 )])
+
+subprocess.run([sys.executable,
+                str(Path(env['PROJECT_DIR']) / 'test/reading_stats_simulator/ugly_tilt_fixture.py'),
+                '--hal', str(root / 'HalTiltSensor.h')], check=True)

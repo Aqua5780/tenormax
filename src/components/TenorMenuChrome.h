@@ -1,16 +1,199 @@
 #pragma once
+#include <BoardConfig.h>
 #include <HalGPIO.h>
+
+#include <algorithm>
+#include <string>
 
 #include "CrossPointSettings.h"
 #include "UIScale.h"
 class GfxRenderer;
+#include "X3NavigationPath.h"
 namespace tenorchrome {
 constexpr int HEADER_TOP = 5;
 constexpr int HEADER_HEIGHT = 48;
 constexpr int TAB_TOP = HEADER_TOP + HEADER_HEIGHT;
-constexpr int TAB_HEIGHT = 59;
+constexpr int TAB_HEIGHT = 60;
 constexpr int CONTENT_TOP = TAB_TOP + TAB_HEIGHT + 16;
-inline bool enabled() { return SETTINGS.uiTheme == CrossPointSettings::TENOR_UI && !gpio.hasTouch(); }
+// The X4 Pro draws every screen in tenor/cross like the button readers; it has no front buttons, so
+// it shows no button hints or tips that name a button. Fixed at build time: the X3 and X4 builds
+// compile the touch branches out.
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+constexpr bool kTouchShell = true;
+#else
+constexpr bool kTouchShell = false;
+#endif
+inline bool enabled() { return kTouchShell || !gpio.hasTouch(); }
+bool x3ScreenLayoutEnabled();
+// The front button hints of a button reader: shown unless the general status bar is Off or their own switch
+// (Button hints) is off, the reader menu and the screens opened from it included (the page draws none). The touch
+// shell has no switch: a value carried in a settings file changes nothing there.
+bool buttonHintsShown();
+// tenor/cross on a button reader with the hints off: the clock and the battery stand in a strip at the top as on the
+// X4 Pro (the clock at the end the placement setting names), the content starts under the strip and the bar sits
+// 16 px over the foot. A book and every screen opened from it keep them at the foot. The one place that says where
+// they go.
+bool statusOnTop();
+void drawX3ActivityPath(const GfxRenderer& renderer, const char* title);
+void drawX3NavigationPath(const GfxRenderer& renderer, const std::vector<X3PathNode>& nodes, bool file);
+// A tip that names a front button (one of the button symbols U+E100..U+E109) has nothing to point at
+// on the touch shell.
+inline bool tipShown(const char* text) {
+  if (x3ScreenLayoutEnabled() && !SETTINGS.tipsEnabled) return false;
+  if (!kTouchShell || !text) return true;
+  for (const char* c = text; c[0] && c[1] && c[2]; ++c)
+    if (static_cast<unsigned char>(c[0]) == 0xEE && static_cast<unsigned char>(c[1]) == 0x84 &&
+        static_cast<unsigned char>(c[2]) >= 0x80 && static_cast<unsigned char>(c[2]) <= 0x89)
+      return false;
+  return true;
+}
+constexpr int TOUCH_BAR_BOTTOM_GAP = 16;
+// Dynamic bar (touch shell): every screen has one bar at the foot, 60 px tall and 16 px over the bottom
+// edge, the same place and size on every screen; only what it holds changes. Each screen declares
+// what it needs (footBarFor), and one function draws it and records where a tap on it goes:
+//   Tabs: the zone's root, its cards drawn by the tab list itself (Home).
+//   Full: a screen below another: "<" (one level back), the zone's round icon (to the zone's root)
+//         and the screen's name, read only.
+//   BackOnly: "<" alone, the screen's own content takes the rest of the foot (a keyboard, the reader
+//             menu's cards).
+// The rows above stop 8 px over it.
+enum class FootBar : uint8_t { None, Tabs, Full, BackOnly };
+// Where a screen belongs: the Home card it was reached from, or the book open under it.
+enum class Zone : uint8_t { Recent, File, Favorites, Stats, Settings, Book };
+FootBar footBarFor(const char* activityName);
+inline bool wantsFootBack(const char* activityName) {
+  const FootBar bar = footBarFor(activityName);
+  return bar == FootBar::Full || bar == FootBar::BackOnly;
+}
+constexpr int FOOT_BACK_SIZE = 60;
+constexpr int FOOT_BACK_X = 16;
+constexpr int FOOT_PILL_GAP = 8;
+struct TouchBarRect { int x, y, width, height; };
+inline TouchBarRect touchTabBarRect(const int screenWidth, const int screenHeight) {
+  return {FOOT_BACK_X, screenHeight - TOUCH_BAR_BOTTOM_GAP - FOOT_BACK_SIZE,
+          screenWidth - 2 * FOOT_BACK_X, FOOT_BACK_SIZE};
+}
+inline int footBackTop(const int screenHeight) { return touchTabBarRect(2 * FOOT_BACK_X, screenHeight).y; }
+// The air between the foot of a frame (a list's, the reader menu's sheet) and the dynamic bar under it.
+constexpr int FRAME_TO_BAR_GAP = 8;
+inline int footBackReserve() { return TOUCH_BAR_BOTTOM_GAP + FOOT_BACK_SIZE + FRAME_TO_BAR_GAP; }
+// The bottom margin of a screen that lays itself out: the dynamic bar's band on touch, the hints elsewhere.
+inline int footReserve(const int buttonHintsHeight) { return kTouchShell ? footBackReserve() : buttonHintsHeight; }
+// The title a screen's header names, kept for the bar's name pill (the touch shell draws no title row).
+void noteScreenTitle(const char* title);
+const char* screenTitle();
+// A screen drawn on tenor/ugly paper with a foot of its own (a question sheet, the shell switch) says so as it
+// draws: its bar is the "<" alone, in pen.
+void noteHandDrawn();
+// A short note for the middle of the status strip (the items of a folder), for the screen that set it.
+void noteStatus(const char* text);
+// True when the "B" of a remote linking should blink now: the caller repaints the screen (one refresh).
+bool bluetoothBlinkDue();
+void drawFootBar(const GfxRenderer& renderer, FootBar bar, Zone zone);
+// A screen's own actions in its bar (rule 4: the bar holds what the screen needs), at the bar's right end, each a
+// pill that hugs its words (rule 16), the name pill keeping the room left of them. The screen names them as it
+// draws, every frame, as it names its title; a tap on one is read back with footActionAt.
+constexpr int FOOT_ACTIONS = 2;
+void noteFootActions(const char* first, const char* second = nullptr);
+// The action pill under a tap at (x, y), 0 for the first, or -1.
+int footActionAt(int x, int y);
+// Where the last bar drew action `index` (a pop-up opened from it hangs from it); width 0 when it drew none.
+TouchBarRect footActionRect(int index);
+// A screen laid over a book's page clears the band of the bar first, so "<" stands on white, not on the
+// page's last line.
+// `air` px of the page above the bar are cleared with it: 12 for a screen laid over the page, FRAME_TO_BAR_GAP for the reader
+// menu, whose frames end that far over the bar.
+void clearFootBand(const GfxRenderer& renderer, int air = 12);
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+// Reader view data for the existing pre-display hook. The reader owns its depth and drafts.
+void noteReaderFootBar(bool open, bool keypad, int activeTool);
+struct ReaderToolRect { int x, y, width, height; };
+// The white band the status strip takes over a page with the reader menu open: down to the first blank row
+// under the strip, so a line of the page is covered whole or not at all.
+int readerStripBottom(const GfxRenderer& renderer);
+// The reader menu's tools, in readermenu::Tool's order (founder 07/10: Favorites, Contents, Text, More).
+constexpr int READER_TOOLS = 4;
+// The tools' ring, right of "<" to the bar's end.
+constexpr int READER_BAR_LEFT = FOOT_BACK_X + FOOT_BACK_SIZE + FOOT_PILL_GAP;
+// The tools stand this far in from the ring's round ends, so the chosen ring of the first or last tool keeps as
+// much air from it at the end as at the top (founder 07/10: the ring crowded the chosen heart).
+constexpr int READER_TOOL_END_AIR = 6;
+inline ReaderToolRect readerToolRect(const int width, const int height, const int tool) {
+  const auto bar = touchTabBarRect(width, height);
+  const int left = READER_BAR_LEFT + READER_TOOL_END_AIR;
+  const int room = width - FOOT_BACK_X - READER_TOOL_END_AIR - left;
+  const int x = left + room * tool / READER_TOOLS;
+  return {x, bar.y, left + room * (tool + 1) / READER_TOOLS - x, bar.height};
+}
+// The tool's tap cell: the equal cell above, but on tenor/ugly, which writes each name at its own width, a cell that holds
+// its name (the 4 cells share the same room).
+ReaderToolRect readerToolHit(const GfxRenderer& renderer, int tool);
+#endif
+// An icon in an icon bar (Mask1, bit 0 = ink), with grey already baked into the regular bitmap.
+// Every icon bar draws its icons with this, preserving every ink pixel on every screen.
+void drawBarIcon(const GfxRenderer& renderer, const uint8_t* bits, int w, int h, int x, int y, bool chosen);
+// One tab of an icon bar whose band is h tall from y, centred on cx: the chosen one in a ring BAR_TAB_W wide,
+// BAR_TAB_INSET in from the band's top and bottom (the Home bar's), its icon centred in the band.
+// A pinned row's mark: the Favourites tab's heart, solid, FAVORITE_MARK px square, from x, beside the row's line
+// of `fontId` text drawn at `lineTop`: centred on its capitals (inlineSymbols::markTopOnCapitals).
+// The touch rows' heart is a size up, its ink about as tall as the rows' small letters (founder 07/10).
+constexpr int FAVORITE_MARK = kTouchShell ? 18 : 14;
+void drawFavoriteMark(const GfxRenderer& renderer, int x, int fontId, int lineTop);
+constexpr int BAR_TAB_W = 84;
+constexpr int BAR_TAB_INSET = 6;
+// The centre of icon tab `i` of `count` in a bar ring of ringW px from ringX, the first and last tab `endInset` px
+// in from the ring's ends and the rest spread evenly between them. The one place that says it: the tab lists
+// (Home, Settings, the reader menu's lists) and the reader's own bar all ask here.
+constexpr int barTabCentre(const int ringX, const int ringW, const int count, const int i, const int endInset) {
+  const int first = ringX + endInset + BAR_TAB_W / 2;
+  const int last = ringX + ringW - 1 - endInset - BAR_TAB_W / 2;
+  return count > 1 ? first + (2 * (last - first) * i + (count - 1)) / (2 * (count - 1)) : ringX + ringW / 2;
+}
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+// The centre of the reader menu's tool `tool` on the X4 Pro: where a tab list puts the same tab of 4 in the same
+// ring (touch icon tabs stand 8 px in from the ring's ends).
+inline int readerToolCentre(const int width, const int tool) {
+  return barTabCentre(READER_BAR_LEFT, width - FOOT_BACK_X - READER_BAR_LEFT, READER_TOOLS, tool, 8);
+}
+#endif
+// The ring round a dynamic bar of cards (grey dots 2 px, round-ended): the one function every board's card bar draws it
+// with, the Home cards and the reader's tool bar. A bar of a screen's path (the back, the zone icon, the name pill) has
+// no ring on any board. The board gives the rect; the cards stand BAR_END_INSET in from the ring's ends and
+// BAR_TAB_INSET from its top and bottom.
+constexpr int BAR_END_INSET = 8;
+void drawBarFrame(const GfxRenderer& g, int x, int y, int w, int h);
+// A button board's bar stands this far in from the screen's sides, as the touch board's does.
+constexpr int X3_BAR_MARGIN = FOOT_BACK_X;
+void drawBarTab(const GfxRenderer& renderer, int cx, int y, int h, const uint8_t* bits, int w, int iconH, bool chosen);
+// A ring of `thick` px just inside a round-ended bar; grey = every other pixel.
+void drawPillRing(const GfxRenderer& g, int x, int y, int w, int h, int thick, bool grey);
+void drawPillLabel(const GfxRenderer& renderer, int font, const char* text, int x, int y, int width, int height);
+struct PathPillLayout {
+  std::string text;
+  int width;
+};
+PathPillLayout layoutPathPill(const GfxRenderer& renderer, int font, const char* title, int maxWidth,
+                              int paddingLeft, int paddingRight);
+void drawPathPill(const GfxRenderer& renderer, int font, const char* title, int x, int y, int maxWidth, int height,
+                  int paddingLeft, int paddingRight, bool grey);
+// The same ring inside a box with corners of radius r (a row menu, a group of list rows).
+void drawRoundRing(const GfxRenderer& g, int x, int y, int w, int h, int r, int thick, bool grey);
+// Whether a group of rows or a panel of content sits in a round frame. The round frame belongs to the touch
+// reader (founder 06/10/2026): the button readers keep their lists and panels unframed. Every frame asks this.
+// The File screens' rows keep their rules but no ring, on touch too (founder 07/10): `fileList` says so.
+constexpr bool roundFrames(const bool fileList = false) { return kTouchShell && !fileList; }
+// Touch shell: the one frame around a group of content across the screen, FOOT_BACK_X in from both sides,
+// grey dots 2 px, radius PANEL_RADIUS. Text inside starts 16 px in from it.
+constexpr int PANEL_RADIUS = 20;
+// Where a frame stands across the screen: on the edges of the dynamic bar's ring under it, X3_BAR_MARGIN in from the
+// X3 bar's ends, FOOT_BACK_X in from both sides on touch (the X4 Pro bar's ends). One function for every frame and sheet.
+struct FrameSpan { int x, width; };
+FrameSpan frameSpan(const GfxRenderer& g);
+void drawPanel(const GfxRenderer& g, int y, int h);
+// Touch page scrollbars use PageScrollbar: outside the frame, x 469-474 on the X4 Pro, 5 px clear of the ring.
+constexpr int FRAME_BAR_WIDTH = 6;
+// The grey dotted rule between 2 rows of a frame (every other pixel), from x0 up to x1.
+void drawRowRule(const GfxRenderer& g, int y, int x0, int x1);
 constexpr int STATUS_HEIGHT = 32;
 constexpr int STATUS_TEXT_LANE = 24;
 constexpr int STATUS_ICON_TOP_OFFSET = 5;
@@ -24,13 +207,27 @@ constexpr int STATUS_INK_TOP = STATUS_TEXT_LANE - 2;
 // thuc te dao dong 1-9 px tuy muc gian dong, va co trang thieu 1 px la mat ca dong.
 constexpr int READER_TEXT_TO_STATUS_GAP = 2;
 constexpr int READER_BOTTOM_RESERVE = STATUS_INK_TOP + READER_TEXT_TO_STATUS_GAP;
-inline int headerHeight() { return HEADER_HEIGHT + uiTextSizeSpec(SETTINGS.uiTextSize).bodyLineHeight - 33; }
-inline int tabTop() { return HEADER_TOP + headerHeight(); }
-inline int tabHeight() { return TAB_HEIGHT + uiTextSizeSpec(SETTINGS.uiTextSize).subtitleLineHeight - 26; }
-inline int contentTop() { return tabTop() + tabHeight() + 16; }
+// Touch: the header row is the status strip alone (clock, a note, radio icons, battery); the title went
+// to the bar at the foot and the tab band is there too.
+constexpr int TOUCH_STATUS_TOP_INSET = 8;
+constexpr int TOUCH_STRIP_HEIGHT = 24 + TOUCH_STATUS_TOP_INSET;
+inline int headerHeight() {
+  return kTouchShell ? TOUCH_STRIP_HEIGHT - TOUCH_STATUS_TOP_INSET - HEADER_TOP
+                     : HEADER_HEIGHT + uiLayoutGrowth(SETTINGS.uiTextSize).body;
+}
+inline int tabTop() { return HEADER_TOP + headerHeight() + (kTouchShell ? TOUCH_STATUS_TOP_INSET : 0); }
+inline int tabHeight() { return kTouchShell ? TAB_HEIGHT : TAB_HEIGHT + uiLayoutGrowth(SETTINGS.uiTextSize).subtitle; }
+// Touch screens with an information line (network name, address, MAC) at the top of the content: its gap under the
+// status strip, one number for the file transfer, Calibre and Wi-Fi screens.
+constexpr int INFO_TOP_GAP = 10;
+inline int contentTop() { return kTouchShell ? TOUCH_STRIP_HEIGHT + 6 : tabTop() + tabHeight() + 16; }
+// Touch shell: the tab bar sits at the foot of the screen, 16 px above the Home key under the glass,
+// and what the button readers put under their tab band moves up by the band.
+inline int touchBarTop(const int screenHeight) { return touchTabBarRect(2 * FOOT_BACK_X, screenHeight).y; }
+inline int contentTopUnderTabs() { return contentTop(); }
 inline int statusTextGrowth(bool large = false) {
-  const auto text = uiTextSizeSpec(SETTINGS.uiTextSize);
-  return large ? text.bodyLineHeight - 33 : text.captionLineHeight - 21;
+  const auto growth = uiLayoutGrowth(SETTINGS.uiTextSize);
+  return large ? growth.body : growth.caption;
 }
 inline int statusHeight(bool large = false) {
   return (large ? STATUS_HEIGHT_LARGE : STATUS_HEIGHT) + statusTextGrowth(large);
@@ -49,8 +246,18 @@ struct StatusCornerBounds {
   int rightStart;
 };
 StatusCornerBounds statusCornerBounds(const GfxRenderer& renderer, bool large);
+struct BatteryInkBounds {
+  int top;
+  int height;
+};
+BatteryInkBounds batteryInkBounds(const GfxRenderer& renderer, int font, int textY);
 void drawStatus(const GfxRenderer& renderer, const char* title = nullptr, int currentPage = 0, int pageCount = 0,
-                float bookProgress = 0, int paddingBottom = 0, bool estimated = false, bool bookmarked = false);
+                float bookProgress = 0, int paddingBottom = 0, bool estimated = false, bool bookmarked = false,
+                bool titleIsName = true);
+void drawReaderSlots(const GfxRenderer& renderer, const char* title, int currentPage, int pageCount,
+                     float bookProgress, bool estimated, bool bookmarked,
+                     int64_t chapterSeconds = -1, int64_t bookSeconds = -1, const char* chapterName = nullptr,
+                     bool titleIsName = true);
 // Small symbols can start one pixel above the battery box (the Select check).
 int smallFooterSymbolsTopY(const GfxRenderer& renderer);
 bool compactFooterTips(bool hasTextHints = false);
@@ -67,16 +274,41 @@ enum class ChevronDir : uint8_t { Down, Left, Right };
 constexpr int MORE_CHEVRON_STROKE = 3;
 constexpr int moreChevronLength(const int span) { return (span * 8 + 5) / 11 + MORE_CHEVRON_STROKE; }
 void drawMoreChevron(const GfxRenderer& renderer, int x, int y, ChevronDir dir, int span);
+// Touch: the grey ">" at the end of a list row that opens a deeper screen, its box (x, y) as above.
+constexpr int ROW_CHEVRON_SPAN = 7;
+void drawRowChevron(const GfxRenderer& renderer, int x, int y);
+// The pop-up mark's width in columns (2 * its span + 1); it starts at x and ends at x + POPUP_MARK_WIDTH - 1.
+constexpr int POPUP_MARK_WIDTH = 13;
+void drawSettingsPopupMark(const GfxRenderer& renderer, int x, int centerY);
 
 // Mui ten chu V o giua, ngay tren dong mach nuoc chan man: bao rang danh sach
 // con dong ben duoi. Thay cho cau "1-10 / 13" o goc tren, vi it ai nhin thanh
 // cuon va con so do lay mat cho cua ten the ben canh.
 int moreBelowChevronTopY(const GfxRenderer& renderer, int hintTopY = -1);
 void drawMoreBelowChevron(const GfxRenderer& renderer, int hintTopY = -1);
+// A list goes on past an edge: the ink of the band [y0, y0 + h) x [x0, x1) thins from all of it at its inner edge
+// to none at its outer edge (Bayer 8x8, black and white only, so no grey pass). x1 < 0 = the screen's width.
+void fadeBand(const GfxRenderer& renderer, int y0, int h, bool outerTop, int x0 = 0, int x1 = -1);
 int tipLineCount(const GfxRenderer& renderer, const char* text, int maxLines = 4);
 int tipHeight(const GfxRenderer& renderer, const char* text, int maxLines = 4);
+struct X3ScreenRect {
+  int x, y, width, height;
+  int bottom() const { return y + height; }
+};
+struct X3ScreenLayout {
+  X3ScreenRect bodyRect, tipRect, barRect, buttonBandRect;
+};
+// `informationHeight` is a line of information (a progress line) that stands in the tip's place, over the bar, whether tips are
+// on or not; the tips stand under it.
+X3ScreenLayout x3ScreenLayout(const GfxRenderer& renderer, int requestedTipHeight = 0, int informationHeight = 0);
+void drawTipInRect(const GfxRenderer& renderer, const char* text, X3ScreenRect rect, int maxLines = 4);
+void drawInfoInRect(const GfxRenderer& renderer, const char* text, X3ScreenRect rect, int maxLines = 4);
 void drawTip(const GfxRenderer& renderer, const char* text, int linesAbove = 0, int maxLines = 4,
              bool hasTextHints = false);
-void drawHeader(const GfxRenderer& renderer, const char* title, const char* prefix = "");
+// tenor/ugly: where the ink of a tip block of `lines` lines starts, the block standing `linesAbove` lines above the
+// place drawTip gives a tip. drawTip, and a screen that keeps something clear of the tips or over them, ask this.
+int uglyTipTop(const GfxRenderer& renderer, int lines, int linesAbove = 0);
+// `note` (a count such as "5 networks") is written at the right end in tenor/ugly; tenor/cross has no room for it.
+void drawHeader(const GfxRenderer& renderer, const char* title, const char* prefix = "", const char* note = nullptr);
 void drawSiblingDestinations(const GfxRenderer& renderer, const char* previous, const char* next);
 }  // namespace tenorchrome

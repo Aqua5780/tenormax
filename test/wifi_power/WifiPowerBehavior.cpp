@@ -10,6 +10,10 @@
 
 #include <iostream>
 
+// A lookup that changes the zone applies it to the clock (util/Timezones.cpp sets the POSIX
+// TZ); the clock itself is outside this harness, which counts the lookups.
+void timezones::applyToClock() {}
+
 // Compile the chooser's production button dispatch, keeping only its unrelated
 // list model and ActivityManager transition boundary fake.
 struct UiListActivity {
@@ -58,11 +62,50 @@ struct Fixture {
   MappedInputManager input;
   WifiSelectionActivity activity;
 
-  explicit Fixture(bool autoConnect = false, bool syncClock = true)
-      : activity(renderer, input, autoConnect, syncClock, false) {
+  explicit Fixture(bool autoConnect = false, bool syncClock = true, bool updateBoot = false)
+      : activity(renderer, input, autoConnect, syncClock, false, updateBoot) {
     activity.runtimeStarted = true;
   }
 };
+
+void updateBootKeepsSavedAttempt() {
+  resetPlatform();
+  Fixture f(true, false, true);
+  WIFI_STORE.addCredential("last-network", "saved-password");
+  WIFI_STORE.setLastConnectedSsid("last-network");
+  f.activity.onEnter();
+  expect(f.activity.state == WifiSelectionState::AUTO_CONNECTING &&
+         f.activity.selectedSSID == "last-network" && f.activity.enteredPassword == "saved-password",
+         "update boot uses the last saved SSID and password");
+  f.input.pressed = MappedInputManager::Button::Confirm;
+  f.activity.loop();
+  expect(f.activity.state == WifiSelectionState::AUTO_CONNECTING && !f.activity.manualNetworkListRequested,
+         "update boot keeps a Confirm edge from reopening the list");
+  f.input.pressed.reset();
+  WiFi.connectionStatus = WL_CONNECTED;
+  f.activity.loop();
+  expect(f.activity.wifiConnectionHandedOff && !f.activity.finalResult.isCancelled,
+         "saved connection returns to OTA without a second choice");
+  expect(timezone_lookup::calls == 0, "OTA keeps clock lookup disabled");
+}
+
+void updateBootFailedSavedNetworkShowsList() {
+  for (int failure = 0; failure < 3; ++failure) {
+    resetPlatform();
+    Fixture f(true, false, true);
+    WIFI_STORE.addCredential("last-network", "bad-password");
+    WIFI_STORE.setLastConnectedSsid("last-network");
+    f.activity.onEnter();
+    if (failure == 2) testMillis += WifiSelectionActivity::AUTO_CONNECTION_TIMEOUT_MS + 1;
+    else WiFi.connectionStatus = failure == 0 ? WL_CONNECT_FAILED : WL_NO_SSID_AVAIL;
+    f.activity.loop();
+    WiFi.found = {{"last-network", -40, 1}};
+    WiFi.scanState = 1;
+    f.activity.loop();
+    expect(f.activity.state == WifiSelectionState::NETWORK_LIST && !f.activity.wifiConnectionHandedOff,
+           "failed, absent or timed out saved network opens the chooser");
+  }
+}
 
 void scanDeadlineStopsRadio() {
   resetPlatform();
@@ -88,6 +131,23 @@ void joinDeadlineStopsRadio() {
   f.activity.loop();
   expect(f.activity.state == WifiSelectionState::CONNECTION_FAILED, "join deadline enters failure");
   expect(WiFi.currentMode == WIFI_MODE_NULL && powerManager.saving, "join deadline stops radio");
+}
+
+void joiningKeepsStationReadyForBegin() {
+  resetPlatform();
+  Fixture f;
+  f.activity.selectedSSID = "test-network";
+  f.activity.selectedRequiresPassword = true;
+  f.activity.enteredPassword = "test-password";
+  f.activity.usedSavedPassword = true;
+  WiFi.connectWhenStationReady = true;
+  f.activity.attemptConnection();
+  expect(WiFi.beginCalls == 1, "join starts an explicit WiFi connection");
+  expect(WiFi.currentMode == WIFI_STA && !WiFi.lastErase,
+         "join keeps station running and preserves AP config through begin");
+  f.activity.loop();
+  expect(f.activity.wifiConnectionHandedOff && !f.activity.finalResult.isCancelled,
+         "station join reaches successful parent handoff");
 }
 
 void manualBackReturnsToFocusedList() {
@@ -297,8 +357,11 @@ void touchBackStillCompletesImmediately() {
 }  // namespace
 
 int main() {
+  updateBootKeepsSavedAttempt();
+  updateBootFailedSavedNetworkShowsList();
   scanDeadlineStopsRadio();
   joinDeadlineStopsRadio();
+  joiningKeepsStationReadyForBegin();
   manualBackReturnsToFocusedList();
   completedScanLeavesListRadioOff();
   savePromptTimeoutCancelsWithoutHandoff();

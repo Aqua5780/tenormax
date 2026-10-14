@@ -1,90 +1,71 @@
 #include "BlePageTurnerActivity.h"
 
+#include "activities/X3ActivityLayout.h"
+
+#include <BlePageTurner.h>
 #include <BoardConfig.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <Logging.h>
 
-#if defined(FREEINK_CAP_BLE_HID_HOST) && FREEINK_CAP_BLE_HID_HOST
-#include <BleKeyboardHost.h>
-#endif
-
 #include <cstring>
 #include <string>
 
 #include "CrossPointSettings.h"
-#include "BlePageTurnerRuntime.h"
 #include "MappedInputManager.h"
+#include "MenuTiltInput.h"
 #include "activities/reader/ReaderUtils.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "components/UiAppHelpers.h"
+#include "components/TenorMenuChrome.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyInk.h"
 
 // One hold rule, one number: a remote hold and a front-button hold skip chapters alike.
-static_assert(blebinding::kHoldMs == ReaderUtils::SKIP_HOLD_MS, "remote hold threshold drifted from the button one");
+static_assert(bleturner::kHoldMs == ReaderUtils::SKIP_HOLD_MS, "remote hold threshold drifted from the button one");
 
-// Cau noi DUY NHAT giua man cai dat va host BLE cua SDK. Cờ FREEINK_CAP_BLE_HID_HOST
-// chi doi THAN ham o day; khong #if nao bao quanh man hinh. Khi ban dung khong co
-// BLE, moi ham tra ve "khong co thiet bi" va man hinh hien "khong kha dung" thay vi
-// treo. Muon cam that: them `BleKeyboardHost=symlink://freeink-sdk/libs/network/
-// BleKeyboardHost` vao lib_deps va -DFREEINK_CAP_BLE_HID_HOST=1 (platformio.ini).
+// Cau noi DUY NHAT giua man cai dat va radio: moi viec di qua lib/BlePageTurner, man
+// hinh khong goi SDK. Ban dung khong co BLE thi module tra "khong co thiet bi" va man
+// hinh hien "khong kha dung" thay vi treo.
 namespace {
-
-// Cap BLE HID host cua ban dung. Doc bang #if defined() chu khong tin mot
-// include: tren simulator, <BoardConfig.h> do goi simulator cung cap va KHONG
-// mang macro cua SDK, nen "khong dinh nghia" phai hieu la "cap dang tat" -
-// dung quy uoc ma chinh BoardConfig.h cua SDK dat ra (mac dinh 0).
-#if defined(FREEINK_CAP_BLE_HID_HOST) && FREEINK_CAP_BLE_HID_HOST
-#define BLE_UI_CAP_HID_HOST 1
-#else
-#define BLE_UI_CAP_HID_HOST 0
-#endif
 
 namespace backend {
 
-// Ban dung co BLE HID host hay khong. Hang so luc dich, khong cap phat, de man
-// hinh biet ngay no phai noi "khong kha dung" ma khong phai thu init radio.
-constexpr bool compiledIn() { return BLE_UI_CAP_HID_HOST != 0; }
+bool compiledIn() { return bleturner::status().compiledIn; }
+bool begin() { return bleturner::switchOn(); }
+bool switchOff() { return bleturner::switchOff(); }
+bool stopping() { return bleturner::status().stopping; }
+bool running() { return bleturner::status().running; }
+bool idleStopped() { return bleturner::status().idleStopped; }
+// True when a remote being paired linked and became the chosen one: the settings are saved.
+bool poll() { return bleturner::service(); }
+bool scanning() { return bleturner::status().scanning; }
+void startScan() { bleturner::scan(15000); }
+void stopScan() { bleturner::scan(0); }
+uint8_t bondCount() { return bleturner::bondCount(); }
+const char* bondAddr(const uint8_t i) { return bleturner::bond(i).addr; }
+const char* bondName(const uint8_t i) { return bleturner::bond(i).name; }
+uint8_t deviceCount() { return bleturner::foundCount(); }
+const char* deviceAddr(const uint8_t i) { return bleturner::found(i).addr; }
+const char* deviceName(const uint8_t i) { return bleturner::found(i).name; }
+bool connected() { return bleturner::status().connected; }
+bool connecting() { return bleturner::status().connecting; }
+const char* connectedName() { return bleturner::linked().name; }
+const char* connectedAddr() { return bleturner::linked().addr; }
+bool pair(const char* addr, const char* name) { return bleturner::pair(addr, name); }
+void disconnect() { bleturner::disconnect(); }
+// Quen ca bond, bang nut cua no va lua chon da luu neu trung: true = cai dat da doi.
+bool forget(const char* addr) { return bleturner::forget(addr); }
+bool takeFailure(char* out, const size_t outLen) { return bleturner::takeConnectFailure(out, outLen); }
 
-#if BLE_UI_CAP_HID_HOST
-
-bool begin(GfxRenderer& renderer) { return freeink::ble::begin(renderer); }
-bool end() { return freeink::ble::suspendForTransition(1000); }
-bool stopping() { return BleHid.isStopping(); }
-bool running() { return BleHid.isRunning(); }
-bool idleStopped() { return freeink::ble::idleStopped(); }
-void poll() { BleHid.poll(); }
-bool scanning() { return BleHid.isScanning(); }
-void startScan() { BleHid.startScan(15000); }
-void stopScan() { BleHid.stopScan(); }
-uint8_t bondCount() { return BleHid.pairedCount(); }
-const char* bondAddr(const uint8_t i) { return BleHid.paired(i).addr; }
-const char* bondName(const uint8_t i) { return BleHid.paired(i).name; }
-uint8_t deviceCount() { return BleHid.deviceCount(); }
-const char* deviceAddr(const uint8_t i) { return BleHid.device(i).addr; }
-const char* deviceName(const uint8_t i) { return BleHid.device(i).name; }
-bool connected() { return BleHid.isConnected(); }
-bool connecting() { return BleHid.isConnecting(); }
-const char* connectedName() { return BleHid.connectedName(); }
-const char* connectedAddr() { return BleHid.connectedAddr(); }
-bool connect(const char* addr) { return BleHid.connect(addr); }
-void disconnect() { BleHid.disconnect(); }
-void forget(const char* addr) { BleHid.forget(addr); }
-bool takeFailure(char* out, const size_t outLen) { return BleHid.takeConnectFailure(out, outLen); }
-
-// Nobody reads key events on this screen, but they must be drained: left queued,
-// the reader would turn pages for old presses when the user goes back.
-void drainKeys() {
-  freeink::KeyEvent ev;
-  while (BleHid.popKey(ev)) {
-  }
-}
-
-// One queued raw edge: button code (see blebinding), press or release, when, and on a
-// release whether the press was the remote's rest frame (RawButtonEvent::wasRest).
+// One queued raw edge: button code (see BleKeyBinding.h), press or release, when, and on a
+// release whether the press was the remote's rest frame. Key events are drained on the way:
+// left queued, the reader would turn pages for old presses when the user goes back.
 bool takeRaw(uint32_t& code, bool& pressed, uint32_t& atMs, bool& wasRest) {
-  freeink::RawButtonEvent ev;
-  if (!BleHid.popRawButton(ev)) return false;
-  code = ev.code();
+  bleturner::Event ev;
+  if (!bleturner::pollEvent(ev)) return false;
+  code = ev.code;
   pressed = ev.pressed;
   atMs = ev.atMs;
   wasRest = ev.wasRest;
@@ -92,38 +73,7 @@ bool takeRaw(uint32_t& code, bool& pressed, uint32_t& atMs, bool& wasRest) {
 }
 
 // Trinh doc da thu bat radio va bi hoan vi RAM: hang Trang thai phai noi that.
-bool readerDeferred() { return freeink::ble::readerStartDeferred(); }
-
-#else
-
-bool begin(GfxRenderer&) { return false; }
-bool end() { return true; }
-bool stopping() { return false; }
-bool running() { return false; }
-bool idleStopped() { return false; }
-void poll() {}
-bool scanning() { return false; }
-void startScan() {}
-void stopScan() {}
-uint8_t bondCount() { return 0; }
-const char* bondAddr(const uint8_t) { return ""; }
-const char* bondName(const uint8_t) { return ""; }
-uint8_t deviceCount() { return 0; }
-const char* deviceAddr(const uint8_t) { return ""; }
-const char* deviceName(const uint8_t) { return ""; }
-bool connected() { return false; }
-bool connecting() { return false; }
-const char* connectedName() { return ""; }
-const char* connectedAddr() { return ""; }
-bool connect(const char*) { return false; }
-void disconnect() {}
-void forget(const char*) {}
-bool takeFailure(char*, const size_t) { return false; }
-void drainKeys() {}
-bool takeRaw(uint32_t&, bool&, uint32_t&, bool&) { return false; }
-bool readerDeferred() { return false; }
-
-#endif
+bool readerDeferred() { return bleturner::status().readerDeferred; }
 
 }  // namespace backend
 
@@ -144,11 +94,11 @@ void BlePageTurnerActivity::onEnter() {
   rowsDirty = true;
   // Khoi dong opt-in da luu khi vao cai dat. Neu radio tu tat vi nhan roi,
   // giu ly do do den khi nguoi dung chu dong bat, quet hoac ket noi lai.
-  if (SETTINGS.blePageTurnerEnabled && backend::compiledIn() && !backend::running() && !backend::stopping() &&
+  if (SETTINGS.ble.enabled && backend::compiledIn() && !backend::running() && !backend::stopping() &&
       !backend::idleStopped()) {
-    if (!backend::begin(renderer)) {
+    if (!backend::begin()) {
       LOG_ERR("BLE", "Saved opt-in could not start the radio on the settings screen; switching it off");
-      SETTINGS.blePageTurnerEnabled = 0;
+      SETTINGS.ble.enabled = 0;
       SETTINGS.saveToFile();
     }
   }
@@ -158,14 +108,24 @@ void BlePageTurnerActivity::onEnter() {
 }
 
 void BlePageTurnerActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() && !x3Popup.isActive() && x3Info.turn(
+      mappedInput.wasReleased(MappedInputManager::Button::Left) ? -1 :
+      mappedInput.wasReleased(MappedInputManager::Button::Right) ? 1 : 0)) {
+    requestUpdate();
+    readPendingKeys();
+    return;
+  }
+  if (tenorchrome::x3ScreenLayoutEnabled() && !x3Popup.isActive() &&
+      (mappedInput.wasReleased(MappedInputManager::Button::Up) || mappedInput.wasReleased(MappedInputManager::Button::Down)))
+    x3Info.page = 0;
   UiListActivity::loop();
 
   // Phim cua page turner khong thuoc ve man nay: rut het hang doi. Trong luot gan
   // nut thi chinh phim do la thu can doc, ngoai luot do thi chi de hien ma vua nhan.
   readPendingKeys();
-  if (bindWaitActive_ && learnCode_ == 0 && millis() - bindWaitStartedMs_ >= blebinding::kWaitMs) {
+  if (bindWaitActive_ && learnCode_ == 0 && millis() - bindWaitStartedMs_ >= bleturner::kWaitMs) {
     bindWaitActive_ = false;
-    bindNotice_ = tr(STR_BLE_BIND_NONE);
+    bindNotice_ = I18N.get(shell::uglyParts() ? StrId::STR_UGLY_BLE_NONE : StrId::STR_BLE_BIND_NONE);
     LOG_INF("BLE", "Bind wait ended with no key");
     rowsDirty = true;
     requestUpdate();
@@ -174,14 +134,14 @@ void BlePageTurnerActivity::loop() {
   // Duong giu nut cua may nut bam. Do duoc tren gia lap X3: day la duong chay,
   // con onRowLongPress() khong he duoc goi o may khong cam ung. Lop nen chi doc
   // nhip giu khi man co bat tinh nang ghim, ma man nay khong bat.
-  if (!optionPopup.isActive() && mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, 700)) {
+  if (!optionPopup.isActive() && !x3Popup.isActive() && mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, 700)) {
     clearBindForRow(nav.selected);
   }
 
   const uint32_t now = millis();
   if (now - lastPollMs < 250) return;  // nhip 4 lan/giay: du muot cho e-ink, khong quay CPU
   lastPollMs = now;
-  if (SETTINGS.blePageTurnerEnabled && backend::running()) backend::poll();
+  if (SETTINGS.ble.enabled && backend::running() && backend::poll()) SETTINGS.saveToFile();
 
   if (trangThaiSig() == lastStateSig) return;  // khong co gi doi thi khong ve lai: e-ink tra gia cho moi khung
   // capNhatTrangThai() chot luon lastStateSig, nen mot nhip bam tay da cap nhat
@@ -194,7 +154,7 @@ void BlePageTurnerActivity::loop() {
 uint32_t BlePageTurnerActivity::trangThaiSig() const {
   return (backend::scanning() ? 1u : 0u) | (backend::connected() ? 2u : 0u) |
          (backend::connecting() ? 4u : 0u) | (backend::stopping() ? 8u : 0u) |
-         (backend::running() ? 16u : 0u) | (SETTINGS.blePageTurnerEnabled ? 32u : 0u) |
+         (backend::running() ? 16u : 0u) | (SETTINGS.ble.enabled ? 32u : 0u) |
          (backend::idleStopped() ? 64u : 0u) | (backend::readerDeferred() ? 128u : 0u) |
          (static_cast<uint32_t>(backend::bondCount()) << 8) |
          (static_cast<uint32_t>(backend::deviceCount()) << 16);
@@ -203,11 +163,14 @@ uint32_t BlePageTurnerActivity::trangThaiSig() const {
 void BlePageTurnerActivity::capNhatTrangThai() {
   char failure[48];
   const bool hasFailure = backend::takeFailure(failure, sizeof(failure));
+  const bool ugly = shell::uglyParts();
+  statusInTip_ = false;
   if (backend::stopping()) {
     statusText_ = tr(STR_BLE_STOPPING);
   } else if (!backend::compiledIn()) {
-    statusText_ = tr(STR_BLE_UNAVAILABLE);
-  } else if (!SETTINGS.blePageTurnerEnabled) {
+    statusText_ = I18N.get(ugly ? StrId::STR_UGLY_BLE_UNAVAILABLE : StrId::STR_BLE_UNAVAILABLE);
+    statusInTip_ = ugly;
+  } else if (!SETTINGS.ble.enabled) {
     statusText_ = tr(STR_STATE_OFF);
   } else if (backend::idleStopped()) {
     statusText_ = tr(STR_BLE_IDLE_STOPPED);
@@ -216,7 +179,8 @@ void BlePageTurnerActivity::capNhatTrangThai() {
   } else if (backend::readerDeferred()) {
     // Radio co the dang chay o man nay nhung lan thu bat trong trinh doc da bi
     // hoan vi RAM - noi that thay vi hien "BAT".
-    statusText_ = tr(STR_BLE_READER_LOW_RAM);
+    statusText_ = I18N.get(ugly ? StrId::STR_UGLY_BLE_LOW_RAM : StrId::STR_BLE_READER_LOW_RAM);
+    statusInTip_ = ugly;
   } else if (!backend::running()) {
     statusText_ = tr(STR_BLE_START_FAILED);
   } else if (backend::connected()) {
@@ -231,7 +195,7 @@ void BlePageTurnerActivity::capNhatTrangThai() {
   // Mot dong log cho moi lan trang thai THAT SU doi: bai kiem mo phong doc duoc
   // dung chuoi nay, nen no la bang chung chu khong phai trang tri.
   LOG_INF("BLE", "BlePageTurner status=%s enabled=%d bonds=%u devices=%u", statusText_.c_str(),
-          static_cast<int>(SETTINGS.blePageTurnerEnabled), backend::bondCount(), backend::deviceCount());
+          static_cast<int>(SETTINGS.ble.enabled), backend::bondCount(), backend::deviceCount());
   lastStateSig = trangThaiSig();
 }
 
@@ -239,16 +203,21 @@ void BlePageTurnerActivity::rebuildRows() {
   // A found device or bond appearing moves the rows: the selection stays on its row.
   int16_t keep = selectCode_;
   if (keep < 0 && nav.selected >= 0 && nav.selected < static_cast<int>(rowItems_.size())) {
-    keep = rowItems_[nav.selected].actionValue;
+    keep = rowCodes_[nav.selected];
   }
   selectCode_ = -1;
   rowItems_.clear();
+  rowCodes_.clear();
 
   const auto them = [this](const char* label, const int16_t code) {
     fui::ListItem item;
     item.label = label;
-    item.actionValue = code;
+    // A tap reports the row's index, as on every list (the frame and the scroll read rows by index too);
+    // what the row does is its code beside it.
+    item.actionValue = static_cast<int16_t>(rowItems_.size());
+    item.opensNext = code == ROW_BIND_MENU || (code >= ROW_PAIRED_BASE && code < ROW_NO_DEVICE);
     rowItems_.push_back(item);
+    rowCodes_.push_back(code);
   };
 
   if (bindMode_) {
@@ -262,6 +231,7 @@ void BlePageTurnerActivity::rebuildRows() {
     them(tr(STR_BLE_BIND_SAVE_QUOTE), ROW_BIND_SAVE_QUOTE);
   } else {
     them(tr(STR_BLE_PAGE_TURNER), ROW_ENABLE);
+    them(tr(STR_BLE_PICK), ROW_PICK);
     them(tr(STR_BLE_STATUS), ROW_STATUS);
     rowItems_.back().enabled = false;
     them(tr(STR_BLE_SCAN), ROW_SCAN);
@@ -279,13 +249,14 @@ void BlePageTurnerActivity::rebuildRows() {
       if (i == 0) rowItems_.back().sectionHeading = tr(STR_BLE_PAIRED_DEVICES);
     }
     if (bonds == 0) {
-      them(tr(STR_BLE_NO_DEVICES), ROW_NO_DEVICE);
-      rowItems_.back().enabled = false;
+      them(I18N.get(shell::uglyParts() ? StrId::STR_UGLY_BLE_NO_DEVICE : StrId::STR_BLE_NO_DEVICES), ROW_NO_DEVICE);
+      // Touch: a disabled row registers no rect, and the frame left it outside; a tap on it does nothing.
+      rowItems_.back().enabled = tenorchrome::kTouchShell;
       rowItems_.back().sectionHeading = tr(STR_BLE_PAIRED_DEVICES);
     }
   }
   for (int i = 0; keep >= 0 && i < static_cast<int>(rowItems_.size()); ++i) {
-    if (rowItems_[i].actionValue == keep) {
+    if (rowCodes_[i] == keep) {
       nav.selected = i;
       break;
     }
@@ -314,58 +285,72 @@ bool BlePageTurnerActivity::clampAfterNav() {
 void BlePageTurnerActivity::refreshValues() {
   // Hang Trang thai: thong bao cua luot gan nut neu dang co, roi den trang thai
   // radio, va duoi cung la ma vua nhan khi man con mo.
-  statusValue_ = bindNotice_.empty() ? statusText_ : bindNotice_;
+  if (shell::uglyParts()) {
+    statusValue_ = statusInTip_ ? "" : statusText_;  // the notices and a long status go to the tip
+  } else {
+    statusValue_ = bindNotice_.empty() ? statusText_ : bindNotice_;
+  }
   if (lastRawCode_ != 0) {
     char ma[16];
     char duoi[48];
-    blebinding::formatCode(ma, sizeof(ma), lastRawCode_);
+    bleturner::formatCode(ma, sizeof(ma), lastRawCode_);
     snprintf(duoi, sizeof(duoi), tr(STR_BLE_LAST_KEY), ma);
-    statusValue_ += " - ";  // gop hai manh thanh mot dong
+    if (!statusInTip_) statusValue_ += " - ";  // gop hai manh thanh mot dong
     statusValue_ += duoi;
   }
-  for (auto& item : rowItems_) {
-    const int16_t code = item.actionValue;
+  for (size_t i = 0; i < rowItems_.size(); ++i) {
+    auto& item = rowItems_[i];
+    const int16_t code = rowCodes_[i];
     if (code == ROW_ENABLE) {
-      item.value = SETTINGS.blePageTurnerEnabled ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
+      item.value = SETTINGS.ble.enabled ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
+    } else if (code == ROW_PICK) {
+      item.value = I18N.get(SETTINGS.ble.pick == 1 ? StrId::STR_BLE_PICK_FIRST : StrId::STR_BLE_PICK_PRIORITY);
     } else if (code == ROW_STATUS) {
-      item.value = statusValue_.c_str();
+      // Touch: the status line is the row itself; beside a label it was cut to "Tra...".
+      if (tenorchrome::kTouchShell)
+        item.label = statusValue_.c_str();
+      else if (tenorchrome::x3ScreenLayoutEnabled()) {
+        item.value = nullptr;
+        item.subtitle = statusValue_.c_str();
+      }
+      else
+        item.value = statusValue_.c_str();
     } else if (code == ROW_SCAN) {
       item.label = backend::scanning() ? tr(STR_BLE_STOP_SCAN) : tr(STR_BLE_SCAN);
     } else if (code >= ROW_BIND_NEXT && code <= ROW_BIND_SAVE_QUOTE) {
       const int i = code - ROW_BIND_NEXT;
-      bindValues_[i] = bindValue(static_cast<blebinding::Action>(i + 1));
+      bindValues_[i] = bindValue(static_cast<bleturner::Action>(i + 1));
       item.value = bindValues_[i].c_str();
     }
   }
 }
 
-std::string BlePageTurnerActivity::bindValue(const blebinding::Action action) const {
-  const blebinding::RemoteTable* bang =
-      backend::connected() ? blebinding::tableFor(SETTINGS.bleRemotes, SETTINGS.bleRemoteCount,
-                                                  backend::connectedAddr(), backend::connectedName())
+std::string BlePageTurnerActivity::bindValue(const bleturner::Action action) const {
+  const bleturner::RemoteTable* bang =
+      backend::connected() ? bleturner::tableFor(SETTINGS.ble.remotes, SETTINGS.ble.remoteCount,
+                                                 backend::connectedAddr(), backend::connectedName())
                            : nullptr;
-  blebinding::Binding o = 0;
+  bleturner::Binding o = 0;
   char ma[16];
-  if (bang != nullptr && blebinding::find(*bang, action, o)) {
-    blebinding::formatCode(ma, sizeof(ma), o);
+  if (bang != nullptr && bleturner::find(*bang, action, o)) {
+    bleturner::formatCode(ma, sizeof(ma), o);
     std::string giaTri = ma;
-    if (o & blebinding::kHoldBit) {
+    if (o & bleturner::kHoldBit) {
       giaTri += ' ';
       giaTri += tr(STR_BLE_BIND_HOLD);
     }
     return giaTri;
   }
   // A button the table does not name still turns pages by its old usage code: show it.
-  const uint8_t cu = action == blebinding::Action::NextPage   ? SETTINGS.bleNextKeyUsage
-                     : action == blebinding::Action::PrevPage ? SETTINGS.blePrevKeyUsage
-                                                              : CrossPointSettings::BLE_USAGE_NONE;
-  if (cu == CrossPointSettings::BLE_USAGE_NONE) return tr(STR_BLE_BIND_DEFAULT);
+  const uint8_t cu = action == bleturner::Action::NextPage   ? SETTINGS.ble.nextKeyUsage
+                     : action == bleturner::Action::PrevPage ? SETTINGS.ble.prevKeyUsage
+                                                             : bleturner::kUsageNone;
+  if (cu == bleturner::kUsageNone) return tr(STR_BLE_BIND_DEFAULT);
   snprintf(ma, sizeof(ma), "0x%02X", cu);
   return std::string(ma);
 }
 
 void BlePageTurnerActivity::readPendingKeys() {
-  backend::drainKeys();
   uint32_t code = 0;
   bool pressed = false;
   uint32_t atMs = 0;
@@ -393,27 +378,27 @@ void BlePageTurnerActivity::readPendingKeys() {
   }
   // No release within kReleaseWaitMs: the remote does not report this button coming
   // up, so it is learned as a tap.
-  if (bindWaitActive_ && learnCode_ != 0 && millis() - learnPressMs_ >= blebinding::kReleaseWaitMs) {
+  if (bindWaitActive_ && learnCode_ != 0 && millis() - learnPressMs_ >= bleturner::kReleaseWaitMs) {
     finishLearn(false, 0);
   }
 }
 
 void BlePageTurnerActivity::finishLearn(const bool sawRelease, const uint32_t heldMs) {
   const uint32_t code = learnCode_;
-  const bool giu = sawRelease && heldMs >= blebinding::kHoldMs;
+  const bool giu = sawRelease && heldMs >= bleturner::kHoldMs;
   bindWaitActive_ = false;
   learnCode_ = 0;
-  blebinding::RemoteTable* bang = blebinding::editableTable(SETTINGS.bleRemotes, SETTINGS.bleRemoteCount,
-                                                            backend::connectedAddr(), backend::connectedName());
+  bleturner::RemoteTable* bang = bleturner::editableTable(SETTINGS.ble.remotes, SETTINGS.ble.remoteCount,
+                                                          backend::connectedAddr(), backend::connectedName());
   char ma[16];
-  blebinding::formatCode(ma, sizeof(ma), code);
+  bleturner::formatCode(ma, sizeof(ma), code);
   if (!backend::connected()) {
     // The link dropped while waiting for the release: nothing to bind it to.
-    bindNotice_ = tr(STR_BLE_BIND_NONE);
+    bindNotice_ = I18N.get(shell::uglyParts() ? StrId::STR_UGLY_BLE_NONE : StrId::STR_BLE_BIND_NONE);
     LOG_INF("BLE", "Link lost while learning %s", ma);
-  } else if (bang == nullptr || !blebinding::learn(*bang, bindAction_, code, giu)) {
-    bindNotice_ = tr(STR_BLE_BIND_FULL);
-    LOG_INF("BLE", "Binding table full; %s not bound to %s", ma, blebinding::actionName(bindAction_));
+  } else if (bang == nullptr || !bleturner::learn(*bang, bindAction_, code, giu)) {
+    bindNotice_ = I18N.get(shell::uglyParts() ? StrId::STR_UGLY_BLE_FULL : StrId::STR_BLE_BIND_FULL);
+    LOG_INF("BLE", "Binding table full; %s not bound to %s", ma, bleturner::actionName(bindAction_));
   } else {
     SETTINGS.saveToFile();
     std::string nut = ma;
@@ -422,67 +407,65 @@ void BlePageTurnerActivity::finishLearn(const bool sawRelease, const uint32_t he
       nut += tr(STR_BLE_BIND_HOLD);
     }
     char thongBao[64];
-    snprintf(thongBao, sizeof(thongBao), tr(STR_BLE_BIND_DONE), nut.c_str());
+    snprintf(thongBao, sizeof(thongBao), I18N.get(shell::uglyParts() ? StrId::STR_UGLY_BLE_DONE : StrId::STR_BLE_BIND_DONE), nut.c_str());
     bindNotice_ = thongBao;
     LOG_INF("BLE", "Bound %s%s to %s (held %u ms, release %d)", ma, giu ? " hold" : "",
-            blebinding::actionName(bindAction_), static_cast<unsigned>(heldMs), sawRelease ? 1 : 0);
+            bleturner::actionName(bindAction_), static_cast<unsigned>(heldMs), sawRelease ? 1 : 0);
   }
   rowsDirty = true;
   requestUpdate();
 }
 
-void BlePageTurnerActivity::startBindWait(const blebinding::Action action) {
+void BlePageTurnerActivity::startBindWait(const bleturner::Action action) {
   bindAction_ = action;
   bindWaitActive_ = true;
   bindWaitStartedMs_ = millis();
   learnCode_ = 0;
-  bindNotice_ = tr(STR_BLE_BIND_WAIT);
-  LOG_INF("BLE", "Waiting for a button to bind to %s", blebinding::actionName(action));
+  bindNotice_ = I18N.get(shell::uglyParts() ? StrId::STR_UGLY_BLE_WAIT : StrId::STR_BLE_BIND_WAIT);
+  LOG_INF("BLE", "Waiting for a button to bind to %s", bleturner::actionName(action));
   rowsDirty = true;
   requestUpdate();
 }
 
-void BlePageTurnerActivity::clearBind(const blebinding::Action action) {
+void BlePageTurnerActivity::clearBind(const bleturner::Action action) {
   // Connected remote: drop this action's slot from its table (a built-in default is
   // copied out first, so it does not come back next time). The two page rows also
   // clear the old usage code, as before.
   if (backend::connected()) {
-    blebinding::RemoteTable* bang = blebinding::editableTable(SETTINGS.bleRemotes, SETTINGS.bleRemoteCount,
-                                                              backend::connectedAddr(), backend::connectedName());
-    if (bang != nullptr) blebinding::clearAction(*bang, action);
+    bleturner::RemoteTable* bang = bleturner::editableTable(SETTINGS.ble.remotes, SETTINGS.ble.remoteCount,
+                                                            backend::connectedAddr(), backend::connectedName());
+    if (bang != nullptr) bleturner::clearAction(*bang, action);
   }
-  if (action == blebinding::Action::NextPage) SETTINGS.bleNextKeyUsage = CrossPointSettings::BLE_USAGE_NONE;
-  if (action == blebinding::Action::PrevPage) SETTINGS.blePrevKeyUsage = CrossPointSettings::BLE_USAGE_NONE;
+  if (action == bleturner::Action::NextPage) SETTINGS.ble.nextKeyUsage = bleturner::kUsageNone;
+  if (action == bleturner::Action::PrevPage) SETTINGS.ble.prevKeyUsage = bleturner::kUsageNone;
   SETTINGS.saveToFile();
   bindWaitActive_ = false;
   learnCode_ = 0;
   bindNotice_ = tr(STR_BLE_BIND_CLEAR);
-  LOG_INF("BLE", "Cleared the %s binding", blebinding::actionName(action));
+  LOG_INF("BLE", "Cleared the %s binding", bleturner::actionName(action));
   rowsDirty = true;
   requestUpdate();
 }
 
 void BlePageTurnerActivity::toggleEnabled() {
-  SETTINGS.blePageTurnerEnabled = SETTINGS.blePageTurnerEnabled ? 0 : 1;
-  if (SETTINGS.blePageTurnerEnabled) {
+  SETTINGS.ble.enabled = SETTINGS.ble.enabled ? 0 : 1;
+  if (SETTINGS.ble.enabled) {
     // Y dinh cua nguoi dung duoc ghi lai du lan init nay co thanh cong hay khong:
     // "da bat" va "radio dang chay" la hai chuyen khac nhau, va man hinh noi ro
     // chuyen nao dang xay ra. (Ban dung khong co BLE: begin() tra false.)
-    if (!backend::begin(renderer)) {
+    if (!backend::begin()) {
       LOG_ERR("BLE", "BLE HID host begin() failed; preference kept, radio not running");
     }
   } else {
-    freeink::ble::setIdleStopped(false);
-    freeink::ble::setReaderStartDeferred(false);
     backend::stopScan();
-    if (!backend::end()) LOG_INF("BLE", "BLE shutdown pending; input loop will finish cleanup");
+    if (!backend::switchOff()) LOG_INF("BLE", "BLE shutdown pending; input loop will finish cleanup");
   }
   SETTINGS.saveToFile();
 }
 
 void BlePageTurnerActivity::handleScanRow() {
-  if (!SETTINGS.blePageTurnerEnabled) return;  // chua bat thi khong co gi de quet
-  if (!backend::begin(renderer)) return;  // ban dung khong co BLE
+  if (!SETTINGS.ble.enabled) return;  // chua bat thi khong co gi de quet
+  if (!backend::begin()) return;  // ban dung khong co BLE
   if (backend::scanning()) {
     backend::stopScan();
     return;
@@ -493,34 +476,31 @@ void BlePageTurnerActivity::handleScanRow() {
 void BlePageTurnerActivity::openPairedPopup(const int bondIndex) {
   if (bondIndex < 0 || bondIndex >= backend::bondCount()) return;
   const std::string addr = backend::bondAddr(bondIndex);
-  const bool dangNoi = backend::connected();
+  const std::string name = backend::bondName(bondIndex);
+  const bool dangNoi = backend::connected() && addr == backend::connectedAddr();
   const StrId options[2] = {dangNoi ? StrId::STR_BLE_DISCONNECT : StrId::STR_BLE_CONNECT, StrId::STR_BLE_FORGET};
-  optionPopup.show(StrId::STR_BLE_PAIRED_DEVICES, options, 2, 0, [this, addr, dangNoi](const int idx) {
+  const auto onSelect = [this, addr, name, dangNoi](const int idx) {
     if (idx == 0) {
       if (dangNoi) {
         backend::disconnect();
       } else {
-        chupChuoi(SETTINGS.blePeerAddr, addr.c_str(), sizeof(SETTINGS.blePeerAddr));
-        SETTINGS.saveToFile();
-        if (SETTINGS.blePageTurnerEnabled && backend::begin(renderer)) backend::connect(SETTINGS.blePeerAddr);
+        backend::pair(addr.c_str(), name.c_str());
       }
-    } else {
-      backend::forget(addr.c_str());
-      // Forgetting a device forgets its button table too.
-      bool doi = blebinding::forgetRemote(SETTINGS.bleRemotes, SETTINGS.bleRemoteCount, addr.c_str());
-      // Mot dia chi vua bi quen ma con nam trong lua chon da luu la mot lan ket
-      // noi lai vao khoang khong o lan sau.
-      if (strncmp(SETTINGS.blePeerAddr, addr.c_str(), sizeof(SETTINGS.blePeerAddr)) == 0) {
-        SETTINGS.blePeerAddr[0] = '\0';
-        SETTINGS.blePeerName[0] = '\0';
-        doi = true;
-      }
-      if (doi) SETTINGS.saveToFile();
+    } else if (backend::forget(addr.c_str())) {
+      SETTINGS.saveToFile();
     }
     capNhatTrangThai();
     rowsDirty = true;
     requestUpdate();
-  });
+  };
+  freeink::ui::Rect parentFrame{};
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* labels[2] = {I18N.get(options[0]), I18N.get(options[1])};
+    x3Popup.show(tr(STR_BLE_PAIRED_DEVICES), labels, 2, 0, onSelect);
+  } else if (tenorchrome::kTouchShell && rowFrameFor(ACTION_ROW, nav.selected, parentFrame))
+    optionPopup.showInFrame(parentFrame, StrId::STR_BLE_PAIRED_DEVICES, options, 2, -1, onSelect);
+  else
+    optionPopup.show(StrId::STR_BLE_PAIRED_DEVICES, options, 2, -1, onSelect);
   requestUpdate();
 }
 
@@ -530,7 +510,7 @@ void BlePageTurnerActivity::activateIndex(const int index) {
   // Mo popup hoac doi trang thai radio deu ve mot be mat khac: vet sang con lai
   // se lam xam mot o khong lien quan.
   app.clearTapFlash();
-  const int16_t code = rowItems_[index].actionValue;
+  const int16_t code = rowCodes_[index];
   const bool hangGan = code >= ROW_BIND_NEXT && code <= ROW_BIND_SAVE_QUOTE;
   // Mot nhip vao hang khac la nguoi dung doi y: thong bao cu va luot cho cu het hieu luc.
   if (!hangGan) {
@@ -539,13 +519,16 @@ void BlePageTurnerActivity::activateIndex(const int index) {
   }
   if (code == ROW_ENABLE) {
     toggleEnabled();
+  } else if (code == ROW_PICK) {
+    SETTINGS.ble.pick = SETTINGS.ble.pick == 1 ? 0 : 1;
+    SETTINGS.saveToFile();
   } else if (code == ROW_BIND_MENU) {
     bindMode_ = true;
     selectCode_ = ROW_BIND_NEXT;
   } else if (code == ROW_SCAN) {
     handleScanRow();
   } else if (hangGan) {
-    startBindWait(static_cast<blebinding::Action>(code - ROW_BIND_NEXT + 1));
+    startBindWait(static_cast<bleturner::Action>(code - ROW_BIND_NEXT + 1));
     return;  // startBindWait da ve lai man
   } else if (code >= ROW_PAIRED_BASE && code < ROW_PAIRED_BASE + static_cast<int16_t>(backend::bondCount())) {
     openPairedPopup(code - ROW_PAIRED_BASE);
@@ -553,10 +536,8 @@ void BlePageTurnerActivity::activateIndex(const int index) {
   } else if (code >= ROW_DEVICE_BASE && code < ROW_DEVICE_BASE + static_cast<int16_t>(backend::deviceCount())) {
     const int dev = code - ROW_DEVICE_BASE;
     backend::stopScan();
-    chupChuoi(SETTINGS.blePeerAddr, backend::deviceAddr(dev), sizeof(SETTINGS.blePeerAddr));
-    chupChuoi(SETTINGS.blePeerName, backend::deviceName(dev), sizeof(SETTINGS.blePeerName));
-    SETTINGS.saveToFile();
-    if (SETTINGS.blePageTurnerEnabled && backend::begin(renderer)) backend::connect(SETTINGS.blePeerAddr);
+    // Chi thanh remote da chon khi noi duoc (bleturner::service): ghep hong giu nguyen remote cu.
+    backend::pair(backend::deviceAddr(dev), backend::deviceName(dev));
   } else {
     return;  // dong tieu de / dong "khong tim thay": khong co viec gi
   }
@@ -567,7 +548,21 @@ void BlePageTurnerActivity::activateIndex(const int index) {
 }
 
 bool BlePageTurnerActivity::handleCustomInput() {
+  if (tenorchrome::x3ScreenLayoutEnabled() && x3Popup.handleInput(mappedInput, [this] { requestUpdate(); })) return true;
   return optionPopup.handleInput(mappedInput, [this] { requestUpdate(); });
+}
+
+void BlePageTurnerActivity::pollTilt() {
+  if (tenorchrome::x3ScreenLayoutEnabled() && x3Popup.isActive()) {
+    menutilt::pollTabs(static_cast<uint8_t>(renderer.getOrientation()), false);
+    const auto tilt = menutilt::pollRows(true);
+    if (tilt.previous || tilt.next) {
+      x3Popup.step(tilt.previous ? -1 : 1);
+      requestUpdate();
+    }
+    return;
+  }
+  UiListActivity::pollTilt();
 }
 
 // Duong giu nut cua may cam ung, do lop nen phat su kien hang co co longPress.
@@ -577,9 +572,9 @@ void BlePageTurnerActivity::onRowLongPress(const int index) { clearBindForRow(in
 // "giu tren hang gan nut la xoa gan" chi duoc phat bieu mot lan.
 void BlePageTurnerActivity::clearBindForRow(const int index) {
   if (index < 0 || index >= static_cast<int>(rowItems_.size())) return;
-  const int16_t code = rowItems_[index].actionValue;
+  const int16_t code = rowCodes_[index];
   if (code >= ROW_BIND_NEXT && code <= ROW_BIND_SAVE_QUOTE) {
-    clearBind(static_cast<blebinding::Action>(code - ROW_BIND_NEXT + 1));
+    clearBind(static_cast<bleturner::Action>(code - ROW_BIND_NEXT + 1));
   }
 }
 
@@ -606,12 +601,18 @@ void BlePageTurnerActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   // Cung bien noi dung voi OpdsServerListActivity: duoi dai header, tren dai nut.
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, nullptr, 8));
+    screen.setContentMarginFromScreen({static_cast<int16_t>(layout.bodyRect.y), 0,
+        static_cast<int16_t>(renderer.getScreenHeight() - layout.bodyRect.bottom()), 0});
+  } else {
   screen.setContentMarginFromScreen(
       fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
                   static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
                   static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
                   static_cast<int16_t>(safe.x)});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
+  if (!tenorchrome::x3ScreenLayoutEnabled()) screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   if (rowsDirty) {
     // Cleared before the rebuild: a row tapped on the loop while it runs (the bindings
@@ -620,6 +621,17 @@ void BlePageTurnerActivity::buildScreen(UiScreen& screen) {
     rebuildRows();
   }
   refreshValues();
+  if (shell::uglyParts()) {
+    const int height = tenorchrome::tipHeight(renderer, uglyTip());
+    if (tenorchrome::x3ScreenLayoutEnabled()) {
+      const bool info = !bindNotice_.empty() || statusInTip_;
+      const auto layout = tenorchrome::x3ScreenLayout(renderer, info ? 0 : height);
+      const int limit = info ? layout.bodyRect.bottom() - height - 8 : layout.bodyRect.bottom();
+      if (screen.body().bottom() > limit) screen.takeBottom(static_cast<int16_t>(screen.body().bottom() - limit));
+    } else {
+      screen.takeBottom(static_cast<int16_t>(height + 20));
+    }
+  }
 
   fui::ListProps props;
   props.items = rowItems_.data();
@@ -627,11 +639,66 @@ void BlePageTurnerActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // nut vat ly do loop() cua lop nen lo
   props.valueInset = 8;
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    props.labelText = uiMenuLabelText(screen.theme());
+    props.labelText.maxLines = 2;
+    props.subtitleText = screen.theme().smallText;
+    props.subtitleText.maxLines = 8;
+  }
   syncListViewport(screen, props);
   screen.list(props);
 }
 
+const char* BlePageTurnerActivity::uglyTip() const {
+  if (!bindNotice_.empty()) return bindNotice_.c_str();
+  return statusInTip_ ? statusText_.c_str() : tr(STR_UGLY_BLE_TIP);
+}
+
+void BlePageTurnerActivity::drawFooter() {
+  if (tenorchrome::x3ScreenLayoutEnabled() && !shell::uglyParts()) {
+    UiListActivity::drawFooter();
+    return;
+  }
+  UiListActivity::drawFooter();
+  if (!shell::uglyParts()) return;
+  if (tenorchrome::x3ScreenLayoutEnabled() && (!bindNotice_.empty() || statusInTip_)) {
+    const int height = tenorchrome::tipHeight(renderer, uglyTip());
+    const auto body = tenorchrome::x3ScreenLayout(renderer).bodyRect;
+    tenorchrome::drawInfoInRect(renderer, uglyTip(), {24, body.bottom() - height, body.width - 48, height});
+  } else {
+    tenorchrome::drawTip(renderer, uglyTip());
+  }
+#ifdef UGLY_FRAME_LOG
+  LOG_INF("UGLY", "BLE tip=\"%s\" status=\"%s\"", uglyTip(), statusValue_.c_str());
+#endif
+}
+
 void BlePageTurnerActivity::render(RenderLock&& lock) {
+  if (tenorchrome::x3ScreenLayoutEnabled() && x3Popup.isActive()) {
+    renderer.clearScreen();
+    drawChrome();
+    const auto frame = x3PopupFrame();
+    x3Popup.draw(renderer, {frame.x, frame.y, frame.width, frame.height});
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    renderer.displayBuffer();
+    return;
+  }
   if (optionPopup.processRender(renderer, mappedInput)) return;
   UiListActivity::render(std::move(lock));
+}
+
+freeink::ui::Rect BlePageTurnerActivity::x3PopupFrame() const {
+  const auto body = tenorchrome::x3ScreenLayout(renderer).bodyRect;
+  return {24, static_cast<int16_t>(body.y + body.height / 4), static_cast<int16_t>(body.width - 48),
+          static_cast<int16_t>(body.height / 2)};
+}
+
+void BlePageTurnerActivity::drawChrome() {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, nullptr, 8));
+    x3activity::drawBar(renderer, layout.barRect, headerTitle(), navigationPrefix.c_str());
+    return;
+  }
+  UiListActivity::drawChrome();
 }

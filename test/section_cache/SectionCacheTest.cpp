@@ -1,5 +1,6 @@
 #include <Epub/Section.h>
 #include <Epub/Page.h>
+#include <Epub/css/CssParser.h>
 #include <GfxRenderer.h>
 #include <gtest/gtest.h>
 #include <Arduino.h>
@@ -16,10 +17,28 @@
 #include <new>
 #include <iostream>
 #include <chrono>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#define usableSize malloc_size
+#else
+#include <malloc.h>
+#define usableSize malloc_usable_size
+#endif
+
+namespace parserImageFixture {
+extern bool enabled;
+}
 
 namespace allocationProbe {
 bool enabled = false;
+// Live bytes allocated since `enabled` went on, and their peak (frees of older blocks count too, so the
+// figure is the peak growth of the heap). Host pointers are 8 bytes, so this is an upper bound for the X3.
+long live = 0;
+long peak = 0;
 size_t largest = 0;
+size_t calls = 0;
+size_t liveLimit = 0;
+size_t requestLimit = 0;
 size_t rejectSize = 0;
 bool rejectNextNothrow = false;
 unsigned matchingCalls = 0;
@@ -27,13 +46,31 @@ unsigned rejectCall = 0;
 unsigned rejected = 0;
 }
 void* operator new(std::size_t size) {
-  if (allocationProbe::enabled) allocationProbe::largest = std::max(allocationProbe::largest, size);
-  if (void* value = std::malloc(size ? size : 1)) return value;
+  if (allocationProbe::enabled) {
+    allocationProbe::largest = std::max(allocationProbe::largest, size);
+    ++allocationProbe::calls;
+    if ((allocationProbe::liveLimit && allocationProbe::live + static_cast<long>(size) >
+                                          static_cast<long>(allocationProbe::liveLimit)) ||
+        (allocationProbe::requestLimit && size > allocationProbe::requestLimit)) {
+      ++allocationProbe::rejected;
+      throw std::bad_alloc();
+    }
+  }
+  if (void* value = std::malloc(size ? size : 1)) {
+    if (allocationProbe::enabled) {
+      allocationProbe::live += static_cast<long>(usableSize(value));
+      allocationProbe::peak = std::max(allocationProbe::peak, allocationProbe::live);
+    }
+    return value;
+  }
   throw std::bad_alloc();
 }
 void* operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void* value) noexcept { std::free(value); }
-void operator delete[](void* value) noexcept { std::free(value); }
+void operator delete(void* value) noexcept {
+  if (allocationProbe::enabled && value) allocationProbe::live -= static_cast<long>(usableSize(value));
+  std::free(value);
+}
+void operator delete[](void* value) noexcept { ::operator delete(value); }
 void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
   if (allocationProbe::rejectNextNothrow) {
     allocationProbe::rejectNextNothrow = false;
@@ -47,7 +84,7 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
   try { return ::operator new(size); } catch (...) { return nullptr; }
 }
 void* operator new[](std::size_t size, const std::nothrow_t& tag) noexcept { return ::operator new(size, tag); }
-void operator delete(void* value, const std::nothrow_t&) noexcept { std::free(value); }
+void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
 void operator delete[](void* value, const std::nothrow_t&) noexcept { std::free(value); }
 namespace {
 template <typename T>
@@ -461,6 +498,39 @@ class SectionCacheTest : public ::testing::Test {
   }
 };
 TEST_F(SectionCacheTest, FullProductionRoundTripPreservesAllBookWords) { retryAndCheckEveryWord(); }
+TEST_F(SectionCacheTest, RasterOnlyChangesReuseSectionCacheAndPageOffsets) {
+  for (int level = 0; level < 6; ++level) for (bool aa : {false, true}) {
+    Section reopened(epub, 0, renderer);
+    ASSERT_TRUE(reopened.loadSectionFile(spec)) << level << ' ' << aa;
+    EXPECT_EQ(reopened.pageCount, fullPages);
+    EXPECT_EQ(bytes(cache()), valid);
+    ASSERT_NE(reopened.loadPage(3), nullptr);
+    for (uint16_t index = 0; index < fullPages; ++index)
+      EXPECT_EQ(pod<uint32_t>(bytes(cache()), lutOffset + index * 4), pageOffsets[index]);
+  }
+}
+TEST_F(SectionCacheTest, SdVariantSwitchKeepsCachedSectionAndPagePosition) {
+  const char* identities = std::getenv("CROSSPOINT_SD_FONT_CACHE_IDS");
+  if (!identities) GTEST_SKIP();
+  int baseId = 0;
+  int heavyId = 0;
+  int restoredId = 0;
+  ASSERT_EQ(std::sscanf(identities, "%d,%d,%d", &baseId, &heavyId, &restoredId), 3);
+  spec.fontId = baseId;
+  Section original(epub, 0, renderer);
+  ASSERT_TRUE(original.createSectionFile(spec));
+  const auto originalBytes = bytes(cache());
+  const auto position = pageOffsets[3];
+  for (const int fontId : {baseId, heavyId, restoredId}) {
+    spec.fontId = fontId;
+    Section reopened(epub, 0, renderer);
+    ASSERT_TRUE(reopened.loadSectionFile(spec)) << fontId;
+    EXPECT_EQ(reopened.pageCount, fullPages);
+    ASSERT_NE(reopened.loadPage(3), nullptr);
+    EXPECT_EQ(bytes(cache()), originalBytes);
+    EXPECT_EQ(pod<uint32_t>(bytes(cache()), lutOffset + 3 * 4), position);
+  }
+}
 TEST_F(SectionCacheTest, StarvedHeapParksBuildInsteadOfAbandoning) {
   std::filesystem::remove(cache());
   Section section(epub, 0, renderer);
@@ -631,6 +701,34 @@ TEST_F(SectionCacheTest, RejectsPartialCacheFromHeapDependentCssResolver) {
   }
   Section reopened(epub, 0, renderer);
   EXPECT_FALSE(reopened.loadSectionFile(spec));
+}
+
+TEST_F(SectionCacheTest, CorruptCssPayloadDefersTheSectionUntilCacheRebuild) {
+  CssParser css(root.string());
+  const auto sourcePath = root / "style.css";
+  { std::ofstream file(sourcePath); file << "p { font-weight: bold; }"; }
+  HalFile source;
+  ASSERT_TRUE(Storage.openFileForRead("TST", sourcePath.string(), source));
+  ASSERT_EQ(css.loadFromStream(source), CssParser::ParseResult::Complete);
+  ASSERT_TRUE(css.saveToCache(true));
+  auto damaged = bytes(root / "css_rules.cache");
+  ASSERT_GT(damaged.size(), 6u);
+  damaged[6] = 'q';
+  { std::ofstream file(root / "css_rules.cache", std::ios::binary); file.write(damaged.data(), damaged.size()); }
+  css.clear();
+  ASSERT_EQ(css.inspectCache(), CssParser::CacheStatus::Complete);
+  epub->cssParser = &css;
+  spec.embeddedStyle = true;
+  Section section(epub, 1, renderer);
+  EXPECT_FALSE(section.startBuild(spec));
+  EXPECT_FALSE(css.hasCache());
+  EXPECT_FALSE(section.startBuild(spec));
+  EXPECT_FALSE(std::filesystem::exists(root / "sections/1.bin"));
+  ASSERT_TRUE(source.seek(0));
+  ASSERT_EQ(css.loadFromStream(source), CssParser::ParseResult::Complete);
+  ASSERT_TRUE(css.saveToCache(true));
+  EXPECT_TRUE(section.startBuild(spec));
+  epub->cssParser = nullptr;
 }
 TEST_F(SectionCacheTest, MiddlePageShortWriteFailsImmediatelyAndKeepsPreviousCache) {
   {
@@ -1003,7 +1101,7 @@ TEST_F(SectionCacheTest, PartialWatermarkExtensionAvoidsReplayingTheColdPrefix) 
   }
 
   struct ExtensionSample {
-    uint64_t elapsedUs = 0;
+    uint64_t textAdvanceCalls = 0;
     uint64_t htmlReadBytes = 0;
     uint64_t htmlReadCalls = 0;
     uint64_t cacheReadBytes = 0;
@@ -1058,7 +1156,7 @@ TEST_F(SectionCacheTest, PartialWatermarkExtensionAvoidsReplayingTheColdPrefix) 
     }
     section.currentPage = targetPage;
     storageMetrics::begin();
-    const auto start = std::chrono::steady_clock::now();
+    renderer.textAdvanceCalls = 0;
     if (!section.startBuild(spec)) {
       ADD_FAILURE() << "extension build did not start";
       storageMetrics::enabled = false;
@@ -1084,7 +1182,6 @@ TEST_F(SectionCacheTest, PartialWatermarkExtensionAvoidsReplayingTheColdPrefix) 
       return {};
     }
     const auto page = section.loadPage(targetPage);
-    const auto end = std::chrono::steady_clock::now();
     if (!page) {
       ADD_FAILURE() << "target page was unavailable after crossing its watermark";
       storageMetrics::enabled = false;
@@ -1092,7 +1189,7 @@ TEST_F(SectionCacheTest, PartialWatermarkExtensionAvoidsReplayingTheColdPrefix) 
       return {};
     }
     ExtensionSample result{
-      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()),
+      renderer.textAdvanceCalls,
       storageMetrics::htmlReadBytes, storageMetrics::htmlReadCalls,
       storageMetrics::cacheReadBytes, storageMetrics::cacheReadCalls,
       storageMetrics::cacheWriteBytes, storageMetrics::cacheSeekCalls,
@@ -1136,8 +1233,8 @@ TEST_F(SectionCacheTest, PartialWatermarkExtensionAvoidsReplayingTheColdPrefix) 
       EXPECT_EQ(partialSamples.back().visibleOffset, coldSamples.back().visibleOffset);
     }
 
-    const auto partialUs = summarize(partialSamples, [](const auto& sample) { return sample.elapsedUs; });
-    const auto coldUs = summarize(coldSamples, [](const auto& sample) { return sample.elapsedUs; });
+    const auto partialWork = summarize(partialSamples, [](const auto& sample) { return sample.textAdvanceCalls; });
+    const auto coldWork = summarize(coldSamples, [](const auto& sample) { return sample.textAdvanceCalls; });
     const auto partialHtml = summarize(partialSamples, [](const auto& sample) { return sample.htmlReadBytes; });
     const auto coldHtml = summarize(coldSamples, [](const auto& sample) { return sample.htmlReadBytes; });
     const auto partialCacheRead = summarize(partialSamples, [](const auto& sample) { return sample.cacheReadBytes; });
@@ -1149,7 +1246,7 @@ TEST_F(SectionCacheTest, PartialWatermarkExtensionAvoidsReplayingTheColdPrefix) 
 
     std::cout << "SECTION_WATERMARK_BENCH mode=partial watermark=" << fixture.watermark
               << " target=" << fixture.watermark << " samples=" << sampleCount;
-    printMetric("us", partialUs);
+    printMetric("text_advance_calls", partialWork);
     printMetric("html_read_bytes", partialHtml);
     printMetric("cache_read_bytes", partialCacheRead);
     printMetric("cache_write_bytes", partialCacheWrite);
@@ -1157,14 +1254,18 @@ TEST_F(SectionCacheTest, PartialWatermarkExtensionAvoidsReplayingTheColdPrefix) 
     std::cout << "\n";
     std::cout << "SECTION_WATERMARK_BENCH mode=cold watermark=" << fixture.watermark
               << " target=" << fixture.watermark << " samples=" << sampleCount;
-    printMetric("us", coldUs);
+    printMetric("text_advance_calls", coldWork);
     printMetric("html_read_bytes", coldHtml);
     printMetric("cache_read_bytes", coldCacheRead);
     printMetric("cache_write_bytes", coldCacheWrite);
     printMetric("cache_seek_calls", coldCacheSeek);
     std::cout << "\n";
 
-    EXPECT_LT(partialUs.p95, coldUs.p50)
+    // Font measurements count layout work even when both paths read one HTML buffer.
+    EXPECT_GT(partialWork.max, 0u);
+    EXPECT_EQ(partialWork.p50, partialWork.max);
+    EXPECT_EQ(coldWork.p50, coldWork.max);
+    EXPECT_LT(partialWork.max, coldWork.p50)
       << "partial extension replayed the cold parser prefix at watermark " << fixture.watermark;
     if (fixture.watermark >= 120) {
       EXPECT_LT(partialHtml.p95, coldHtml.p50)
@@ -1819,6 +1920,71 @@ TEST_F(SectionCacheTest, ParserParkingKeepsBuildActiveAndPreservesExactOutputAcr
   EXPECT_EQ(section.findAnchor("chapter-end"), coldAnchors[2]);
 }
 
+TEST_F(SectionCacheTest, ParkedAnchorStorageSurvivesResumeAndSecondPark) {
+  epub->contents = "<html><body><section id=\"chapter-start\">";
+  for (unsigned index = 0; index < 220; ++index) {
+    const std::string id = index == 110 ? " id=\"chapter-middle\"" :
+                           index == 219 ? " id=\"chapter-end\"" : "";
+    epub->contents += "<p" + id + ">anchor lifetime paragraph " + std::to_string(index) +
+                      " carries enough text for a parser checkpoint and resume.</p>";
+  }
+  epub->contents += "</section></body></html>";
+  std::filesystem::remove(cache());
+  std::filesystem::remove(root / "html/0.html");
+
+  {
+    Section section(epub, 0, renderer);
+    ASSERT_TRUE(section.startBuild(spec));
+    while (section.pageCount < 8u) {
+      ASSERT_TRUE(section.buildSomeMore(2));
+      ASSERT_TRUE(section.isBuilding());
+    }
+    ASSERT_TRUE(section.parkBuild());
+    ASSERT_TRUE(section.isBuildParked());
+    const void* parkedData = section.parkedAnchorsDataForTest();
+    ASSERT_NE(parkedData, nullptr);
+
+    ASSERT_TRUE(section.buildSomeMore(2));
+    ASSERT_TRUE(section.isBuilding());
+    EXPECT_EQ(section.parkedAnchorsDataForTest(), parkedData);
+
+    ASSERT_TRUE(section.parkBuild());
+    ASSERT_TRUE(section.isBuildParked());
+    EXPECT_EQ(section.parkedAnchorsDataForTest(), parkedData);
+  }
+
+  epub->tocCount = 220;
+  epub->contents = "<html><body>";
+  for (unsigned index = 0; index < 220; ++index) {
+    epub->contents += "<p id=\"anchor-" + std::to_string(index) +
+                      "\">anchor ownership paragraph " + std::to_string(index) +
+                      " carries enough text for a parser checkpoint and resume.</p>";
+  }
+  epub->contents += "</body></html>";
+  std::filesystem::remove(cache());
+  std::filesystem::remove(root / "html/0.html");
+
+  Section largeSection(epub, 0, renderer);
+  ASSERT_TRUE(largeSection.startBuild(spec));
+  while (largeSection.pageCount < 40u) {
+    ASSERT_TRUE(largeSection.buildSomeMore(2));
+    ASSERT_TRUE(largeSection.isBuilding());
+  }
+  ASSERT_TRUE(largeSection.parkBuild());
+  ASSERT_TRUE(largeSection.isBuildParked());
+  ASSERT_NE(largeSection.parkedAnchorsDataForTest(), nullptr);
+  ASSERT_GT(largeSection.parkedAnchorsCapacityForTest(), 4u);
+
+  ASSERT_TRUE(largeSection.buildSomeMore(2));
+  ASSERT_TRUE(largeSection.isBuilding());
+  EXPECT_EQ(largeSection.parkedAnchorsCapacityForTest(), 0u);
+  EXPECT_EQ(largeSection.parkedAnchorsDataForTest(), nullptr);
+
+  ASSERT_TRUE(largeSection.parkBuild());
+  ASSERT_TRUE(largeSection.isBuildParked());
+  EXPECT_NE(largeSection.parkedAnchorsDataForTest(), nullptr);
+}
+
 TEST_F(SectionCacheTest, ParkedBuildCloseReopensAsReadablePartialAndContinues) {
   uint16_t watermark = 0;
   {
@@ -2314,4 +2480,735 @@ TEST_F(SectionCacheTest, StarvedAfterARestoreParksBackAtThePartialCheckpoint) {
   EXPECT_EQ(bytes(cache()), cold);
 }
 
+// v1.0.53, X3 07/10/2026: back in the book the radio restarts and takes ~50 KB, and the parked build's
+// resume runs out of heap in its checkpoint restore. It was abandoned ("Unable to resume") and the
+// chapter laid out again from its first page behind the indexing notice. A resume short of heap is a
+// starved build: it stays parked, the reader frees the heap, and it resumes from the same checkpoint.
+TEST_F(SectionCacheTest, ResumeShortOfHeapStaysParked) {
+  epub->contents = streakChapter(spec);
+  std::filesystem::remove(root / "html/0.html");
+  std::filesystem::remove(cache());
+  std::string cold;
+  {
+    Section section(epub, 0, renderer);
+    ASSERT_TRUE(section.createSectionFile(spec));
+    cold = bytes(cache());
+  }
+  std::filesystem::remove(cache());
+  Section section(epub, 0, renderer);
+  ASSERT_TRUE(section.startBuild(spec));
+  while (section.pageCount < 4) ASSERT_TRUE(section.buildSomeMore(1));
+  ASSERT_TRUE(section.parkBuild());
+  const uint16_t parked = section.pageCount;
+  ESP.freeHeap = 16820;
+  ESP.maxAlloc = 8180;
+  allocationProbe::rejectNextNothrow = true;
+  EXPECT_FALSE(section.buildSomeMore(1));
+  EXPECT_TRUE(section.buildStarved());
+  EXPECT_TRUE(section.isBuilding()) << "a resume short of heap abandoned the build";
+  EXPECT_TRUE(section.isBuildParked());
+  EXPECT_EQ(section.pageCount, parked);
+  ESP = {};
+  while (!section.isBuildComplete()) ASSERT_TRUE(section.buildSomeMore(8));
+  EXPECT_EQ(bytes(cache()), cold);
+}
+
+// The same for a chapter reopened from its partial file: the restore at the start runs out of heap.
+// It used to lay the chapter out again from its first byte; the start is refused as starved, the
+// partial stays readable, and the next start restores from its checkpoint.
+TEST_F(SectionCacheTest, PartialRestoreShortOfHeapIsRefusedAsStarved) {
+  epub->contents = streakChapter(spec);
+  std::filesystem::remove(root / "html/0.html");
+  std::filesystem::remove(cache());
+  std::string cold;
+  {
+    Section section(epub, 0, renderer);
+    ASSERT_TRUE(section.createSectionFile(spec));
+    cold = bytes(cache());
+  }
+  std::filesystem::remove(cache());
+  uint16_t watermark = 0;
+  {
+    Section section(epub, 0, renderer);
+    ASSERT_TRUE(section.startBuild(spec));
+    while (section.pageCount < 4) ASSERT_TRUE(section.buildSomeMore(1));
+    section.suspendBuild();
+    ASSERT_TRUE(section.isPartial());
+    watermark = section.pageCount;
+  }
+  Section reopened(epub, 0, renderer);
+  ASSERT_TRUE(reopened.loadSectionFile(spec));
+  // The first TextBlock the restore asks for is refused, on a heap under the step floor.
+  bool refused = false;
+  for (unsigned call = 1; call < 20 && !refused; ++call) {
+    ESP.freeHeap = 16820;
+    ESP.maxAlloc = 8180;
+    allocationProbe::rejectSize = sizeof(TextBlock);
+    allocationProbe::matchingCalls = 0;
+    allocationProbe::rejectCall = call;
+    allocationProbe::rejected = 0;
+    storageMetrics::begin();
+    storageMetrics::watchPrefix(root.string() + "/html/0.html", 0, 64);
+    const bool started = reopened.startBuild(spec);
+    storageMetrics::enabled = false;
+    allocationProbe::rejectSize = 0;
+    ESP = {};
+    ASSERT_EQ(allocationProbe::rejected, 1u) << "no TextBlock was asked for at call " << call;
+    if (started) {
+      EXPECT_EQ(storageMetrics::prefixReadBytes, 0u) << "laid out again from the first byte at call " << call;
+      reopened.abandonBuild();
+      continue;
+    }
+    refused = true;
+    EXPECT_TRUE(reopened.buildStarved());
+    EXPECT_FALSE(reopened.isBuilding());
+    EXPECT_EQ(reopened.pageCount, watermark) << "the partial's pages are gone";
+  }
+  ASSERT_TRUE(refused);
+  storageMetrics::begin();
+  storageMetrics::watchPrefix(root.string() + "/html/0.html", 0, 64);
+  ASSERT_TRUE(reopened.startBuild(spec));
+  storageMetrics::enabled = false;
+  EXPECT_EQ(storageMetrics::prefixReadBytes, 0u) << "the chapter was laid out again from its first byte";
+  while (!reopened.isBuildComplete()) ASSERT_TRUE(reopened.buildSomeMore(8));
+  EXPECT_EQ(bytes(cache()), cold);
+}
+
+}
+
+// The page shown while the chapter is laid out again under new text settings: it opens at the line
+// that holds the old page's first word and carries the same lines as the full layout from there.
+namespace {
+std::vector<std::string> pageLines(const Page& page) {
+  std::vector<std::string> lines;
+  for (const auto& element : page.elements) {
+    if (element->getTag() != TAG_PageLine) continue;
+    const auto& block = *static_cast<const PageLine&>(*element).getBlock();
+    std::string line;
+    for (uint16_t i = 0; i < block.wordCount(); ++i) line += (i ? " " : "") + std::string(block.wordText(i));
+    lines.push_back(line);
+  }
+  return lines;
+}
+bool hasWord(const std::string& line, const std::string& word) {
+  return (" " + line + " ").find(" " + word + " ") != std::string::npos;
+}
+struct PreviewBook {
+  std::filesystem::path root = std::filesystem::temp_directory_path() / ("cross-preview-" + std::to_string(getpid()));
+  std::shared_ptr<Epub> epub = std::make_shared<Epub>();
+  GfxRenderer renderer;
+  ReaderRenderSpec narrow, wide;
+  PreviewBook() {
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    epub->cachePath = root.string();
+    epub->contents = "<html><body><div>";
+    for (int p = 0; p < 40; ++p) {
+      epub->contents += "<p>";
+      for (int w = 0; w < 9 + (p * 7) % 31; ++w) epub->contents += "p" + std::to_string(p) + "w" + std::to_string(w) + " ";
+      epub->contents += "</p>";
+    }
+    epub->contents += "</div></body></html>";
+    narrow.viewportWidth = 160; narrow.viewportHeight = 120; narrow.embeddedStyle = false; narrow.dropCapMode = 0;
+    wide = narrow; wide.viewportWidth = 240; wide.lineCompression = 1.25f;
+  }
+  ~PreviewBook() { std::filesystem::remove_all(root); }
+  std::vector<std::string> allLines(const ReaderRenderSpec& spec) {
+    Section section(epub, 0, renderer);
+    if (!section.loadSectionFile(spec) && !section.createSectionFile(spec)) return {};
+    std::vector<std::string> lines;
+    for (int i = 0; i < section.pageCount; ++i) {
+      auto page = section.loadPage(i);
+      if (!page) return {};
+      for (auto& line : pageLines(*page)) lines.push_back(line);
+    }
+    return lines;
+  }
+};
+}  // namespace
+
+TEST(PreviewPage, OpensAtTheLineHoldingTheOldPageStart) {
+  PreviewBook book;
+  struct Start { uint32_t offset; std::string word; };
+  std::vector<Start> starts;
+  {
+    Section old(book.epub, 0, book.renderer);
+    ASSERT_TRUE(old.createSectionFile(book.narrow));
+    ASSERT_GT(old.pageCount, 12);
+    for (uint16_t k = 1; k < old.pageCount; ++k) {
+      auto page = old.loadPage(k);
+      ASSERT_TRUE(page);
+      const auto lines = pageLines(*page);
+      ASSERT_FALSE(lines.empty());
+      starts.push_back({*old.getVisibleTextOffsetForPage(k), lines[0].substr(0, lines[0].find(' '))});
+    }
+  }
+  ASSERT_TRUE(std::filesystem::exists(book.root / "sections/0.dd"));
+  const auto wideLines = book.allLines(book.wide);
+  ASSERT_FALSE(wideLines.empty());
+  for (const auto& start : starts) {
+    Section section(book.epub, 0, book.renderer);
+    auto page = section.previewPage(book.wide, start.offset);
+    ASSERT_TRUE(page) << "offset " << start.offset;
+    EXPECT_LE(page->visibleTextOffset, start.offset);
+    const auto lines = pageLines(*page);
+    ASSERT_FALSE(lines.empty());
+    EXPECT_TRUE(hasWord(lines[0], start.word)) << "first line '" << lines[0] << "' lacks " << start.word;
+    const auto at = std::find(wideLines.begin(), wideLines.end(), lines[0]);
+    ASSERT_NE(at, wideLines.end()) << lines[0];
+    for (size_t i = 0; i < lines.size() && at + i != wideLines.end(); ++i) EXPECT_EQ(lines[i], *(at + i));
+  }
+}
+
+TEST(PreviewPage, NoResumePointsNoPreview) {
+  PreviewBook book;
+  uint32_t offset = 0;
+  {
+    Section old(book.epub, 0, book.renderer);
+    ASSERT_TRUE(old.createSectionFile(book.narrow));
+    offset = *old.getVisibleTextOffsetForPage(5);
+  }
+  std::filesystem::remove(book.root / "sections/0.dd");
+  Section section(book.epub, 0, book.renderer);
+  EXPECT_FALSE(section.previewPage(book.wide, offset));
+  // A build under other settings does not bring them back: only one from the chapter top writes them,
+  // and that is the same build whatever the settings.
+  ASSERT_TRUE(section.createSectionFile(book.wide));
+  EXPECT_TRUE(std::filesystem::exists(book.root / "sections/0.dd"));
+  Section again(book.epub, 0, book.renderer);
+  EXPECT_TRUE(again.previewPage(book.narrow, offset));
+}
+
+TEST(PreviewPage, FirstPageWithoutResumeIndexFitsSheetHeapBudget) {
+  PreviewBook book;
+  book.epub->contents = "<html><body><div>";
+  for (int p = 0; p < 1000; ++p)
+    book.epub->contents += "<p>alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu</p>";
+  book.epub->contents += "</div></body></html>";
+  std::vector<std::string> expected;
+  {
+    Section old(book.epub, 0, book.renderer);
+    ASSERT_TRUE(old.createSectionFile(book.wide));
+    auto first = old.loadPage(0);
+    ASSERT_TRUE(first);
+    expected = pageLines(*first);
+  }
+  std::filesystem::remove(book.root / "sections/0.dd");
+  Section section(book.epub, 0, book.renderer);
+  allocationProbe::live = allocationProbe::peak = 0;
+  allocationProbe::calls = allocationProbe::largest = allocationProbe::rejected = 0;
+  allocationProbe::liveLimit = 70 * 1024;
+  allocationProbe::requestLimit = 40948;
+  allocationProbe::enabled = true;
+  std::unique_ptr<Page> page;
+  try {
+    page = section.previewPage(book.wide, 0);
+  } catch (...) {
+    allocationProbe::enabled = false;
+    allocationProbe::liveLimit = allocationProbe::requestLimit = 0;
+    throw;
+  }
+  allocationProbe::enabled = false;
+  allocationProbe::liveLimit = allocationProbe::requestLimit = 0;
+  std::cout << "PREVIEW_NO_DD peak=" << allocationProbe::peak << " largest=" << allocationProbe::largest
+            << " rejected=" << allocationProbe::rejected << '\n';
+  ASSERT_TRUE(page);
+  EXPECT_EQ(pageLines(*page), expected);
+  EXPECT_EQ(page->visibleTextOffset, 0u);
+  EXPECT_EQ(allocationProbe::rejected, 0u);
+  EXPECT_FALSE(std::filesystem::exists(book.root / "sections/0.dd"));
+  EXPECT_FALSE(section.isBuilding());
+}
+
+TEST(PreviewPage, FallbackParserReleasesHeapAndKeepsPageWhenParked) {
+  PreviewBook book;
+  Section section(book.epub, 0, book.renderer);
+#ifdef __APPLE__
+  const auto heapUsed = [] {
+    malloc_statistics_t stats{};
+    malloc_zone_statistics(nullptr, &stats);
+    return stats.size_in_use;
+  };
+  const size_t heapBefore = heapUsed();
+#endif
+  allocationProbe::live = allocationProbe::peak = 0;
+  allocationProbe::enabled = true;
+  const bool started = section.startBuild(book.wide);
+  const bool built = started && section.buildSomeMore(8);
+  const long active = allocationProbe::live;
+#ifdef __APPLE__
+  const size_t heapActive = heapUsed();
+#endif
+  const bool parked = built && section.parkBuild();
+  const long after = allocationProbe::live;
+  allocationProbe::enabled = false;
+#ifdef __APPLE__
+  const size_t heapAfter = heapUsed();
+  std::cout << "FALLBACK_ALL_HEAP active=" << heapActive - heapBefore << " parked=" << heapAfter - heapBefore
+            << " released=" << heapActive - heapAfter << '\n';
+#endif
+  std::cout << "FALLBACK_PARSER active=" << active << " parked=" << after << " released=" << active - after << '\n';
+  ASSERT_TRUE(parked);
+  ASSERT_TRUE(section.isBuildParked());
+  EXPECT_GT(active, after);
+  const auto page = section.loadPage(0);
+  ASSERT_TRUE(page);
+  EXPECT_FALSE(pageLines(*page).empty());
+  EXPECT_EQ(page->visibleTextOffset, 0u);
+}
+
+TEST(PreviewPage, KeepsParagraphGapAfterTheHeldFinalLine) {
+  PreviewBook book;
+  book.epub->contents = "<html><body><p>BEFORE</p><p>ANCHOR</p><p>AFTER</p></body></html>";
+  book.narrow.viewportWidth = 240;
+  book.narrow.viewportHeight = 18;
+  uint32_t target = 0;
+  {
+    Section old(book.epub, 0, book.renderer);
+    ASSERT_TRUE(old.createSectionFile(book.narrow));
+    for (uint16_t i = 0; i < old.pageCount; ++i) {
+      auto page = old.loadPage(i);
+      ASSERT_TRUE(page);
+      const auto lines = pageLines(*page);
+      if (!lines.empty() && lines.front() == "ANCHOR") target = *old.getVisibleTextOffsetForPage(i);
+    }
+  }
+  ASSERT_GT(target, 0u);
+  book.wide.viewportHeight = 400;
+  book.wide.lineCompression = 1.0f;
+  book.wide.extraParagraphSpacing = readerSpacing::VERY_WIDE;
+  Section full(book.epub, 0, book.renderer);
+  ASSERT_TRUE(full.createSectionFile(book.wide));
+  auto reference = full.loadPage(0);
+  ASSERT_TRUE(reference);
+  ASSERT_EQ(pageLines(*reference), (std::vector<std::string>{"BEFORE", "ANCHOR", "AFTER"}));
+  Section section(book.epub, 0, book.renderer);
+  auto preview = section.previewPage(book.wide, target);
+  ASSERT_TRUE(preview);
+  EXPECT_EQ(pageLines(*preview), (std::vector<std::string>{"ANCHOR", "AFTER"}));
+  ASSERT_EQ(preview->elements.size(), 2u);
+  const int referenceGap = reference->elements[2]->yPos - reference->elements[1]->yPos;
+  const int previewGap = preview->elements[1]->yPos - preview->elements[0]->yPos;
+  std::cout << "HELD_GAP reference=" << referenceGap << " preview=" << previewGap << '\n';
+  EXPECT_EQ(previewGap, referenceGap);
+}
+
+TEST(PreviewPage, KeepsImageAndCssMarginsAfterTheHeldFinalLine) {
+  struct EnableImages {
+    EnableImages() { parserImageFixture::enabled = true; }
+    ~EnableImages() { parserImageFixture::enabled = false; }
+  } enableImages;
+  PreviewBook book;
+  CssParser css(book.root.string());
+  book.epub->cssParser = &css;
+  const uint8_t png[] = {0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 13,
+                         'I', 'H', 'D', 'R', 0, 0, 0, 32, 0, 0, 0, 24};
+  for (const char* path : {"before.png", "after.png"}) {
+    book.epub->images[path] = std::string(reinterpret_cast<const char*>(png), sizeof(png));
+  }
+  book.epub->contents = "<html><body><p>BEFORE</p><img src=\"before.png\"/>"
+                        "<p style=\"margin-bottom:11px\">ANCHOR</p>"
+                        "<div style=\"margin-top:9px;margin-bottom:13px\"><img src=\"after.png\"/></div>"
+                        "<p style=\"margin-top:7px\">AFTER</p></body></html>";
+  book.narrow.embeddedStyle = true;
+  book.narrow.viewportWidth = 240;
+  book.narrow.viewportHeight = 18;
+  uint32_t target = 0;
+  {
+    Section old(book.epub, 0, book.renderer);
+    ASSERT_TRUE(old.createSectionFile(book.narrow));
+    for (uint16_t i = 0; i < old.pageCount; ++i) {
+      auto page = old.loadPage(i);
+      ASSERT_TRUE(page);
+      const auto lines = pageLines(*page);
+      if (!lines.empty() && lines.front() == "ANCHOR") target = *old.getVisibleTextOffsetForPage(i);
+    }
+  }
+  ASSERT_GT(target, 0u);
+  book.wide = book.narrow;
+  book.wide.viewportHeight = 400;
+  book.wide.extraParagraphSpacing = readerSpacing::VERY_WIDE;
+  Section full(book.epub, 0, book.renderer);
+  ASSERT_TRUE(full.createSectionFile(book.wide));
+  auto reference = full.loadPage(0);
+  ASSERT_TRUE(reference);
+  ASSERT_EQ(reference->elements.size(), 5u);
+  ASSERT_EQ(reference->elements[1]->getTag(), TAG_PageImage);
+  ASSERT_EQ(reference->elements[2]->getTag(), TAG_PageLine);
+  ASSERT_EQ(reference->elements[3]->getTag(), TAG_PageImage);
+  for (const uint32_t start : {target, target + 1, target + 5}) {
+    SCOPED_TRACE(start);
+    Section section(book.epub, 0, book.renderer);
+    auto preview = section.previewPage(book.wide, start);
+    ASSERT_TRUE(preview);
+    EXPECT_EQ(pageLines(*preview), (std::vector<std::string>{"ANCHOR", "AFTER"}));
+    ASSERT_EQ(preview->elements.size(), 3u);
+    for (size_t i = 0; i < preview->elements.size(); ++i) {
+      EXPECT_EQ(preview->elements[i]->getTag(), reference->elements[i + 2]->getTag());
+      EXPECT_EQ(preview->elements[i]->xPos, reference->elements[i + 2]->xPos);
+      EXPECT_EQ(preview->elements[i]->yPos,
+                reference->elements[i + 2]->yPos - reference->elements[2]->yPos);
+    }
+    const auto& image = static_cast<const PageImage&>(*preview->elements[1]).getImageBlock();
+    EXPECT_TRUE(image.getImagePath().ends_with("img_0_1.png"));
+    EXPECT_EQ(image.getWidth(), 32);
+    EXPECT_EQ(image.getHeight(), 24);
+    std::cout << "HELD_IMAGE target=" << start << " image_y=" << preview->elements[1]->yPos
+              << " after_y=" << preview->elements[2]->yPos << '\n';
+  }
+  for (const uint32_t start : {target + 6, target + 10}) {  // next-paragraph boundary and chapter's last line
+    Section section(book.epub, 0, book.renderer);
+    auto preview = section.previewPage(book.wide, start);
+    ASSERT_TRUE(preview);
+    EXPECT_EQ(pageLines(*preview), (std::vector<std::string>{"AFTER"}));
+    ASSERT_EQ(preview->elements.size(), 1u);
+    EXPECT_EQ(preview->elements.front()->yPos, 0);
+  }
+  book.wide.viewportHeight = 96;
+  Section shortPage(book.epub, 0, book.renderer);
+  auto preview = shortPage.previewPage(book.wide, target);
+  ASSERT_TRUE(preview);
+  EXPECT_EQ(pageLines(*preview), (std::vector<std::string>{"ANCHOR"}));
+  ASSERT_EQ(preview->elements.size(), 2u);
+  EXPECT_EQ(preview->elements[1]->getTag(), TAG_PageImage);
+  EXPECT_EQ(preview->elements[1]->yPos, 36);
+}
+
+TEST(PreviewPage, CorruptDdLengthsFailBeforeAllocation) {
+  PreviewBook book;
+  // A valid long prolog lets the combined-bound case replay valid XML on the old reader.
+  std::string prolog = "<?xml version=\"1.0\"?>\n";
+  prolog.resize(1024, ' ');
+  book.epub->contents.insert(0, prolog);
+  Section old(book.epub, 0, book.renderer);
+  ASSERT_TRUE(old.createSectionFile(book.narrow));
+  const auto ddPath = book.root / "sections/0.dd";
+  const auto htmlPath = book.root / "html/0.html";
+  const auto valid = bytes(ddPath);
+  const auto html = bytes(htmlPath);
+  const auto cache = bytes(book.root / "sections/0.bin");
+  ASSERT_GE(valid.size(), 28u);
+  const uint32_t target = pod<uint32_t>(valid, 20) + 1;
+  struct Damage {
+    const char* name;
+    uint16_t prolog, length;
+    uint32_t records;
+    std::string prefix;
+    size_t allocationLimit;
+    bool shortHtml = false;
+    bool preview = false;
+  };
+  std::string longPrefix = "<html data-test=\"";
+  longPrefix.append(1025 - longPrefix.size() - std::string("\"><body><div>").size(), 'a');
+  longPrefix += "\"><body><div>";
+  std::string maxPrefix = longPrefix;
+  maxPrefix.erase(maxPrefix.find("aaa"), 1);
+  const Damage damage[] = {
+      {"prolog65535", UINT16_MAX, 17, 1, "<html><body><div>", 2049},
+      {"prefix65535", 1024, UINT16_MAX, 1, std::string(UINT16_MAX, 'a'), 2049},
+      {"truncatedPrefix", 0, 1900, 160, "x", 1900},
+      {"combined2049", 1024, 1025, 1, longPrefix, 2049},
+      {"recordCountOverflow", 1024, 17, UINT32_MAX, "<html><body><div>", 2049},
+      {"prologPastHtml", 1024, 17, 1, "<html><body><div>", 1024, true},
+      {"validCombined2048", 1024, 1024, 1, maxPrefix, SIZE_MAX, false, true},
+  };
+  for (const auto& item : damage) {
+    SCOPED_TRACE(item.name);
+    std::string damaged = valid.substr(0, 16);
+    const uint32_t htmlSize = item.shortHtml ? 64 : html.size();
+    memcpy(damaged.data() + 4, &htmlSize, sizeof(htmlSize));
+    memcpy(damaged.data() + 8, &item.records, sizeof(item.records));
+    memcpy(damaged.data() + 12, &item.prolog, sizeof(item.prolog));
+    damaged[14] = 1;
+    std::string record = valid.substr(16, 12);
+    record[10] = 0;
+    for (uint32_t i = 0; i < (item.records == UINT32_MAX ? 1 : item.records); ++i) damaged += record;
+    damaged.append(reinterpret_cast<const char*>(&item.length), sizeof(item.length));
+    damaged += item.prefix;
+    std::ofstream(ddPath, std::ios::binary | std::ios::trunc).write(damaged.data(), damaged.size());
+    std::ofstream(htmlPath, std::ios::binary | std::ios::trunc).write(html.data(), htmlSize);
+    Section section(book.epub, 0, book.renderer);
+    allocationProbe::largest = 0;
+    allocationProbe::enabled = true;
+    auto page = section.previewPage(book.wide, target);
+    allocationProbe::enabled = false;
+    const size_t largest = allocationProbe::largest;
+    std::cout << "DD_BOUNDS name=" << item.name << " largest=" << largest << " preview=" << bool(page) << '\n';
+    EXPECT_EQ(bool(page), item.preview);
+    EXPECT_LT(largest, item.allocationLimit);
+    EXPECT_EQ(bytes(ddPath), damaged);
+    EXPECT_EQ(bytes(htmlPath), html.substr(0, htmlSize));
+    EXPECT_EQ(bytes(book.root / "sections/0.bin"), cache);
+  }
+}
+
+TEST(PreviewPage, DdSeedRejectsOversizedPrefixBeforeAllocation) {
+  PreviewBook book;
+  {
+    Section partial(book.epub, 0, book.renderer);
+    ASSERT_TRUE(partial.startBuild(book.narrow));
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(partial.buildSomeMore(1));
+    partial.suspendBuild();
+    ASSERT_TRUE(partial.isPartial());
+  }
+  const auto cachePath = book.root / "sections/0.bin";
+  const auto ddPath = book.root / "sections/0.dd";
+  const auto cache = bytes(cachePath);
+  std::string damaged = bytes(ddPath);
+  ASSERT_GE(damaged.size(), 16u);
+  const size_t prefixAt = 16 + 12u * pod<uint32_t>(damaged, 8);
+  ASSERT_LT(prefixAt + 2, damaged.size());
+  const uint16_t length = UINT16_MAX;
+  damaged.resize(prefixAt + 2);
+  damaged[14] = 1;
+  damaged[15] = 0;
+  memcpy(damaged.data() + prefixAt, &length, sizeof(length));
+  damaged.append(length, 'x');
+  std::ofstream(ddPath, std::ios::binary | std::ios::trunc).write(damaged.data(), damaged.size());
+  Section resumed(book.epub, 0, book.renderer);
+  ASSERT_TRUE(resumed.loadSectionFile(book.narrow));
+  allocationProbe::largest = 0;
+  allocationProbe::enabled = true;
+  const bool started = resumed.startBuild(book.narrow);
+  allocationProbe::enabled = false;
+  const auto largest = allocationProbe::largest;
+  EXPECT_TRUE(started);
+  EXPECT_LT(largest, size_t(UINT16_MAX));
+  EXPECT_EQ(bytes(cachePath), cache);
+  EXPECT_EQ(bytes(ddPath), damaged);
+  std::cout << "DD_SEED_BOUND prefix=" << length << " largest=" << largest << " started=" << started << '\n';
+}
+
+TEST(PreviewPage, DdSeedHeapRefusalKeepsPartialAndRetries) {
+  PreviewBook book;
+  book.epub->contents.insert(5, " data-test=\"" + std::string(1000, 'a') + "\"");
+  {
+    Section partial(book.epub, 0, book.renderer);
+    ASSERT_TRUE(partial.startBuild(book.narrow));
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(partial.buildSomeMore(1));
+    partial.suspendBuild();
+    ASSERT_TRUE(partial.isPartial());
+  }
+  const auto cachePath = book.root / "sections/0.bin";
+  const auto ddPath = book.root / "sections/0.dd";
+  const auto cache = bytes(cachePath);
+  const auto dd = bytes(ddPath);
+  ASSERT_GT(dd.size(), 16u);
+  const size_t prefixAt = 16 + 12u * pod<uint32_t>(dd, 8);
+  const auto length = pod<uint16_t>(dd, prefixAt);
+  ASSERT_GT(length, 1000u);
+  Section resumed(book.epub, 0, book.renderer);
+  ASSERT_TRUE(resumed.loadSectionFile(book.narrow));
+  const auto watermark = resumed.pageCount;
+  ESP.maxAlloc = 8180 + length + 1;
+  const bool started = resumed.startBuild(book.narrow);
+  const bool starved = resumed.buildStarved();
+  ESP = {};
+  EXPECT_FALSE(started);
+  EXPECT_TRUE(starved);
+  EXPECT_FALSE(resumed.isBuilding());
+  EXPECT_EQ(resumed.pageCount, watermark);
+  EXPECT_EQ(bytes(cachePath), cache);
+  EXPECT_EQ(bytes(ddPath), dd);
+  EXPECT_FALSE(std::filesystem::exists(book.root / "sections/0.dd.part"));
+  EXPECT_FALSE(std::filesystem::exists(book.root / "sections/0.bin.part"));
+  if (started) resumed.abandonBuild();
+  ASSERT_TRUE(resumed.startBuild(book.narrow));
+  while (!resumed.isBuildComplete()) ASSERT_TRUE(resumed.buildSomeMore(8));
+  const auto final = bytes(cachePath);
+  {
+    Section cold(book.epub, 0, book.renderer);
+    ASSERT_TRUE(cold.createSectionFile(book.narrow));
+  }
+  EXPECT_EQ(bytes(cachePath), final);
+  std::cout << "DD_SEED_HEAP prefix=" << length << " started=" << started << " starved=" << starved
+            << " watermark=" << watermark << " final_bytes=" << final.size() << '\n';
+}
+
+TEST(PreviewPage, DdGrowthHeapRefusalParksAndResumesExactPages) {
+  PreviewBook book;
+  book.epub->contents = "<html><body><div>";
+  for (int i = 0; i < 180; ++i) {
+    if (i == 100) book.epub->contents += "<div data-dd=\"" + std::string(1000, 'a') + "\">";
+    book.epub->contents += "<p>";
+    for (int w = 0; w < 24; ++w) book.epub->contents += "word" + std::to_string(i) + " ";
+    book.epub->contents += "</p>";
+  }
+  book.epub->contents += "</div></div></body></html>";
+  Section build(book.epub, 0, book.renderer);
+  ASSERT_TRUE(build.startBuild(book.narrow));
+  while (build.pageCount < 4) ASSERT_TRUE(build.buildSomeMore(1));
+  ASSERT_TRUE(build.parkBuild());
+  ASSERT_TRUE(build.isBuildParked());
+  storageFault::heapDrops = 0;
+  storageFault::dropHeapOnDd = true;
+  bool advanced = true;
+  for (unsigned ticks = 0; advanced && !build.isBuildComplete() && ticks < 1000; ++ticks)
+    advanced = build.buildSomeMore(1);
+  const bool starved = build.buildStarved();
+  const bool parked = build.isBuildParked();
+  const auto drops = storageFault::heapDrops;
+  const auto watermark = build.pageCount;
+  storageFault::dropHeapOnDd = false;
+  ESP = {};
+  EXPECT_EQ(drops, 1u);
+  EXPECT_FALSE(advanced);
+  EXPECT_TRUE(starved);
+  EXPECT_TRUE(parked);
+  EXPECT_GT(watermark, 4u);
+  EXPECT_TRUE(std::filesystem::exists(book.root / "sections/0.bin.checkpoint.part"));
+  while (!build.isBuildComplete()) ASSERT_TRUE(build.buildSomeMore(8));
+  const auto final = bytes(book.root / "sections/0.bin");
+  {
+    Section cold(book.epub, 0, book.renderer);
+    ASSERT_TRUE(cold.createSectionFile(book.narrow));
+  }
+  EXPECT_EQ(bytes(book.root / "sections/0.bin"), final);
+  std::cout << "DD_GROWTH_HEAP drops=" << drops << " starved=" << starved << " parked=" << parked
+            << " watermark=" << watermark << " final_bytes=" << final.size() << '\n';
+}
+
+TEST(PreviewPage, DdPreviewRefusesHeapBeforeReplayAllocation) {
+  PreviewBook book;
+  book.epub->contents.insert(5, " data-test=\"" + std::string(1000, 'a') + "\"");
+  {
+    Section complete(book.epub, 0, book.renderer);
+    ASSERT_TRUE(complete.createSectionFile(book.narrow));
+  }
+  const auto dd = bytes(book.root / "sections/0.dd");
+  const auto cache = bytes(book.root / "sections/0.bin");
+  const uint32_t target = pod<uint32_t>(dd, 20) + 1;
+  ASSERT_GT(target, 0u);
+  const size_t prefixAt = 16 + 12u * pod<uint32_t>(dd, 8);
+  const auto length = pod<uint16_t>(dd, prefixAt);
+  ASSERT_GT(length, 1000u);
+  Section preview(book.epub, 0, book.renderer);
+  ESP.maxAlloc = 8180 + length;
+  allocationProbe::largest = 0;
+  allocationProbe::enabled = true;
+  auto page = preview.previewPage(book.wide, target);
+  allocationProbe::enabled = false;
+  const auto largest = allocationProbe::largest;
+  ESP = {};
+  EXPECT_FALSE(page);
+  EXPECT_LT(largest, length);
+  EXPECT_EQ(bytes(book.root / "sections/0.dd"), dd);
+  EXPECT_EQ(bytes(book.root / "sections/0.bin"), cache);
+  ASSERT_TRUE(preview.previewPage(book.wide, target));
+  std::cout << "DD_PREVIEW_HEAP prefix=" << length << " largest=" << largest << '\n';
+}
+
+TEST(PreviewPage, AbandonedBuildKeepsItsPointsAndTheCommittedCache) {
+  PreviewBook book;
+  {
+    Section old(book.epub, 0, book.renderer);
+    ASSERT_TRUE(old.createSectionFile(book.narrow));
+  }
+  const auto kept = bytes(book.root / "sections/0.dd");
+  std::filesystem::remove(book.root / "sections/0.dd");
+  std::filesystem::copy_file(book.root / "sections/0.bin", book.root / "keep.bin");
+  {
+    Section build(book.epub, 0, book.renderer);
+    ASSERT_TRUE(build.startBuild(book.wide));
+    for (int i = 0; i < 6; ++i) ASSERT_TRUE(build.buildSomeMore(1));
+    build.abandonBuild();
+  }
+  // The points found before the stop are kept (they do not depend on the layout), the staging files go.
+  EXPECT_TRUE(std::filesystem::exists(book.root / "sections/0.dd"));
+  EXPECT_LT(std::filesystem::file_size(book.root / "sections/0.dd"), kept.size());
+  EXPECT_FALSE(std::filesystem::exists(book.root / "sections/0.dd.part"));
+  EXPECT_FALSE(std::filesystem::exists(book.root / "sections/0.bin.part"));
+  EXPECT_EQ(bytes(book.root / "sections/0.bin"), bytes(book.root / "keep.bin")) << "the committed cache changed";
+  EXPECT_FALSE(kept.empty());
+}
+
+// Heap and time of the preview page against laying the chapter out to the same place, printed for the
+// research notes (not a gate: host pointers are twice the X3's).
+TEST(PreviewPage, HeapAndTimeAgainstLayingOutToThePage) {
+  PreviewBook book;
+  book.epub->contents = "<html><body><div>";
+  for (int p = 0; p < 400; ++p) {
+    book.epub->contents += "<p>";
+    for (int w = 0; w < 30; ++w) book.epub->contents += "p" + std::to_string(p) + "w" + std::to_string(w) + " ";
+    book.epub->contents += "</p>";
+  }
+  book.epub->contents += "</div></body></html>";
+  uint32_t offset = 0;
+  uint16_t pages = 0;
+  {
+    Section old(book.epub, 0, book.renderer);
+    ASSERT_TRUE(old.createSectionFile(book.narrow));
+    pages = old.pageCount;
+    offset = *old.getVisibleTextOffsetForPage(pages * 9 / 10);
+  }
+  const auto measure = [](auto&& work) {
+    allocationProbe::live = allocationProbe::peak = 0;
+    allocationProbe::calls = allocationProbe::largest = 0;
+    allocationProbe::enabled = true;
+    const auto started = std::chrono::steady_clock::now();
+    const bool ok = work();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    allocationProbe::enabled = false;
+    return std::make_tuple(ok, allocationProbe::peak, ms);
+  };
+  const auto [previewOk, previewPeak, previewMs] = measure([&] {
+    Section section(book.epub, 0, book.renderer);
+    return static_cast<bool>(section.previewPage(book.wide, offset));
+  });
+  const size_t previewCalls = allocationProbe::calls;
+  const size_t previewLargest = allocationProbe::largest;
+  const auto [buildOk, buildPeak, buildMs] = measure([&] {
+    Section section(book.epub, 0, book.renderer);
+    if (!section.startBuild(book.wide)) return false;
+    while (!section.isBuildComplete() && !section.buildReachedVisibleTextOffset(offset))
+      if (!section.buildSomeMore(1)) return false;
+    section.abandonBuild();
+    return true;
+  });
+  ASSERT_TRUE(previewOk);
+  ASSERT_TRUE(buildOk);
+  std::cout << "PREVIEW_COST pages=" << pages << " page=" << pages * 9 / 10 << " preview_peak=" << previewPeak
+            << " preview_calls=" << previewCalls << " preview_largest=" << previewLargest
+            << " preview_ms=" << previewMs << " build_to_page_peak=" << buildPeak << " build_to_page_ms=" << buildMs
+            << "\n";
+  EXPECT_LT(previewMs, buildMs);
+}
+
+// A chapter entered by a turn starts as a few pages laid out on a quiet pass and suspended (the
+// next-chapter look-ahead), and is laid out further from that partial. The resume points must
+// cover the pages laid out after the partial too, or a text change deep in it has no point near.
+TEST(PreviewPage, PointsGrowAcrossAResumedPartial) {
+  PreviewBook book;
+  uint16_t pages = 0;
+  {
+    Section first(book.epub, 0, book.renderer);
+    ASSERT_TRUE(first.startBuild(book.narrow));
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(first.buildSomeMore(1));
+    first.suspendBuild();
+    ASSERT_TRUE(first.isPartial());
+  }
+  {
+    Section resumed(book.epub, 0, book.renderer);
+    ASSERT_TRUE(resumed.loadSectionFile(book.narrow));
+    ASSERT_TRUE(resumed.isPartial());
+    ASSERT_TRUE(resumed.startBuild(book.narrow));
+    while (!resumed.isBuildComplete()) ASSERT_TRUE(resumed.buildSomeMore(8));
+    pages = resumed.pageCount;
+  }
+  const auto raw = bytes(book.root / "sections/0.dd");
+  ASSERT_GE(raw.size(), 16u);
+  uint32_t count = 0;
+  memcpy(&count, raw.data() + 8, 4);
+  std::cout << "DD_RESUMED pages=" << pages << " points=" << count << "\n";
+  EXPECT_GE(count, pages / 2u) << "points stop where the partial stopped";
+}
+
+TEST(AllocationProbe, ArrayDeleteGivesBackWhatArrayNewCounted) {
+  allocationProbe::enabled = true;
+  const long before = allocationProbe::live;
+  char* volatile block = new char[64];
+  delete[] block;
+  const long after = allocationProbe::live;
+  allocationProbe::enabled = false;
+  EXPECT_EQ(after, before);
 }

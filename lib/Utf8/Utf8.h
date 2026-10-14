@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #define REPLACEMENT_GLYPH 0xFFFD
@@ -12,6 +13,47 @@ size_t utf8RemoveLastChar(std::string& str);
 // Truncate string by removing N UTF-8 codepoints from the end.
 void utf8TruncateChars(std::string& str, size_t numChars);
 
+// Keep both ends of a UTF-8 label when it exceeds a measured width. The
+// callback receives a complete candidate string and returns its pixel width.
+template <typename Measure>
+std::string utf8MiddleEllipsis(const std::string& input, const int maxWidth, Measure&& measure) {
+  if (input.empty() || maxWidth <= 0) return {};
+  if (measure(input.c_str()) <= maxWidth) return input;
+
+  constexpr const char* ellipsis = "\xE2\x80\xA6";
+  if (measure(ellipsis) > maxWidth) return {};
+
+  const auto* begin = reinterpret_cast<const unsigned char*>(input.c_str());
+  const auto* cursor = begin;
+  int chars = 0;
+  while (*cursor) {
+    utf8NextCodepoint(&cursor);
+    ++chars;
+  }
+  if (chars < 3) return ellipsis;
+
+  const auto offsetAfterChars = [&](const int count) {
+    const auto* at = begin;
+    for (int i = 0; i < count && *at; ++i) utf8NextCodepoint(&at);
+    return static_cast<size_t>(at - begin);
+  };
+  const int minHead = chars >= 6 ? 2 : 1;
+  const int minTail = chars >= 6 ? 2 : 1;
+  std::string candidate;
+  candidate.reserve(input.size() + 3);
+  for (int kept = chars - 1; kept >= minHead + minTail; --kept) {
+    const int headChars = std::clamp((kept * 2 + 4) / 5, minHead, kept - minTail);
+    const int tailChars = kept - headChars;
+    const size_t headOffset = offsetAfterChars(headChars);
+    const size_t tailOffset = offsetAfterChars(chars - tailChars);
+    candidate.assign(input, 0, headOffset);
+    candidate += ellipsis;
+    candidate.append(input, tailOffset, std::string::npos);
+    if (measure(candidate.c_str()) <= maxWidth) return candidate;
+  }
+  return ellipsis;
+}
+
 // Canonical composition (NFC) for the Latin / Vietnamese range and Hangul:
 // precomposes a base letter followed by combining diacritical mark(s), and
 // conjoining Hangul jamo sequences (L+V[+T]), into single codepoints. Needed
@@ -20,14 +62,31 @@ void utf8TruncateChars(std::string& str, size_t numChars);
 // filename written by macOS) otherwise renders broken or blank.
 std::string utf8ComposeNfc(const std::string& in);
 
+// Compose a null-terminated display buffer without allocating or growing it.
+// Uncomposed bytes (including malformed UTF-8) are preserved unchanged.
+void utf8ComposeNfcInPlace(char* buffer);
+
+// The base letter a precomposed codepoint decomposes to, or 0 when there is
+// none ("é" -> "e", but "ø" -> 0: it is a letter in its own right, not
+// o-with-stroke). Lives here rather than in a caller because the compose table
+// is a ~5 KB static array in the header: a second includer is a second copy in
+// flash.
+//
+// A linear scan, unlike utf8ComposePair's binary search above it: the table is
+// sorted by (base, mark), which this lookup searches against the grain. Adding
+// a second table sorted by composed would cost more flash than sharing this one
+// saves.
+uint32_t utf8DecomposedBase(uint32_t cp);
+
 // Truncate a raw char buffer to the last complete UTF-8 codepoint boundary.
 // Returns the new length (<= len). If the buffer ends mid-sequence, the
 // incomplete trailing bytes are excluded.
 int utf8SafeTruncateBuffer(const char* buf, int len);
 
-// Returns true for CJK characters that allow line breaks on either side without hyphenation.
-// Covers CJK Unified Ideographs, Hiragana, Katakana, Hangul Syllables, CJK punctuation,
-// and fullwidth forms — the ranges where word boundaries are implicit per character.
+// Returns true for CJK characters that break without hyphenation. Covers CJK Unified Ideographs,
+// Hiragana, Katakana, Hangul, CJK punctuation, and fullwidth forms. Han and Kana have implicit
+// word boundaries per character; Hangul is space-delimited, so layout keeps Hangul words whole
+// (see utf8IsHangul) and splits one without a hyphen only through the hyphenation path.
 inline bool utf8IsCjkBreakable(const uint32_t cp) {
   return (cp >= 0x1100 && cp <= 0x11FF)        // Hangul Jamo
          || (cp >= 0x3000 && cp <= 0x303F)     // CJK Symbols and Punctuation
@@ -44,6 +103,16 @@ inline bool utf8IsCjkBreakable(const uint32_t cp) {
          || (cp >= 0xFF65 && cp <= 0xFFEF)     // Halfwidth Katakana / Hangul
          || (cp >= 0x20000 && cp <= 0x2A6DF)   // CJK Extension B
          || (cp >= 0x2A700 && cp <= 0x2B73F);  // CJK Extension C
+}
+
+// Returns true for Hangul letters. Korean separates words with spaces, so a boundary touching
+// Hangul is never an implicit line-break opportunity (CSS word-break: keep-all).
+inline bool utf8IsHangul(const uint32_t cp) {
+  return (cp >= 0x1100 && cp <= 0x11FF)      // Hangul Jamo
+         || (cp >= 0x3130 && cp <= 0x318F)   // Hangul Compatibility Jamo
+         || (cp >= 0xA960 && cp <= 0xA97F)   // Hangul Jamo Extended-A
+         || (cp >= 0xAC00 && cp <= 0xD7FF)   // Hangul Syllables, Hangul Jamo Extended-B
+         || (cp >= 0xFFA0 && cp <= 0xFFDC);  // Halfwidth Hangul
 }
 
 // Returns true for any codepoint in a CJK script block (Han, Kana, Hangul, Bopomofo,

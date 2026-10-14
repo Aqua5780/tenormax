@@ -89,7 +89,7 @@ class HomeRecentCardTest(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / 'test/epubs' / epub, target)
         covers = f'/.crosspoint/home-covers/{book_key(path):08x}_[HEIGHT].bmp'
-        cover(self.sd / covers.lstrip('/').replace('[HEIGHT]', '356'), title.split(':')[0], 356)
+        cover(self.sd / covers.lstrip('/').replace('[HEIGHT]', '450'), title.split(':')[0], 450)
         return {'path': path, 'title': title, 'author': author, 'coverBmpPath': covers, 'excerpt': excerpt}
 
     def write_recent(self, books):
@@ -135,8 +135,8 @@ class HomeRecentCardTest(unittest.TestCase):
 
     # Regions of the default X3 card (528 x 792): cover, text block, other-book row, left arrow,
     # the footer tip lane the pin hint used, and the four footer hint cells.
-    COVER = (24, 124, 260, 480)
-    TEXT = (40, 498, 488, 712)
+    COVER = (24, 124, 322, 574)
+    TEXT = (24, 590, 504, 712)
     ROW = (40, 712, 488, 756)
     LEFT_ARROW = (10, 722, 30, 756)
     FOOTER = (0, 756, 528, 792)
@@ -232,9 +232,9 @@ class HomeRecentCardTest(unittest.TestCase):
         card = images['second']
         last = card.width - 1
         # The rule is the full-width line above the row; the row's arrows are measured under it.
-        rule = next(y for y in range(700, 760)
+        rule = next(y for y in range(600, 760)
                     if sum(card.getpixel((x, y)) < 128 for x in range(card.width)) > 400)
-        (l0, l1), (r0, r1), label, title = self.edge_runs(card, rule + 2, 756)
+        (l0, l1), (r0, r1), label, title = self.edge_runs(card, rule + 2, rule + 36)
         self.assertEqual((l0, last - r1), (l0, l0), f'row arrows: left x {l0}..{l1}, right x {r0}..{r1}')
         self.assertEqual(l1 - l0, r1 - r0, 'row arrows differ in width')
         # The title keeps the label's distance from its arrow, within a glyph's side bearing.
@@ -256,12 +256,48 @@ class HomeRecentCardTest(unittest.TestCase):
                 runs[-1][1] = top + offset
         return [tuple(run) for run in runs]
 
+    def assert_card_title_clear(self, card, size, title_lines, name):
+        base = {0: 25, 1: 28, 2: 31}
+        rule = next(y for y in range(600, 780)
+                    if sum(card.getpixel((x, y)) < 128 for x in range(card.width)) > 400)
+        if size:
+            # Approved X3 enlarged layout: metadata is above the cover in the left column.
+            # Exclude the stats and the tab band; right is the exclusive cover edge.
+            right, top = {1: (254, 137), 2: (249, 147)}[size]
+            column = card.crop((0, 0, right + 24, card.height))
+            runs = self.bands(column, top, rule)
+        else:
+            runs = self.bands(card, 124, rule)
+        cover_run = next(i for i, (first, last) in enumerate(runs) if last - first > 100)
+        raw_lines = runs[:cover_run] if size else runs[cover_run + 1:]
+        lines = []
+        for first, last in raw_lines:
+            # Vietnamese dots/accents can be separated from the glyph by 1 empty row.
+            if lines and first == lines[-1][1] + 2:
+                lines[-1] = (lines[-1][0], last)
+            else:
+                lines.append((first, last))
+        # The approved .54 two-line next-book title uses the excerpt slot below a one-line title.
+        expected_lines = title_lines + (2 if size == 1 and title_lines == 1 else 1)
+        self.assertEqual(len(lines), expected_lines, f'{name}: {runs}')
+        heights = [last - first + 1 for first, last in lines]
+        if name.startswith('short') and size < 2:
+            self.assertGreater(heights[0], base[size], f'{name}: title {heights[0]} rows, {runs}')
+        self.assertLessEqual(max(heights), 38 if size == 0 else 43, f'{name}: {runs}')
+        for previous, following in zip(lines, lines[1:]):
+            self.assertLess(previous[1], following[0] - 1, f'{name}: metadata lines touch')
+        self.assertLess(lines[-1][1], rule - 1, f'{name}: text reaches the rule')
+        if size:
+            first, last = runs[cover_run]
+            self.assertLess(lines[-1][1], first - 1, f'{name}: text reaches the cover')
+            bbox = ImageChops.invert(card.crop((0, first, right + 24, last + 1))).getbbox()
+            self.assertEqual((bbox[0], bbox[2]), (24, right), f'{name}: cover edges')
+
     def test_card_title_is_larger_and_clear_of_the_lines_around_it(self):
         # Before the title went one size up (Geist bold 12/14/16 at text sizes 0/1/2) the short
         # title's ink measured 25/28/31 rows. Size 2 has no larger Geist face in flash and keeps 31.
-        base = {0: 25, 1: 28, 2: 31}
         books = [self.add_book(PATH_A, TITLE_A, 'Tác giả Mẫu, Người Viết', EXCERPT_A),
-                 self.add_book('/ben-song.epub', 'Bến sông ngày gió', 'Người Viết Thử',
+                 self.add_book('/ben-song.epub', 'Bến sông', 'Người Viết Thử',
                                'Nước lên từ sáng, bến vắng người, chỉ còn tiếng gió qua mấy mái chèo. '
                                'Chiều xuống, thuyền về muộn, đèn trên bến bật lên từng ngọn một.',
                                'test_kerning_ligature.epub')]
@@ -272,21 +308,7 @@ class HomeRecentCardTest(unittest.TestCase):
                     {'language': 'VI', 'uiTheme': 4, 'sleepTimeout': 120, 'uiTextSize': size}))
                 _, images = self.launch('2000:RIGHT;5000:QUIT', [(1800, f'long-{size}'), (4600, f'short-{size}')])
                 for name, title_lines in ((f'long-{size}', 2), (f'short-{size}', 1)):
-                    card = images[name]
-                    rule = next(y for y in range(600, 780)
-                                if sum(card.getpixel((x, y)) < 128 for x in range(card.width)) > 400)
-                    runs = self.bands(card, 124, rule)
-                    # The cover (with the stats beside it) is one tall run; then title, author, excerpt.
-                    cover_run = next(i for i, (first, last) in enumerate(runs) if last - first > 100)
-                    lines = runs[cover_run + 1:]
-                    self.assertGreaterEqual(len(lines), title_lines + 2, f'{name}: {runs}')
-                    heights = [last - first + 1 for first, last in lines]
-                    if name.startswith('short') and size < 2:
-                        self.assertGreater(heights[0], base[size], f'{name}: title {heights[0]} rows, {runs}')
-                    # Each run is one line of text: a title line running into the author or the
-                    # excerpt would join two lines into one run taller than any single line.
-                    self.assertLessEqual(max(heights), 38 if size == 0 else 43, f'{name}: {runs}')
-                    self.assertLess(lines[-1][1], rule - 1, f'{name}: text reaches the rule')
+                    self.assert_card_title_clear(images[name], size, title_lines, name)
 
     def test_keyboard_side_arrows_mirror_each_other(self):
         # The keyboard draws its side button arrows through the theme, apart from the list screens.

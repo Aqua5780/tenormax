@@ -2,6 +2,7 @@
 
 #include <FsHelpers.h>
 #include <HalStorage.h>
+#include <HeapFloor.h>
 
 #include <cstring>
 
@@ -14,36 +15,61 @@ bool visible(const char* name, bool showHidden) {
 }  // namespace
 
 bool doc(const char* const duongDan, const bool hienFileAn, const Loc loc, char* const dem, const size_t demCo,
-         std::vector<std::string>& ra) {
+         std::vector<std::string>& ra, const size_t tran, bool* const quaTran, filebrowser::SortMode sortMode) {
   ra.clear();
+  if (quaTran) *quaTran = false;
   if (dem == nullptr || demCo == 0) return false;
+
+  // One date or size per row, bounded by the row ceiling and freed before paint. No room (or no
+  // ceiling) means the folder still opens, in name order.
+  std::unique_ptr<uint64_t[]> keys;
+  if (loc == Loc::Sach && sortMode != filebrowser::SortMode::Name && tran)
+    keys = heapfloor::array<uint64_t[]>(tran, "folder-order");
 
   auto goc = Storage.open(duongDan);
   if (!goc || !goc.isDirectory()) return false;
   goc.rewindDirectory();
 
+  // Het cho thi dung han: giu mot danh sach cut con te hon khong giu.
+  const auto conCho = [&] {
+    if (tran == 0 || ra.size() < tran) return true;
+    if (quaTran) *quaTran = true;
+    return false;
+  };
   for (auto muc = goc.openNextFile(); muc; muc = goc.openNextFile()) {
     muc.getName(dem, demCo);
     // File an, va thu muc rac cua Windows.
     if (!visible(dem, hienFileAn)) continue;
 
     if (muc.isDirectory()) {
+      if (!conCho()) break;
+      if (keys) keys[ra.size()] = 0;
       ra.emplace_back(std::string(dem) + "/");
       continue;
     }
 
     const std::string_view ten{dem};
     if (loc == Loc::Firmware) {
-      if (FsHelpers::checkFileExtension(ten, ".bin")) ra.emplace_back(ten);
+      if (FsHelpers::checkFileExtension(ten, ".bin")) {
+        if (!conCho()) break;
+        ra.emplace_back(ten);
+      }
       continue;
     }
     if (FsHelpers::hasEpubExtension(ten) || FsHelpers::hasXtcExtension(ten) || FsHelpers::hasTxtExtension(ten) ||
         FsHelpers::hasMarkdownExtension(ten) || FsHelpers::hasBmpExtension(ten) || FsHelpers::hasPngExtension(ten)) {
+      if (!conCho()) break;
+      if (keys)
+        keys[ra.size()] = sortMode == filebrowser::SortMode::Modified ? muc.modificationTime() : muc.fileSize64();
       ra.emplace_back(ten);
     }
   }
   goc.close();
-  FsHelpers::sortFileList(ra);
+  if (quaTran && *quaTran) {
+    std::vector<std::string>().swap(ra);
+    return true;
+  }
+  filebrowser::sortNames(ra, keys.get(), sortMode);
   return true;
 }
 

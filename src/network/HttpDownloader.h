@@ -2,7 +2,10 @@
 #include <HalStorage.h>
 
 #include <functional>
+#include <memory>
 #include <string>
+
+namespace freeink { class SecureHttpClient; }
 
 /**
  * HTTP client utility for fetching content and downloading files. Built on
@@ -11,6 +14,19 @@
  */
 class HttpDownloader {
  public:
+  class RangeSession {
+   public:
+    RangeSession();
+    ~RangeSession();
+    bool hasTlsContext() const;
+    RangeSession(const RangeSession&) = delete;
+    RangeSession& operator=(const RangeSession&) = delete;
+   private:
+    friend class HttpDownloader;
+#if defined(FREEINK_NET_WOLFSSL)
+    std::unique_ptr<freeink::SecureHttpClient> client_;
+#endif
+  };
   // Also called periodically during transport waits to pump activity input.
   // total == 0 means unknown size; callers must throttle repaint separately.
   using ProgressCallback = std::function<void(size_t downloaded, size_t total)>;
@@ -32,6 +48,39 @@ class HttpDownloader {
   // downloadToFile() and fail into their error UI instead.
   static constexpr uint32_t MIN_TLS_FREE_HEAP = 40000;
   static constexpr uint32_t MIN_TLS_MAX_ALLOC = 20000;
+  // A fetch pinned to its own root CA (OTA) gives up after this long without a byte: TLS
+  // handshake, response headers, or between two body reads.
+  static constexpr uint32_t PINNED_CA_TIMEOUT_MS = 10000;
+
+  // What a streaming fetch saw, for callers that record failures (OTA). The heap is sampled
+  // while the connection is up, every 200 ms at most, so it describes the transfer rather
+  // than the heap after the TLS session is freed.
+  struct TransferStats {
+    int status = 0;        // status line received, 0 when none arrived
+    bool headers = false;  // the response headers were read whole
+    uint32_t bytes = 0;
+    uint32_t total = 0;
+    uint32_t elapsedMs = 0;
+    uint32_t idleMs = 0;  // since the last body byte, or since the start when none came
+    uint32_t heap = 0;
+    uint32_t largest = 0;
+    uint32_t largestMin = 0;
+  };
+
+  /**
+   * HTTP status of the last request, or 0 when it never got a response (DNS,
+   * connect, TLS, timeout). fetchUrl() returns only success or failure; this
+   * lets a caller tell a dead server from a catalog that wants a password.
+   * Not thread-safe by design: one fetch runs at a time.
+   */
+  static int lastStatus();
+
+  /**
+   * True when the last answer came from a different origin (scheme, host or
+   * port) than the URL asked for, after a redirect. Credentials are withheld
+   * from such a hop, so a 401 there is not a wrong password.
+   */
+  static bool lastAnswerRedirected();
 
   /**
    * Fetch text content from a URL with optional credentials.
@@ -48,7 +97,16 @@ class HttpDownloader {
    */
   static bool fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username = "",
                        const std::string& password = "", const char* rootCA = nullptr, bool allowRedirects = true,
-                       ProgressCallback progress = nullptr, bool* cancelFlag = nullptr);
+                       ProgressCallback progress = nullptr, bool* cancelFlag = nullptr, TransferStats* stats = nullptr);
+
+  /**
+   * Bytes first..last of a resource over a connection of its own, pinned to rootCA, no redirects:
+   * a 206 whose Content-Range starts at `first` streams its part to onData. A 200 (the whole body)
+   * is taken only when first is 0, and sets *whole. Otherwise as the streaming fetchUrl above.
+   */
+  static bool fetchRange(const std::string& url, size_t first, size_t last, const DataCallback& onData,
+                         const char* rootCA, ProgressCallback progress, bool* cancelFlag, TransferStats* stats,
+                         bool* whole, RangeSession* session = nullptr);
 
   /**
    * Download a file to the SD card with optional credentials.

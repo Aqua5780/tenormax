@@ -2,6 +2,7 @@
 
 #include <HalDisplay.h>
 #include <HalStorage.h>
+#include <HeapFloor.h>
 #include <JPEGDEC.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -15,6 +16,11 @@
 #include "BitmapHelpers.h"
 #include "GrayThumb.h"
 #include "JpegScale.h"
+#include "TenorInk.h"
+#include "ProgressiveJpeg.h"
+#ifdef BOARD_HAS_PSRAM
+#include <HalMemory.h>
+#endif
 
 // ============================================================================
 // IMAGE PROCESSING OPTIONS - Toggle these to test different configurations
@@ -85,7 +91,7 @@ void writeBmpHeader8bit(Print& bmpOut, const int width, const int height) {
 }
 
 // Helper function: Write BMP header with 2-bit color depth
-static void writeBmpHeader2bit(Print& bmpOut, const int width, const int height) {
+void writeBmpHeader2bit(Print& bmpOut, const int width, const int height) {
   // Calculate row padding (each row must be multiple of 4 bytes)
   const int bytesPerRow = (width * 2 + 31) / 32 * 4;  // 2 bits per pixel, round up
   const int imageSize = bytesPerRow * height;
@@ -188,6 +194,7 @@ struct BmpConvertCtx {
   int srcHeight;
   int outWidth;
   int outHeight;
+  int bitmapWidth, bitmapHeight, cropX, cropY;
   bool oneBit;
   int bytesPerRow;
   bool needsScaling;
@@ -200,6 +207,10 @@ struct BmpConvertCtx {
   // Accumulates one MCU row (up to MAX_MCU_HEIGHT source rows × srcWidth pixels)
   // Filled column-by-column as JPEGDEC callbacks arrive for the same MCU row
   std::unique_ptr<uint8_t[]> mcuBuf;
+  uint8_t* mcuPixels = nullptr;
+#ifdef BOARD_HAS_PSRAM
+  HalMemory::PsramBuffer mcuPsram;
+#endif
 
   // Y-axis area averaging accumulators (needsScaling only)
   int currentOutY;
@@ -231,14 +242,16 @@ static void yieldDuringDecode(BmpConvertCtx* ctx) {
   yieldToIdle();
 }
 
-static void yieldDuringDecodeBlock(BmpConvertCtx* ctx) {
-  if (++ctx->blocksSinceYield < 16) return;
-  ctx->blocksSinceYield = 0;
+static void yieldDuringDecodeBlock(uint8_t& blocksSinceYield) {
+  if (++blocksSinceYield < 16) return;
+  blocksSinceYield = 0;
   yieldToIdle();
 }
 
 // Write a fully-assembled output row (grayscale bytes, length outWidth) to BMP
 static void writeOutputRow(BmpConvertCtx* ctx, const uint8_t* srcRow, int outY) {
+  if (outY < ctx->cropY || outY >= ctx->cropY + ctx->bitmapHeight) return;
+  srcRow += ctx->cropX;
   memset(ctx->bmpRow.get(), 0, ctx->bytesPerRow);
 
   if (USE_8BIT_OUTPUT && !ctx->oneBit) {
@@ -246,9 +259,9 @@ static void writeOutputRow(BmpConvertCtx* ctx, const uint8_t* srcRow, int outY) 
       ctx->bmpRow[x] = adjustPixel(srcRow[x]);
     }
   } else if (ctx->oneBit) {
-    for (int i = 0; i < ctx->outWidth; i++) {
+    for (int i = 0; i < ctx->bitmapWidth; i++) {
       const int x = ctx->oneBitDitherer->at(i);
-      ctx->bmpRow[x / 8] |= ctx->oneBitDitherer->processPixel(srcRow[x], x) << (7 - (x % 8));
+      ctx->bmpRow[x >> 3] |= ctx->oneBitDitherer->processPixel(srcRow[x], x) << (7 - (x & 7));
     }
     ctx->oneBitDitherer->nextRow();
   } else {
@@ -262,7 +275,7 @@ static void writeOutputRow(BmpConvertCtx* ctx, const uint8_t* srcRow, int outY) 
       } else {
         twoBit = quantize(gray, x, outY);
       }
-      ctx->bmpRow[(x * 2) / 8] |= (twoBit << (6 - ((x * 2) % 8)));
+      ctx->bmpRow[x >> 2] |= (twoBit << (6 - ((x & 3) * 2)));
     }
     if (ctx->atkinsonDitherer)
       ctx->atkinsonDitherer->nextRow();
@@ -358,18 +371,25 @@ static void finishSmoothUpscale(BmpConvertCtx* ctx) {
 
 // Flush one scaled output row from Y-axis accumulators and advance currentOutY
 static void flushScaledRow(BmpConvertCtx* ctx) {
+  if (ctx->currentOutY < ctx->cropY || ctx->currentOutY >= ctx->cropY + ctx->bitmapHeight) {
+    ctx->currentOutY++;
+    yieldDuringDecode(ctx);
+    return;
+  }
   memset(ctx->bmpRow.get(), 0, ctx->bytesPerRow);
 
   if (USE_8BIT_OUTPUT && !ctx->oneBit) {
     for (int x = 0; x < ctx->outWidth; x++) {
-      const uint8_t gray = (ctx->rowCount[x] > 0) ? (ctx->rowAccum[x] / ctx->rowCount[x]) : 0;
+      const int sampleX = x + ctx->cropX;
+      const uint8_t gray = (ctx->rowCount[sampleX] > 0) ? (ctx->rowAccum[sampleX] / ctx->rowCount[sampleX]) : 0;
       ctx->bmpRow[x] = adjustPixel(gray);
     }
   } else if (ctx->oneBit) {
-    for (int i = 0; i < ctx->outWidth; i++) {
+    for (int i = 0; i < ctx->bitmapWidth; i++) {
       const int x = ctx->oneBitDitherer->at(i);
-      const uint8_t gray = (ctx->rowCount[x] > 0) ? (ctx->rowAccum[x] / ctx->rowCount[x]) : 0;
-      ctx->bmpRow[x / 8] |= ctx->oneBitDitherer->processPixel(gray, x) << (7 - (x % 8));
+      const int sampleX = x + ctx->cropX;
+      const uint8_t gray = (ctx->rowCount[sampleX] > 0) ? (ctx->rowAccum[sampleX] / ctx->rowCount[sampleX]) : 0;
+      ctx->bmpRow[x >> 3] |= ctx->oneBitDitherer->processPixel(gray, x) << (7 - (x & 7));
     }
     ctx->oneBitDitherer->nextRow();
   } else {
@@ -383,7 +403,7 @@ static void flushScaledRow(BmpConvertCtx* ctx) {
       } else {
         twoBit = quantize(gray, x, ctx->currentOutY);
       }
-      ctx->bmpRow[(x * 2) / 8] |= (twoBit << (6 - ((x * 2) % 8)));
+      ctx->bmpRow[x >> 2] |= (twoBit << (6 - ((x & 3) * 2)));
     }
     if (ctx->atkinsonDitherer)
       ctx->atkinsonDitherer->nextRow();
@@ -403,7 +423,7 @@ static void flushScaledRow(BmpConvertCtx* ctx) {
 int bmpDrawCallback(JPEGDRAW* pDraw) {
   auto* ctx = reinterpret_cast<BmpConvertCtx*>(pDraw->pUser);
   if (!ctx || ctx->error) return 0;
-  yieldDuringDecodeBlock(ctx);
+  yieldDuringDecodeBlock(ctx->blocksSinceYield);
 
   const uint8_t* pixels = reinterpret_cast<uint8_t*>(pDraw->pPixels);
   const int stride = pDraw->iWidth;
@@ -424,7 +444,7 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
   for (int r = 0; r < blockH && r < MAX_MCU_HEIGHT; r++) {
     const int copyW = (blockX + validW <= ctx->srcWidth) ? validW : (ctx->srcWidth - blockX);
     if (copyW <= 0) continue;
-    memcpy(ctx->mcuBuf.get() + r * ctx->srcWidth + blockX, pixels + r * stride, copyW);
+    memcpy(ctx->mcuPixels + r * ctx->srcWidth + blockX, pixels + r * stride, copyW);
   }
 
   // Wait for the last MCU column before processing any rows
@@ -434,7 +454,7 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
   const int endRow = blockY + blockH;
 
   for (int y = blockY; y < endRow && y < ctx->srcHeight; y++) {
-    const uint8_t* srcRow = ctx->mcuBuf.get() + (y - blockY) * ctx->srcWidth;
+    const uint8_t* srcRow = ctx->mcuPixels + (y - blockY) * ctx->srcWidth;
 
     if (ctx->smoothUpscale) {
       processSmoothSourceRow(ctx, srcRow, y);
@@ -477,10 +497,102 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
 
 }  // namespace
 
+bool JpegToBmpConverter::jpegFileToInkBmpStream(HalFile& file, Print& out, int width, int height, bool four) {
+#ifdef BOARD_HAS_PSRAM
+  s_jpegFile = &file;
+  const auto jpeg = makeUniqueNoThrow<JPEGDEC>();
+  struct Capture { uint8_t* pixels; int w, h; uint8_t blocksSinceYield; };
+  const auto capture = [](JPEGDRAW* block) -> int {
+    auto& c = *static_cast<Capture*>(block->pUser);
+    if (block->x < 0 || block->y < 0 || block->x >= c.w || block->y >= c.h) return 0;
+    const auto* src = reinterpret_cast<const uint8_t*>(block->pPixels);
+    for (int y = 0; y < block->iHeight && block->y + y < c.h; ++y)
+      std::memcpy(c.pixels + (block->y + y) * c.w + block->x, src + y * block->iWidth,
+                  std::min(block->iWidthUsed, c.w - block->x));
+    yieldDuringDecodeBlock(c.blocksSinceYield);
+    return 1;
+  };
+  if (!jpeg || jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, capture) != 1) return false;
+  const ScopedCleanup cleanup{[&]() { jpeg->close(); }};
+  const int sw = jpeg->getWidth(), sh = jpeg->getHeight();
+  if (sw <= 0 || sh <= 0 || sw > MAX_IMAGE_WIDTH || sh > MAX_IMAGE_HEIGHT) return false;
+  if (jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE && progressivejpeg::supported()) {
+    auto gray = progressivejpeg::decode(file, sw, sh);
+    LOG_INF("JPG", "tenor/ink progressive full source=%dx%d psram=%u ok=%d", sw, sh,
+            static_cast<unsigned>(static_cast<size_t>(sw) * sh), gray ? 1 : 0);
+    if (gray) return tenorink::writeCover(gray.get(), sw, sh, out, width, height, four);
+    // Too large for PSRAM or refused by the full decoder: keep the 1/8 cover of v1.0.56 below.
+    jpeg->close();
+    if (jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, capture) != 1) return false;
+  }
+  // JPEGDEC retains the reduced path when full progressive decoding is unavailable.
+  const bool progressive = jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE;
+  const int scale = progressive ? 8 : 1;
+  const int dw = (sw + scale - 1) / scale, dh = (sh + scale - 1) / scale;
+  const size_t bytes = static_cast<size_t>(dw) * dh;
+  const auto psram = HalMemory::getPsramHeap();
+  if (psram.freeBytes < bytes + 128 * 1024 || psram.largestBlockBytes < bytes) return false;
+  auto gray = HalMemory::allocatePsram(bytes);
+  if (!gray) return false;
+  Capture c{gray.get(), dw, dh, 0};
+  jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
+  jpeg->setUserPointer(&c);
+  const bool decoded = jpeg->decode(0, 0, progressive ? JPEG_SCALE_EIGHTH : 0) == 1;
+  LOG_INF("JPG", "tenor/ink source=%dx%d grid=%dx%d psram=%u progressive=%u", sw, sh, dw, dh,
+          static_cast<unsigned>(bytes), progressive ? 1u : 0u);
+  return decoded && tenorink::writeCover(gray.get(), dw, dh, out, width, height, four);
+#else
+  s_jpegFile = &file;
+  auto jpeg = heapfloor::make<JPEGDEC>("ink-jpeg");
+  struct Capture {
+    tenorink::CoverStream* stream;
+    uint8_t* rows;
+    int w, h;
+    uint8_t blocksSinceYield = 0;
+  };
+  const auto capture = [](JPEGDRAW* block) -> int {
+    auto& c = *static_cast<Capture*>(block->pUser);
+    if (block->x < 0 || block->y < 0 || block->x >= c.w || block->y >= c.h ||
+        block->iHeight > MAX_MCU_HEIGHT) return 0;
+    const int n = std::min(block->iWidthUsed, c.w - block->x);
+    const auto* pixels = reinterpret_cast<const uint8_t*>(block->pPixels);
+    for (int y = 0; y < block->iHeight; ++y)
+      std::memcpy(c.rows + y * c.w + block->x, pixels + y * block->iWidth, n);
+    yieldDuringDecodeBlock(c.blocksSinceYield);
+    if (block->x + n < c.w) return 1;
+    for (int y = 0; y < block->iHeight && block->y + y < c.h; ++y)
+      if (!c.stream->push(c.rows + y * c.w, block->y + y)) return 0;
+    return 1;
+  };
+  if (!jpeg || jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, capture) != 1) return false;
+  const ScopedCleanup cleanup{[&]() { jpeg->close(); }};
+  const int sw = jpeg->getWidth(), sh = jpeg->getHeight();
+  if (sw <= 0 || sh <= 0 || sw > MAX_IMAGE_WIDTH || sh > MAX_IMAGE_HEIGHT) return false;
+  const bool progressive = jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE;
+  const int scale = progressive ? 8 : 1;
+  const int dw = (sw + scale - 1) / scale, dh = (sh + scale - 1) / scale;
+  auto rows = heapfloor::array<uint8_t[]>(MAX_MCU_HEIGHT * dw, "ink-mcu");
+  tenorink::CoverStream stream(dw, dh, out, width, height, four);
+  if (!rows || !stream.valid()) return false;
+#if defined(ESP_PLATFORM)
+  // The blocks under 4 KB skip the door: the heap left with all of them must still be on the floor.
+  if (heapfloor::crosses(ESP.getFreeHeap(), ESP.getMaxAllocHeap())) return false;
+#endif
+  Capture c{&stream, rows.get(), dw, dh};
+  jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
+  jpeg->setUserPointer(&c);
+  const bool decoded = jpeg->decode(0, 0, progressive ? JPEG_SCALE_EIGHTH : 0) == 1;
+  LOG_INF("JPG", "tenor/ink stream source=%dx%d grid=%dx%d mcu=%u decoder=%u progressive=%u",
+          sw, sh, dw, dh, static_cast<unsigned>(MAX_MCU_HEIGHT * dw),
+          static_cast<unsigned>(sizeof(JPEGDEC)), progressive ? 1u : 0u);
+  return decoded && stream.complete();
+#endif
+}
+
 // Internal implementation with configurable target size and bit depth
 bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& bmpOut, int targetWidth,
                                                      int targetHeight, bool oneBit, bool crop,
-                                                     bool originalThresholds) {
+                                                     bool originalThresholds, bool exactSize, bool fullProgressiveCover) {
   LOG_DBG("JPG", "Converting JPEG to %s BMP (target: %dx%d)", oneBit ? "1-bit" : "2-bit", targetWidth, targetHeight);
 
   if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
@@ -490,7 +602,7 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
 
   s_jpegFile = &jpegFile;
 
-  const auto jpeg = makeUniqueNoThrow<JPEGDEC>();
+  const auto jpeg = heapfloor::make<JPEGDEC>("jpeg-decoder");
   if (!jpeg) {
     LOG_ERR("JPG", "OOM: JPEG decoder");
     return false;
@@ -507,6 +619,21 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   const int srcWidth = jpeg->getWidth();
   const int srcHeight = jpeg->getHeight();
   const bool progressiveDecode = (jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE);
+  bool fullProgressive = false;
+  (void)fullProgressiveCover;
+#ifdef BOARD_HAS_PSRAM
+  fullProgressive = fullProgressiveCover && progressiveDecode && progressivejpeg::supported();
+  HalMemory::PsramBuffer fullGray;
+  if (fullProgressive) {
+    fullGray = progressivejpeg::decode(jpegFile, srcWidth, srcHeight);
+    if (!fullGray) {
+      // Too large for PSRAM or refused by the full decoder: keep the 1/8 cover of v1.0.56.
+      fullProgressive = false;
+      jpeg->close();
+      if (jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, bmpDrawCallback) != 1) return false;
+    }
+  }
+#endif
 
   LOG_DBG("JPG", "JPEG dimensions: %dx%d", srcWidth, srcHeight);
 
@@ -526,13 +653,19 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
 
   if (targetWidth > 0 && targetHeight > 0 && (srcWidth != targetWidth || srcHeight != targetHeight)) {
     coverScaleSize(srcWidth, srcHeight, targetWidth, targetHeight, crop, &outWidth, &outHeight);
+    if (exactSize) {
+      // Round the fitted gray image to the nearest pixel before the centered crop.
+      const bool byWidth = targetWidth * srcHeight >= targetHeight * srcWidth;
+      outWidth = byWidth ? targetWidth : (srcWidth * targetHeight + srcHeight / 2) / srcHeight;
+      outHeight = byWidth ? (srcHeight * targetWidth + srcWidth / 2) / srcWidth : targetHeight;
+    }
   }
 
   // Callback coordinates and MCU buffering use the reduced decode grid (JpegScale.h): the smallest
   // grid still covering the output, for the screen cover as for a thumbnail. Without a target the
   // output is the source and the grid the full one (an eighth for a progressive stream).
   int decodeOption = 0;
-  const int decodeScale = chooseJpegScale(std::max(static_cast<float>(outWidth) / srcWidth,
+  const int decodeScale = fullProgressive ? 1 : chooseJpegScale(std::max(static_cast<float>(outWidth) / srcWidth,
                                                    static_cast<float>(outHeight) / srcHeight),
                                           progressiveDecode, decodeOption);
   const int scaleSrcWidth = (srcWidth + decodeScale - 1) / decodeScale;
@@ -551,17 +684,22 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     needsScaling = true;
   }
 
-  const bool smoothUpscale =
-      progressiveDecode && needsScaling && scaleSrcWidth <= outWidth && scaleSrcHeight <= outHeight;
+  // A cover narrower than its output grows by linear interpolation, baseline or progressive; area
+  // averaging has nothing to average there and only repeats source pixels.
+  const bool smoothUpscale = needsScaling && scaleSrcWidth <= outWidth && scaleSrcHeight <= outHeight;
 
+  const int bitmapWidth = exactSize ? targetWidth : outWidth;
+  const int bitmapHeight = exactSize ? targetHeight : outHeight;
+  // Crop gray pixels before dithering so the packed bitmap is the Home frame's own size.
+  const int cropX = (outWidth - bitmapWidth) / 2, cropY = (outHeight - bitmapHeight) / 2;
   // Write BMP header with output dimensions
   int bytesPerRow;
   if (USE_8BIT_OUTPUT && !oneBit) {
     writeBmpHeader8bit(bmpOut, outWidth, outHeight);
     bytesPerRow = (outWidth + 3) / 4 * 4;
   } else if (oneBit) {
-    writeBmpHeader1bit(bmpOut, outWidth, outHeight);
-    bytesPerRow = (outWidth + 31) / 32 * 4;
+    writeBmpHeader1bit(bmpOut, bitmapWidth, bitmapHeight);
+    bytesPerRow = (bitmapWidth + 31) / 32 * 4;
   } else {
     writeBmpHeader2bit(bmpOut, outWidth, outHeight);
     bytesPerRow = (outWidth * 2 + 31) / 32 * 4;
@@ -573,6 +711,10 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   ctx.srcHeight = scaleSrcHeight;
   ctx.outWidth = outWidth;
   ctx.outHeight = outHeight;
+  ctx.bitmapWidth = bitmapWidth;
+  ctx.bitmapHeight = bitmapHeight;
+  ctx.cropX = cropX;
+  ctx.cropY = cropY;
   ctx.oneBit = oneBit;
   ctx.bytesPerRow = bytesPerRow;
   ctx.needsScaling = needsScaling;
@@ -588,12 +730,21 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   ctx.error = false;
 
   // MCU row buffer: MAX_MCU_HEIGHT rows × decoded srcWidth columns of grayscale
-  ctx.mcuBuf = makeUniqueNoThrow<uint8_t[]>(MAX_MCU_HEIGHT * ctx.srcWidth);
-  if (!ctx.mcuBuf) {
+#ifdef BOARD_HAS_PSRAM
+  if (fullProgressive) {
+    ctx.mcuPsram = progressivejpeg::allocate(MAX_MCU_HEIGHT * ctx.srcWidth);
+    ctx.mcuPixels = ctx.mcuPsram.get();
+  } else
+#endif
+  {
+    ctx.mcuBuf = heapfloor::array<uint8_t[]>(MAX_MCU_HEIGHT * ctx.srcWidth, "jpeg-mcu");
+    ctx.mcuPixels = ctx.mcuBuf.get();
+  }
+  if (!ctx.mcuPixels) {
     LOG_ERR("JPG", "OOM: MCU buffer (%d bytes)", MAX_MCU_HEIGHT * ctx.srcWidth);
     return false;
   }
-  memset(ctx.mcuBuf.get(), 0, MAX_MCU_HEIGHT * ctx.srcWidth);
+  memset(ctx.mcuPixels, 0, MAX_MCU_HEIGHT * ctx.srcWidth);
 
   ctx.bmpRow = makeUniqueNoThrow<uint8_t[]>(bytesPerRow);
   if (!ctx.bmpRow) {
@@ -604,7 +755,7 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   if (smoothUpscale) {
     // One contiguous allocation avoids three heap blocks while keeping smoothing line-buffered.
     const size_t smoothRowsBytes = static_cast<size_t>(outWidth) * 3;
-    ctx.smoothRows = makeUniqueNoThrow<uint8_t[]>(smoothRowsBytes);
+    ctx.smoothRows = heapfloor::array<uint8_t[]>(smoothRowsBytes, "jpeg-smooth");
     if (!ctx.smoothRows) {
       LOG_ERR("JPG", "OOM: progressive smoothing buffers");
       return false;
@@ -625,7 +776,7 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   }
 
   if (oneBit) {
-    ctx.oneBitDitherer = makeUniqueNoThrow<FloydSteinberg1BitDitherer>(outWidth);
+    ctx.oneBitDitherer = makeUniqueNoThrow<FloydSteinberg1BitDitherer>(bitmapWidth);
     if (!ctx.oneBitDitherer || !ctx.oneBitDitherer->isValid()) {
       LOG_ERR("JPG", "OOM: 1-bit ditherer");
       return false;
@@ -649,6 +800,20 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
   jpeg->setUserPointer(&ctx);
 
+#ifdef BOARD_HAS_PSRAM
+  if (fullProgressive) {
+    rc = 1;
+    for (int y = 0; y < srcHeight && rc == 1; y += MAX_MCU_HEIGHT) {
+      JPEGDRAW block{};
+      block.pUser = &ctx;
+      block.pPixels = reinterpret_cast<decltype(block.pPixels)>(fullGray.get() + y * srcWidth);
+      block.x = 0; block.y = y;
+      block.iWidth = block.iWidthUsed = srcWidth;
+      block.iHeight = std::min(MAX_MCU_HEIGHT, srcHeight - y);
+      rc = bmpDrawCallback(&block);
+    }
+  } else
+#endif
   rc = jpeg->decode(0, 0, decodeOption);
 
   if (rc == 1 && ctx.smoothUpscale && !ctx.error) {
@@ -670,19 +835,19 @@ bool JpegToBmpConverter::jpegFileToBmpStream(HalFile& jpegFile, Print& bmpOut, b
   // Use runtime display dimensions (swapped for portrait cover sizing)
   const int targetWidth = display.getDisplayHeight();
   const int targetHeight = display.getDisplayWidth();
-  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetWidth, targetHeight, oneBit, crop, originalThresholds);
+  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetWidth, targetHeight, oneBit, crop, originalThresholds, false, true);
 }
 
 // Convert with custom target size (for thumbnails, 2-bit)
 bool JpegToBmpConverter::jpegFileToBmpStreamWithSize(HalFile& jpegFile, Print& bmpOut, int targetMaxWidth,
                                                      int targetMaxHeight) {
-  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, false);
+  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, false, true, false, false, true);
 }
 
 // Convert to 1-bit BMP (black and white only, no grays) for fast home screen rendering
 bool JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(HalFile& jpegFile, Print& bmpOut, int targetMaxWidth,
-                                                         int targetMaxHeight) {
-  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true);
+                                                         int targetMaxHeight, bool exactSize) {
+  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true, false, exactSize);
 }
 
 namespace {
@@ -707,7 +872,7 @@ bool JpegToBmpConverter::jpegFileToGrayThumb(HalFile& jpegFile, GrayThumb& thumb
   *scale = 0;
   if (ESP.getFreeHeap() < MIN_FREE_HEAP) return false;
   s_jpegFile = &jpegFile;
-  const auto jpeg = makeUniqueNoThrow<JPEGDEC>();
+  const auto jpeg = heapfloor::make<JPEGDEC>("jpeg-thumb");
   if (!jpeg || jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, grayThumbDrawCallback) != 1)
     return false;
   const ScopedCleanup cleanup{[&jpeg]() { jpeg->close(); }};

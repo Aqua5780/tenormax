@@ -7,6 +7,7 @@
 #include <HalStorage.h>
 #include <I18n.h>
 #include <InlineButtonText.h>
+#include <LibraryBuilder.h>
 #include <Logging.h>
 #include <Memory.h>
 #include <WiFi.h>
@@ -23,24 +24,38 @@
 #include "CrossPointSettings.h"
 #include "DeviceName.h"
 #include "FontInstaller.h"
+#include "FontPackInstaller.h"
 #include "OpdsServerStore.h"
+#include "QuoteStore.h"
 #include "SdCardFontSystem.h"
 #include "SettingsList.h"
 #include "WebDAVHandler.h"
 #include "WebPathPolicy.h"
 #include "WifiCredentialStore.h"
+#include "shells/Shell.h"
+#include "util/Timezones.h"
 #include "html/FilesPageHtml.generated.h"
 #include "html/FontsPageHtml.generated.h"
 #include "html/HomePageHtml.generated.h"
 #include "html/SettingsPageHtml.generated.h"
 #include "html/ThemeCss.generated.h"
+#include "html/js/WebI18nJs.generated.h"
 #include "html/js/jszip_minJs.generated.h"
 #include "util/BookCacheUtils.h"
 #include "util/TaskWatchdog.h"
 
 namespace {
-// Folders/files to hide from the web interface file browser
-// Note: Items starting with "." are automatically hidden
+// Folders/files to hide from the web interface file browser (System Volume
+// Information, XTCache, dotfiles): now lives in WebPathPolicy, shared with
+// WebDAV. Note: items starting with "." are automatically hidden.
+
+// The library index tracks these extensions (LibraryIndex isBookName): an
+// upload of any of these must mark the index dirty so the next Library entry
+// rebuilds it.
+bool isLibraryBookFile(const String& filename) {
+  return FsHelpers::checkFileExtension(filename, ".epub") || FsHelpers::checkFileExtension(filename, ".txt") ||
+         FsHelpers::checkFileExtension(filename, ".md") || FsHelpers::checkFileExtension(filename, ".xtc");
+}
 constexpr uint16_t UDP_PORTS[] = {54982, 48123, 39001, 44044, 59678};
 constexpr uint16_t LOCAL_UDP_PORT = 8134;
 
@@ -115,6 +130,25 @@ void CrossPointWebServer::setUiTextSizeApplier(std::function<bool(uint8_t)> appl
   uiTextSizeApplier = std::move(applier);
 }
 
+void CrossPointWebServer::setFontPackApplier(std::function<bool(const char*)> applier) {
+  fontPackApplier = std::move(applier);
+}
+
+bool CrossPointWebServer::prepareFontPackUpload(String& path, const String& filename) {
+  if (!filename.endsWith(".cpfontpack")) return true;
+  if (!FontPackInstaller::isPackFilename(filename.c_str())) return false;
+  path = "/fonts";
+  return Storage.exists("/fonts") || Storage.mkdir("/fonts");
+}
+
+bool CrossPointWebServer::applyFontPackUpload(const String& path, const String& filename) {
+  if (!FontPackInstaller::isPackFilename(filename.c_str())) return true;
+  String fullPath = path;
+  if (!fullPath.endsWith("/")) fullPath += "/";
+  fullPath += filename;
+  return fontPackApplier && fontPackApplier(fullPath.c_str());
+}
+
 void CrossPointWebServer::setUploadCancel(std::function<bool()> cancel) { uploadCancel = std::move(cancel); }
 
 // Drops the connection when the owner asks, so the WebServer read loop ends at once
@@ -133,12 +167,11 @@ void CrossPointWebServer::noteUploadSocket() {
 #endif
 }
 
-// Runs on the Back sampler task. With its read side shut, the socket reports the client
-// gone at the library's next poll for data (every 2 ms), so the upload aborts there. The
-// main task retracts the socket before the server closes it (UploadSocket).
+// Runs on the Back sampler task. Closing both directions interrupts a blocked read or write.
+// The main task retracts the socket before the server closes it (UploadSocket).
 void CrossPointWebServer::interruptUpload() {
 #ifndef SIMULATOR
-  uploadSocket.interrupt([](const int fd) { shutdown(fd, SHUT_RD); });
+  uploadSocket.interrupt([](const int fd) { shutdown(fd, SHUT_RDWR); });
 #endif
 }
 
@@ -177,7 +210,7 @@ void CrossPointWebServer::begin() {
   // Store AP mode flag for later use (e.g., in handleStatus)
   apMode = isInApMode;
   char hostname[64];
-  deviceNetworkName(hostname, sizeof(hostname), "tenor-cross");
+  deviceNetworkName(hostname, sizeof(hostname), defaultNetworkName());
 #ifdef SIMULATOR
   auth.configure("127.0.0.1", hostname);
 #else
@@ -233,6 +266,9 @@ void CrossPointWebServer::begin() {
   server->on("/js/jszip.min.js", HTTP_GET, [this] {
     if (auth.authorize(*server, true, requestLanguage())) handleJszip();
   });
+  server->on("/js/web-i18n.js", HTTP_GET, [this] {
+    if (auth.authorize(*server, true, requestLanguage())) handleWebI18n();
+  });
 
   server->on("/api/status", HTTP_GET, [this] {
     if (auth.authorize(*server, true, requestLanguage())) handleStatus();
@@ -242,6 +278,9 @@ void CrossPointWebServer::begin() {
   });
   server->on("/download", HTTP_GET, [this] {
     if (auth.authorize(*server, true, requestLanguage())) handleDownload();
+  });
+  server->on("/api/quotes/export", HTTP_GET, [this] {
+    if (auth.authorize(*server, true, requestLanguage())) handleQuotesExport();
   });
 
   // Upload endpoint with special handling for multipart form data
@@ -339,7 +378,8 @@ void CrossPointWebServer::begin() {
                                     "Timeout",   "If-None-Match", "Host",    "Origin"};
   server->collectHeaders(collectedHeaders, 9);
   server->addHandler(
-      new WebDAVHandler(auth));  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
+      new WebDAVHandler(auth, [this] { return uploadCancelled(); }, [this] { noteUploadSocket(); },
+                        [this] { uploadSocket.retract(); }));  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
   LOG_DBG("WEB", "WebDAV handler initialized");
 
   server->begin();
@@ -567,6 +607,10 @@ void CrossPointWebServer::handleTheme() const {
   sendStaticContent(server.get(), ThemeCss, ThemeCssCompressedSize, ThemeCssETag, "text/css; charset=utf-8");
 }
 
+void CrossPointWebServer::handleWebI18n() const {
+  sendStaticContent(server.get(), WebI18nJs, WebI18nJsCompressedSize, WebI18nJsETag, "application/javascript; charset=utf-8");
+}
+
 void CrossPointWebServer::handleRoot() const {
   sendStaticContent(server.get(), HomePageHtml, sizeof(HomePageHtml), HomePageHtmlETag, "text/html");
   LOG_DBG("WEB", "Served root page");
@@ -613,6 +657,8 @@ void CrossPointWebServer::handleStatus() const {
   doc["rssi"] = apMode ? 0 : WiFi.RSSI();
   doc["freeHeap"] = ESP.getFreeHeap();
   doc["uptime"] = millis() / 1000;
+  // On tenor/ugly the pages put the shell's name, in the device language, on their masthead.
+  if (shell::isUgly()) doc["shellName"] = tr(STR_SHELL_UGLY);
 #if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
   doc["device"] = gpio.deviceIsX3() ? "X3" : "X4";
 #else
@@ -792,6 +838,7 @@ void CrossPointWebServer::handleDownload() {
   server->send(200, contentType.c_str(), "");
 
   NetworkClient client = server->client();
+  noteUploadSocket();
   // HTTP handlers run serially; reuse the upload arena instead of spending
   // half of loopTask's stack on a second transfer buffer.
   auto* buffer = upload.buffer.data();
@@ -802,11 +849,19 @@ void CrossPointWebServer::handleDownload() {
           static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
   bool downloadOk = chunkSize > 0;
   while (downloadOk && file.available()) {
+    if (uploadCancelled()) {
+      downloadOk = false;
+      break;
+    }
     int result = file.read(buffer, chunkSize);
     if (result <= 0) break;
     size_t bytesRead = static_cast<size_t>(result);
     size_t totalWritten = 0;
     while (totalWritten < bytesRead) {
+      if (uploadCancelled()) {
+        downloadOk = false;
+        break;
+      }
       resetTaskWatchdogIfSubscribed();
       size_t wrote = client.write(buffer + totalWritten, bytesRead - totalWritten);
       if (wrote == 0) {
@@ -818,11 +873,53 @@ void CrossPointWebServer::handleDownload() {
       sent += wrote;
     }
   }
+  uploadSocket.retract();
+  if (!downloadOk) client.stop();
   client.clear();
   file.close();
   LOG_INF("WEB", "Download end ok=%d sent=%u elapsed=%lu heap=%u stack=%u", downloadOk, static_cast<unsigned>(sent),
           static_cast<unsigned long>(millis() - started), ESP.getFreeHeap(),
           static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+}
+
+void CrossPointWebServer::handleQuotesExport() {
+  bool started = false;
+#ifdef TENOR_PRESS_PROBE
+  const uint32_t freeBefore = ESP.getFreeHeap();
+  uint32_t freeMin = freeBefore, largestMin = ESP.getMaxAllocHeap();
+#endif
+  const size_t count = quotes::streamKindle([this, &started
+#ifdef TENOR_PRESS_PROBE
+                                            , &freeMin, &largestMin
+#endif
+                                          ](const char* data, const size_t size) -> bool {
+    if (!server->client().connected()) return false;
+    if (!started) {
+      server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+      server->sendHeader("Content-Disposition", "attachment; filename=\"My Clippings.txt\"");
+      server->send(200, "text/plain; charset=utf-8", "");
+      started = true;
+    }
+    resetTaskWatchdogIfSubscribed();
+    server->sendContent(data, size);
+    noteTransferActivity(size);
+#ifdef TENOR_PRESS_PROBE
+    freeMin = std::min(freeMin, static_cast<uint32_t>(ESP.getFreeHeap()));
+    largestMin = std::min(largestMin, static_cast<uint32_t>(ESP.getMaxAllocHeap()));
+#endif
+    return server->client().connected();
+  });
+  if (count != SIZE_MAX) {
+    server->sendContent("");
+  } else if (!started) {
+    server->send(503, "text/plain; charset=utf-8", trWeb(requestLanguage(), StrId::STR_WEB_FAILED_OPEN_FILE));
+  } else {
+    server->client().stop();
+  }
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("WEB", "QUOTE_EXPORT count=%u before=%u min=%u largest=%u after=%u", static_cast<unsigned>(count),
+          freeBefore, freeMin, largestMin, ESP.getFreeHeap());
+#endif
 }
 
 // Diagnostic counters for upload performance analysis
@@ -896,6 +993,11 @@ void CrossPointWebServer::handleUpload(UploadState& state) {
 
     if (state.path.isEmpty()) {
       state.error = trWeb(lang, StrId::STR_WEB_PROTECTED_PATH);
+      return;
+    }
+
+    if (!prepareFontPackUpload(state.path, state.fileName)) {
+      state.error = trWeb(lang, StrId::STR_WEB_INVALID_FILE_NAME);
       return;
     }
 
@@ -981,6 +1083,8 @@ void CrossPointWebServer::handleUpload(UploadState& state) {
       if (!flushUploadBuffer(state)) {
         state.error = trWeb(lang, StrId::STR_WEB_WRITE_FINAL_FAILED);
       }
+      if (FontPackInstaller::isPackFilename(state.fileName.c_str()) && !state.file.sync())
+        state.error = trWeb(lang, StrId::STR_WEB_WRITE_FINAL_FAILED);
       state.file.close();
 
       if (state.error.isEmpty()) {
@@ -998,6 +1102,9 @@ void CrossPointWebServer::handleUpload(UploadState& state) {
         if (!filePath.endsWith("/")) filePath += "/";
         filePath += state.fileName;
         clearBookCache(filePath.c_str());
+        if (isLibraryBookFile(state.fileName)) library::markLibraryIndexDirty();
+        state.success = applyFontPackUpload(state.path, state.fileName);
+        if (!state.success) state.error = trWeb(lang, StrId::STR_WEB_INVALID_CPFONT);
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
@@ -1419,7 +1526,9 @@ void CrossPointWebServer::handleGetSettings() const {
             options.add(opt);
           }
         } else {
-          for (const auto& opt : s.enumValues) {
+          // enumLabels() covers StaticEnum rows (e.g. home button shortcuts)
+          // as well as the dynamic enumValues vector.
+          for (const auto& opt : s.enumLabels()) {
             options.add(trWeb(lang, opt));
           }
         }
@@ -1491,6 +1600,12 @@ void CrossPointWebServer::handlePostSettings() {
   int applied = 0;
   bool uiTextSizeApplied = false;
   const uint8_t previousUiTextSize = SETTINGS.uiTextSize;
+  // What the clock zone is made of, to push the zone into the clock when the page changed any of it.
+  const auto zoneOf = [] {
+    return (static_cast<uint32_t>(SETTINGS.clockAutoTimezone) << 24) | (static_cast<uint32_t>(SETTINGS.clockTimezone) << 16) |
+           (static_cast<uint32_t>(SETTINGS.clockDst) << 8) | SETTINGS.clockUtcOffsetQ;
+  };
+  const uint32_t zoneBefore = zoneOf();
   if (!doc["uiTextSize"].isNull()) {
     const int requestedUiTextSize = doc["uiTextSize"].as<int>();
     if (requestedUiTextSize >= CrossPointSettings::UI_TEXT_SMALL &&
@@ -1525,7 +1640,7 @@ void CrossPointWebServer::handlePostSettings() {
       }
       case SettingType::ENUM: {
         const int val = doc[s.key].as<int>();
-        const int maxVal = s.enumStringValues.empty() ? static_cast<int>(s.enumValues.size())
+        const int maxVal = s.enumStringValues.empty() ? static_cast<int>(s.enumLabels().size())
                                                       : static_cast<int>(s.enumStringValues.size());
         if (val >= 0 && val < maxVal) {
           if (s.valuePtr) {
@@ -1576,6 +1691,9 @@ void CrossPointWebServer::handlePostSettings() {
     server->send(500, "text/plain", trWeb(lang, StrId::STR_HABIT_SAVE_FAILED));
     return;
   }
+
+  // The screens that change the zone push it into the clock at once (cc1e315b); so does the page.
+  if (zoneOf() != zoneBefore) timezones::applyToClock();
 
   LOG_DBG("WEB", "Applied %d setting(s)", applied);
   char appliedBody[64];
@@ -1925,6 +2043,10 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
             wsServer->sendTXT(num, "ERROR:Protected path");
             return;
           }
+          if (!prepareFontPackUpload(wsUploadPath, wsUploadFileName)) {
+            wsServer->sendTXT(num, "ERROR:Invalid font pack");
+            return;
+          }
           wsUploadReceived = 0;
           wsLastProgressSent = 0;
           wsUploadStartTime = wsLastActivityTime = millis();
@@ -1958,11 +2080,16 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
           if (wsUploadSize == 0) {
             // Explicit close() required: file-scope global persists beyond function scope
             wsUploadFile.close();
+            if (!applyFontPackUpload(wsUploadPath, wsUploadFileName)) {
+              wsServer->sendTXT(num, "ERROR:Invalid font pack");
+              return;
+            }
             wsLastCompleteName = wsUploadFileName;
             wsLastCompleteSize = 0;
             wsLastCompleteAt = millis();
             LOG_DBG("WS", "Zero-byte upload complete: %s", filePath.c_str());
             clearBookCache(filePath.c_str());
+            if (isLibraryBookFile(wsUploadFileName)) library::markLibraryIndexDirty();
             wsServer->sendTXT(num, "DONE");
             wsLastProgressSent = 0;
             break;
@@ -2015,9 +2142,18 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
       // Check if upload complete
       if (wsUploadReceived >= wsUploadSize) {
         // Explicit close() required: file-scope global persists beyond function scope
+        if (FontPackInstaller::isPackFilename(wsUploadFileName.c_str()) && !wsUploadFile.sync()) {
+          abortWsUpload("WS");
+          wsServer->sendTXT(num, "ERROR:Write failed");
+          return;
+        }
         wsUploadFile.close();
         wsUploadInProgress = false;
         wsUploadClientNum = 255;
+        if (!applyFontPackUpload(wsUploadPath, wsUploadFileName)) {
+          wsServer->sendTXT(num, "ERROR:Invalid font pack");
+          return;
+        }
 
         wsLastCompleteName = wsUploadFileName;
         wsLastCompleteSize = wsUploadSize;
@@ -2034,6 +2170,7 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         if (!filePath.endsWith("/")) filePath += "/";
         filePath += wsUploadFileName;
         clearBookCache(filePath.c_str());
+        if (isLibraryBookFile(wsUploadFileName)) library::markLibraryIndexDirty();
 
         wsServer->sendTXT(num, "DONE");
         wsLastProgressSent = 0;
@@ -2121,10 +2258,13 @@ void CrossPointWebServer::handleFontList() {
     if (!sendRecord()) return;
     if (!append(",\"sizes\":[")) return;
     bool firstSize = true;
-    for (const uint8_t size : family.availableSizes()) {
-      snprintf(value, sizeof(value), "%s%u", firstSize ? "" : ",", static_cast<unsigned>(size));
-      firstSize = false;
-      if (!append(value)) return;
+    // A vector family has no fixed sizes: availableSizes() would report a lone 0.
+    if (!family.vector) {
+      for (const uint8_t size : family.availableSizes()) {
+        snprintf(value, sizeof(value), "%s%u", firstSize ? "" : ",", static_cast<unsigned>(size));
+        firstSize = false;
+        if (!append(value)) return;
+      }
     }
     if (!append("],\"files\":[")) return;
     bool firstFile = true;
@@ -2132,7 +2272,11 @@ void CrossPointWebServer::handleFontList() {
       if (!firstFile && !append(",")) return;
       firstFile = false;
       doc.clear();
+#if CROSSPOINT_VECTOR_FONTS
+      const std::string filePath = family.vector ? file.path : family.filePath(file);
+#else
       const std::string filePath = family.filePath(file);
+#endif
       const char* name = strrchr(filePath.c_str(), '/');
       doc["name"] = name ? name + 1 : filePath.c_str();
       HalFile font;
@@ -2142,9 +2286,11 @@ void CrossPointWebServer::handleFontList() {
       if (!sendRecord()) return;
       resetTaskWatchdogIfSubscribed();
     }
-    if (!append("]}")) return;
+    if (!append(family.vector ? "],\"vector\":true}" : "]}")) return;
   }
-  snprintf(value, sizeof(value), "],\"maxFamilies\":%d}", SdCardFontRegistry::MAX_SD_FAMILIES);
+  // "vector" tells the page whether this build can render .ttf/.otf at all (PSRAM boards only).
+  snprintf(value, sizeof(value), "],\"maxFamilies\":%d,\"vector\":%s}", SdCardFontRegistry::MAX_SD_FAMILIES,
+           CROSSPOINT_VECTOR_FONTS ? "true" : "false");
   if (!append(value)) return;
   if (!flush()) return;
   server->sendContent("");
@@ -2165,11 +2311,16 @@ void CrossPointWebServer::handleFontUploadData() {
       fontUpload.filePath.clear();
       fontUpload.valid = false;
       fontUpload.magicChecked = false;
+      fontUpload.pack = false;
+      fontUpload.vector = false;
+      fontUpload.code = nullptr;
+      fontUpload.check = FontInstaller::VectorUploadCheck();
       fontUpload.bytesWritten = 0;
       fontUpload.bufferPos = 0;
 
       if (!FontInstaller::isValidFamilyName(family.c_str())) {
         LOG_ERR("WEB", "Invalid font family name: %s", family.c_str());
+        fontUpload.code = "family";
         break;
       }
 
@@ -2179,11 +2330,26 @@ void CrossPointWebServer::handleFontUploadData() {
       // a .cpfont basename of alphanumeric + hyphen + underscore. Without
       // this an attacker could supply "../../.crosspoint/settings.json" as
       // a "filename" and have it written outside the fonts directory.
-      if (!FontInstaller::isValidCpfontFilename(filename.c_str())) {
+      fontUpload.pack = FontPackInstaller::isPackFilename(filename.c_str());
+      fontUpload.vector = FsHelpers::checkFileExtension(filename, ".ttf") || FsHelpers::checkFileExtension(filename, ".otf");
+      if (fontUpload.vector) {
+        // No engine without PSRAM: refuse before anything touches the card, a stored
+        // file would never show up in the font list.
+        if (!CROSSPOINT_VECTOR_FONTS) {
+          fontUpload.code = "unsupported";
+          break;
+        }
+        if (!FontInstaller::isValidVectorFilename(filename.c_str())) {
+          LOG_ERR("WEB", "Invalid vector font filename: %s", filename.c_str());
+          fontUpload.code = "name";
+          break;
+        }
+      } else if (!fontUpload.pack && !FontInstaller::isValidCpfontFilename(filename.c_str())) {
         LOG_ERR("WEB", "Invalid font filename: %s", filename.c_str());
         break;
       }
 
+      if (fontUpload.pack && family != filename.substring(0, filename.length() - 11)) break;
       fontUpload.familyName = family.c_str();
 
       // Build and validate the complete destination path before touching the
@@ -2191,26 +2357,34 @@ void CrossPointWebServer::handleFontUploadData() {
       // open a truncated target for writing. A failure leaves fontUpload
       // invalid, so the upload reports the existing 400 without cleanup work.
       char path[FontInstaller::MAX_FONT_PATH_SIZE];
-      if (!FontInstaller::buildFontPath(family.c_str(), filename.c_str(), path, sizeof(path))) {
+      const bool validPath = fontUpload.pack
+          ? std::snprintf(path, sizeof(path), "/fonts/%s", filename.c_str()) < static_cast<int>(sizeof(path))
+          : (fontUpload.vector ? FontInstaller::buildVectorFontPath(family.c_str(), filename.c_str(), path, sizeof(path))
+                               : FontInstaller::buildFontPath(family.c_str(), filename.c_str(), path, sizeof(path)));
+      if (!validPath) {
         LOG_ERR("WEB", "Invalid font path: %s/%s", family.c_str(), filename.c_str());
+        fontUpload.code = "name";
         break;
       }
 
       // Create a temporary FontInstaller for directory creation
       FontInstaller installer(sdFontSystem.registry());
-      if (!installer.ensureFamilyDir(family.c_str())) {
+      if (!(fontUpload.pack ? (Storage.exists("/fonts") || Storage.mkdir("/fonts")) : installer.ensureFamilyDir(family.c_str()))) {
         LOG_ERR("WEB", "Failed to create font family dir");
+        fontUpload.code = "write";
         break;
       }
 
       if (Storage.exists(path)) {
         LOG_ERR("WEB", "Font file already exists");
+        fontUpload.code = "exists";
         break;
       }
       fontUpload.filePath = path;
 
       if (!Storage.openFileForWrite("WEB", path, fontUpload.file)) {
         LOG_ERR("WEB", "Failed to open font file for write: %s", path);
+        fontUpload.code = "write";
         break;
       }
 
@@ -2231,16 +2405,27 @@ void CrossPointWebServer::handleFontUploadData() {
       if (!fontUpload.valid) break;
       resetTaskWatchdogIfSubscribed();
 
-      const size_t received = fontUpload.bytesWritten + fontUpload.bufferPos;
-      constexpr char magic[] = "CPFONT\0\0";
-      for (size_t i = 0; i < upload.currentSize && received + i < 8; ++i) {
-        if (upload.buf[i] != static_cast<uint8_t>(magic[received + i])) {
+      if (fontUpload.vector) {
+        // Streamed verdict: header from the first 4 bytes, running size against the cap.
+        const auto verdict = fontUpload.check.feed(upload.buf, upload.currentSize);
+        if (verdict != FontInstaller::VectorUploadCheck::Verdict::OK) {
           fontUpload.valid = false;
+          fontUpload.code = verdict == FontInstaller::VectorUploadCheck::Verdict::TOO_BIG ? "size" : "magic";
           break;
         }
+      } else {
+        const size_t received = fontUpload.bytesWritten + fontUpload.bufferPos;
+        const char* magic = fontUpload.pack ? "PK\x03\x04" : "CPFONT\0\0";
+        const size_t magicSize = fontUpload.pack ? 4 : 8;
+        for (size_t i = 0; i < upload.currentSize && received + i < magicSize; ++i) {
+          if (upload.buf[i] != static_cast<uint8_t>(magic[received + i])) {
+            fontUpload.valid = false;
+            break;
+          }
+        }
+        if (!fontUpload.valid) break;
+        if (received + upload.currentSize >= magicSize) fontUpload.magicChecked = true;
       }
-      if (!fontUpload.valid) break;
-      if (received + upload.currentSize >= 8) fontUpload.magicChecked = true;
 
       // Font and general uploads share the serial HTTP handler's arena.
       size_t remaining = upload.currentSize;
@@ -2256,6 +2441,7 @@ void CrossPointWebServer::handleFontUploadData() {
         if (fontUpload.bufferPos >= UploadState::UPLOAD_BUFFER_SIZE) {
           if (fontUpload.file.write(this->upload.buffer.data(), fontUpload.bufferPos) != fontUpload.bufferPos) {
             fontUpload.valid = false;
+            fontUpload.code = "write";
             break;
           }
           fontUpload.bytesWritten += fontUpload.bufferPos;
@@ -2268,7 +2454,8 @@ void CrossPointWebServer::handleFontUploadData() {
     }
 
     case UPLOAD_FILE_END: {
-      fontUpload.valid = fontUpload.valid && fontUpload.magicChecked;
+      if (fontUpload.vector && fontUpload.valid && !fontUpload.check.complete()) fontUpload.code = "magic";
+      fontUpload.valid = fontUpload.valid && (fontUpload.vector ? fontUpload.check.complete() : fontUpload.magicChecked);
       // Flush remaining buffer
       if (fontUpload.valid && fontUpload.bufferPos > 0) {
         if (fontUpload.file.write(this->upload.buffer.data(), fontUpload.bufferPos) != fontUpload.bufferPos) {
@@ -2308,12 +2495,19 @@ void CrossPointWebServer::handleFontUploadData() {
 
 void CrossPointWebServer::handleFontUpload() {
   const Language lang = requestLanguage();
+  if (fontUpload.valid && fontUpload.pack)
+    fontUpload.valid = fontPackApplier && fontPackApplier(fontUpload.filePath.c_str());
   if (fontUpload.valid) {
     sdFontSystem.markRegistryDirty();
     server->send(200, "application/json", "{\"ok\":true}");
     LOG_DBG("WEB", "Font upload complete: %s", fontUpload.filePath.c_str());
   } else {
-    server->send(400, "application/json", webErrorBody(lang, StrId::STR_WEB_INVALID_CPFONT));
+    if (fontUpload.code) {
+      // The page owns the wording of these (3 locales), the device sends only the reason.
+      server->send(400, "application/json", String("{\"ok\":false,\"code\":\"") + fontUpload.code + "\"}");
+    } else {
+      server->send(400, "application/json", webErrorBody(lang, StrId::STR_WEB_INVALID_CPFONT));
+    }
   }
 }
 

@@ -9,6 +9,7 @@
 #include <ZipFile.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <cstdio>
@@ -286,36 +287,90 @@ TEST(HugeBookIndex, OrdinaryBooksKeepOneDirectoryScan) {
 
 // The size table stays resident for the whole reading session, next to the
 // page-turner radio. X3 r45b: reading a 2,000-chapter book with the radio on
-// already bottomed out at 23 KB free.
+// already bottomed out at 23 KB free. X3 v1.0.50: a 5,000-chapter book held a
+// 10,240 B block of chapter sizes beside the page; the radio's start then left
+// a 28,660 B largest block, under the 32,768 B it keeps, and it never stayed on.
+// A 5,000-chapter book may hold at most 2 KB more than a 30-chapter one.
+namespace {
+struct LoadedHeap {
+  size_t resident = 0, peak = 0, afterLookups = 0;
+};
+LoadedHeap loadAndReadSizes(int n) {
+  EXPECT_TRUE(indexBook(makeBook(Kind::Split, n), SIZE_MAX).ok);
+  LoadedHeap heap;
+  heapcap::reset(SIZE_MAX);
+  {
+    BookMetadataCache cache(cachePath);
+    EXPECT_TRUE(cache.load());
+    heap.resident = heapcap::live;
+    heap.peak = heapcap::peak;
+    uint32_t total = 0;
+    for (int i = 0; i < n; ++i) {
+      total += chapterBytes(i + 1);
+      EXPECT_EQ(cache.getCumulativeSize(i), total) << "spine " << i;
+    }
+    heap.afterLookups = heapcap::live;
+  }
+  heapcap::stop();
+  return heap;
+}
+}  // namespace
+
 TEST(HugeBookIndex, LoadedSizeTableStaysSmall) {
+  bigChapter = 0;
+  const LoadedHeap ordinary = loadAndReadSizes(30);
+  printf("HUGE_INDEX resident n=30 bytes=%zu peak=%zu\n", ordinary.resident, ordinary.peak);
   for (int big : {0, 777}) {
     bigChapter = big;
-    const Book book = makeBook(Kind::Split, 5000);
-    ASSERT_TRUE(indexBook(book, SIZE_MAX).ok);
-    heapcap::reset(SIZE_MAX);
-    size_t resident = 0, peak = 0;
-    {
-      BookMetadataCache cache(cachePath);
-      ASSERT_TRUE(cache.load());
-      resident = heapcap::live;
-      peak = heapcap::peak;
-      heapcap::stop();
-      uint32_t total = 0;
-      for (int i = 0; i < 5000; ++i) {
-        total += chapterBytes(i + 1);
-        ASSERT_EQ(cache.getCumulativeSize(i), total) << "spine " << i;
-      }
-    }
-    printf("HUGE_INDEX resident n=5000 big_chapter=%d bytes=%zu peak=%zu\n", big, resident, peak);
-    // Two bytes per chapter plus one running total per 32; a book with a
-    // chapter of 64 KB or more keeps four bytes per chapter.
-    EXPECT_LE(resident, big ? 5000u * 4 + 4096 : 5000u * 2 + 5000u / 8 + 4096);
-    // Load may also hold its two 4 KB read buffers, never both tables at once:
-    // the radio heap has room for one flat table, not for a flat table on top
-    // of the compact one.
-    EXPECT_LE(peak, (big ? 5000u * 4 : 5000u * 2 + 5000u / 8) + 2 * 4096 + 4096);
+    const LoadedHeap huge = loadAndReadSizes(5000);
+    printf("HUGE_INDEX resident n=5000 big_chapter=%d bytes=%zu peak=%zu after_lookups=%zu\n", big, huge.resident,
+           huge.peak, huge.afterLookups);
+    EXPECT_LE(huge.resident, ordinary.resident + 2048);
+    // Lookups keep nothing: the heap after a sweep of every chapter is the heap after load.
+    EXPECT_EQ(huge.afterLookups, huge.resident);
+    // Load may hold its two 4 KB read buffers on top.
+    EXPECT_LE(huge.peak, ordinary.resident + 2048 + 2 * 4096 + 4096);
   }
   bigChapter = 0;
+}
+
+// The chapter sizes stay in book.bin; lookups read them a window of 32 chapters at a time. Reading
+// straight through the book, every page asks the book's size and the running totals before and
+// after the current chapter: the card is opened at most once per 32 chapters, never per page.
+// Finding the chapter at a byte offset (percent jump, progress sync) opens it at most once.
+TEST(HugeBookIndex, SizeLookupsReachTheCardOncePerWindow) {
+  const int n = 5000;
+  ASSERT_TRUE(indexBook(makeBook(Kind::Split, n), SIZE_MAX).ok);
+  std::vector<uint32_t> cumulative(n);
+  uint32_t total = 0;
+  for (int i = 0; i < n; ++i) cumulative[i] = total += chapterBytes(i + 1);
+  BookMetadataCache cache(cachePath);
+  ASSERT_TRUE(cache.load());
+  cardCalls = {};
+  for (int spine = 0; spine < n; ++spine) {
+    for (int page = 0; page < 3; ++page) {
+      ASSERT_EQ(cache.getCumulativeSize(n - 1), total);
+      ASSERT_EQ(spine > 0 ? cache.getCumulativeSize(spine - 1) : 0u, spine > 0 ? cumulative[spine - 1] : 0u);
+      ASSERT_EQ(cache.getCumulativeSize(spine), cumulative[spine]) << "spine " << spine;
+    }
+  }
+  printf("HUGE_INDEX size_lookups n=%d opens=%zu reads=%zu seeks=%zu\n", n, cardCalls.opens, cardCalls.reads,
+         cardCalls.seeks);
+  EXPECT_LE(cardCalls.opens, static_cast<size_t>((n + 31) / 32));
+
+  for (const int spine : {0, 1, 31, 32, 33, 2500, 4991, 4992, n - 2, n - 1}) {
+    for (const int64_t delta : {-1, 0, 1}) {
+      const int64_t target = static_cast<int64_t>(cumulative[spine]) + delta;
+      if (target < 0) continue;
+      const auto it = std::lower_bound(cumulative.begin(), cumulative.end(), static_cast<uint32_t>(target));
+      const int expected = it == cumulative.end() ? -1 : static_cast<int>(it - cumulative.begin());
+      cardCalls = {};
+      EXPECT_EQ(cache.getSpineIndexForSize(static_cast<uint32_t>(target)), expected) << "target " << target;
+      EXPECT_LE(cardCalls.opens, 1u) << "target " << target;
+    }
+  }
+  EXPECT_EQ(cache.getSpineIndexForSize(0), 0);
+  EXPECT_EQ(cache.getSpineIndexForSize(total + 1), -1);
 }
 
 // The largest split book the open heap indexes, found by bisection. Every
@@ -676,4 +731,173 @@ TEST(BackgroundIndex, StepsFitBesideTheReader) {
   EXPECT_TRUE(built);
   // The one-pass TOC pass holds 8 bytes per chapter (40 KB here) on top of the parser.
   EXPECT_LT(tocPeak, 5000u * 8);
+}
+
+// The TOC step's own heap beside the inflater, parser included (its blocks go through the door
+// and are counted here): what the step's heap decision (BookMetadataCache::tocStepFits) books.
+TEST(BackgroundIndex, TocStepStaysInItsBudget) {
+  const Book book = makeBook(Kind::Split, 5000);
+  resetCard(book);
+  ASSERT_TRUE(writeChapterList(book));
+  heapcap::reset(SIZE_MAX);
+  ASSERT_TRUE(tocStep(book));
+  const size_t peak = heapcap::peak, biggest = heapcap::biggest;
+  heapcap::stop();
+  printf("TOC_STEP n=5000 nav=%zu peak=%zu biggest=%zu\n", book.nav.size(), peak, biggest);
+  // The parser's blocks go through the door, so they are counted: about 14 KB beside the 4 KB
+  // buffer. A parser on plain malloc shows the buffer alone.
+  EXPECT_GT(peak, 4096u + 8 * 1024);
+  // The X3 took 10 KB more than the host counts (zip readers and slices, block overhead).
+  EXPECT_LE(peak + 10 * 1024, BookMetadataCache::TOC_STEP_HEAP);
+  // The pass's 4 KB buffer and the parser's biggest block, with room for that block to double.
+  EXPECT_LE(4096 + 2 * biggest, BookMetadataCache::TOC_STEP_BLOCKS);
+}
+
+namespace {
+template <typename T>
+auto pauseToc(T& cache, int) -> decltype(cache.pauseDeferredTocPass()) { return cache.pauseDeferredTocPass(); }
+template <typename T>
+bool pauseToc(T&, long) { return true; }
+}
+
+TEST(BackgroundIndex, InterruptedNavAppendsAfterSavedEntries) {
+  for (int n : {30, 399, 2000, 5000}) {
+    const Book book = makeBook(Kind::Split, n);
+    resetCard(book);
+    ASSERT_TRUE(tocStep(book));
+    const auto expected = fileBytes(cachePath + "/toc.bin");
+    resetCard(book);
+    cardCalls = {};
+    size_t pauses = 0;
+    for (int boundary : {1, 257, 1024}) {
+      if (boundary >= n) continue;
+      size_t end = 0;
+      for (int i = 0; i < boundary; ++i) end = book.nav.find("</a>", end) + 4;
+      BookMetadataCache pass(cachePath);
+      ASSERT_TRUE(pass.beginDeferredTocPass());
+      TocNavParser nav(basePath, book.nav.size(), &pass);
+      ASSERT_TRUE(nav.setup());
+      {
+        heapcap::Untracked guard;
+        ASSERT_TRUE(feed(nav, book.nav.substr(0, end)));
+      }
+      ASSERT_EQ(pass.getTocCount(), boundary);
+      ASSERT_TRUE(pauseToc(pass, 0));
+      EXPECT_FALSE(BookMetadataCache::deferredTocReady(cachePath));
+      ++pauses;
+    }
+    ASSERT_TRUE(tocStep(book));
+    EXPECT_EQ(fileBytes(cachePath + "/toc.bin"), expected);
+    printf("TOC_RESUME n=%d pauses=%zu writes=%zu bytes=%zu output=%zu\n", n, pauses,
+           cardCalls.writes, cardCalls.writeBytes, expected.size());
+    EXPECT_LE(cardCalls.writeBytes, expected.size() + 128 * pauses + 3);
+  }
+}
+
+namespace {
+template <typename T>
+auto heapRefused(const T& cache, int) -> decltype(cache.wasHeapRefused()) { return cache.wasHeapRefused(); }
+template <typename T>
+bool heapRefused(const T&, long) { return false; }
+}
+
+TEST(BackgroundIndex, RadioHeapRefusalKeepsChapterListAndCheckpoint) {
+  for (int n : {2000, 5000}) {
+    const Book book = makeBook(Kind::Split, n);
+    const auto expected = onePassBookBin(book);
+    resetCard(book);
+    ASSERT_TRUE(writeChapterList(book) && tocStep(book));
+    BookMetadataCache part(cachePath);
+    ASSERT_TRUE(part.load(true));
+    stopAfter = n == 5000 ? 65 : 30;
+    stopAsked = 0;
+    heapcap::reset(60 * 1024);
+    const bool first = part.buildBookBinFromPart(epubPath, stopCounter);
+    heapcap::stop();
+    ASSERT_FALSE(first);
+    const auto chapterList = fileBytes(partPath);
+    const auto checkpoint = fileBytes(cachePath + "/book.ckpt");
+    ASSERT_FALSE(checkpoint.empty());
+    const auto temporary = fileBytes(cachePath + "/book.bin.tmp");
+    for (int retry = 0; retry < 4; ++retry) {
+      cardCalls = {};
+      heapcap::reset(RADIO_HEAP);
+      const bool built = part.buildBookBinFromPart(epubPath, nullptr);
+      const size_t peak = heapcap::peak;
+      const unsigned aborts = heapcap::aborts;
+      heapcap::stop();
+      printf("MERGE_REFUSE n=%d retry=%d built=%d peak=%zu writes=%zu bytes=%zu aborts=%u\n",
+             n, retry, built, peak, cardCalls.writes, cardCalls.writeBytes, aborts);
+      EXPECT_FALSE(built);
+      EXPECT_TRUE(heapRefused(part, 0));
+      EXPECT_EQ(aborts, 0u);
+      EXPECT_EQ(fileBytes(partPath), chapterList);
+      EXPECT_EQ(fileBytes(cachePath + "/book.ckpt"), checkpoint);
+      EXPECT_EQ(fileBytes(cachePath + "/book.bin.tmp"), temporary);
+      EXPECT_FALSE(Storage.exists(binPath.c_str()));
+    }
+    heapcap::reset(OPEN_HEAP);
+    const bool resumed = part.buildBookBinFromPart(epubPath, nullptr);
+    heapcap::stop();
+    ASSERT_TRUE(resumed);
+    EXPECT_FALSE(heapRefused(part, 0));
+    EXPECT_EQ(fileBytes(binPath), expected);
+  }
+}
+
+TEST(BackgroundIndex, PausingDuringReplayKeepsThePreviousCursor) {
+  const auto append = [](BookMetadataCache& pass, int count) {
+    for (int i = 0; i < count; ++i) pass.createTocEntry("Title", "chapter" + std::to_string(i), "", 0);
+  };
+  resetCard(makeBook(Kind::Split, 399));
+  {
+    BookMetadataCache pass(cachePath);
+    ASSERT_TRUE(pass.beginDeferredTocPass("nav"));
+    append(pass, 257);
+    ASSERT_TRUE(pass.pauseDeferredTocPass());
+  }
+  const auto saved = fileBytes(cachePath + "/toc.progress");
+  const auto entries = fileBytes(cachePath + "/toc.bin.tmp");
+  {
+    BookMetadataCache pass(cachePath);
+    ASSERT_TRUE(pass.beginDeferredTocPass("nav"));
+    append(pass, 1);
+    cardCalls = {};
+    ASSERT_TRUE(pass.pauseDeferredTocPass());
+    EXPECT_EQ(cardCalls.writeBytes, 0u);
+  }
+  EXPECT_EQ(fileBytes(cachePath + "/toc.progress"), saved);
+  EXPECT_EQ(fileBytes(cachePath + "/toc.bin.tmp"), entries);
+  {
+    BookMetadataCache pass(cachePath);
+    ASSERT_TRUE(pass.beginDeferredTocPass("nav"));
+    append(pass, 399);
+    ASSERT_TRUE(pass.endDeferredTocPass());
+  }
+  const auto resumed = fileBytes(cachePath + "/toc.bin");
+  BookMetadataCache fresh(cachePath);
+  ASSERT_TRUE(fresh.beginDeferredTocPass("nav", true));
+  append(fresh, 399);
+  ASSERT_TRUE(fresh.endDeferredTocPass());
+  EXPECT_EQ(fileBytes(cachePath + "/toc.bin"), resumed);
+}
+
+TEST(BackgroundIndex, InvalidCursorAndDifferentSourceRestartTheToc) {
+  for (bool changedSource : {false, true}) {
+    resetCard(makeBook(Kind::Split, 30));
+    {
+      BookMetadataCache pass(cachePath);
+      ASSERT_TRUE(pass.beginDeferredTocPass("nav"));
+      pass.createTocEntry("Old", "old", "", 0);
+      ASSERT_TRUE(pass.pauseDeferredTocPass());
+    }
+    if (!changedSource) Storage.files[cachePath + "/toc.progress"]->bytes.back() ^= 1;
+    BookMetadataCache pass(cachePath);
+    ASSERT_TRUE(pass.beginDeferredTocPass(changedSource ? "ncx" : "nav"));
+    EXPECT_EQ(pass.getTocCount(), 0);
+    pass.createTocEntry("New", "new", "", 0);
+    ASSERT_TRUE(pass.endDeferredTocPass());
+    const auto result = fileBytes(cachePath + "/toc.bin");
+    EXPECT_EQ(std::search(result.begin(), result.end(), "Old", "Old" + 3), result.end());
+  }
 }

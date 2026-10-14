@@ -14,8 +14,10 @@ p.add_argument('--repo', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--sanitize', action='store_true')
 p.add_argument('--web-baseline', type=Path)
+p.add_argument('--i18n-dir', type=Path)
 a = p.parse_args()
 r, out = a.repo.resolve(), a.output.resolve()
+i18n = a.i18n_dir.resolve() if a.i18n_dir else r / 'lib/I18n'
 out.mkdir(parents=True, exist_ok=True)
 here = Path(__file__).resolve().parent
 
@@ -31,7 +33,7 @@ def method(text, sig):
 paths = ['src/SettingsList.h', 'src/MenuCustomization.h', 'src/MenuCustomization.cpp',
          'src/activities/settings/SettingsActivity.h', 'src/activities/settings/SettingsActivity.cpp',
          'src/activities/settings/SettingsTabs.h', 'src/activities/settings/SettingsTabs.cpp',
-         'src/activities/home/HomeActivity.cpp', 'src/network/CrossPointWebServer.cpp', 'lib/I18n/I18nKeys.h',
+         'src/activities/home/HomeRows.cpp', 'src/network/CrossPointWebServer.cpp', 'lib/I18n/I18nKeys.h',
          'src/CrossPointSettings.cpp']
 (out / 'source-manifest.json').write_text(json.dumps({x: hashlib.sha256((r/x).read_bytes()).hexdigest() for x in paths}, indent=2)+'\n')
 (out / 'SettingsList.h').write_text((r / paths[0]).read_text())
@@ -39,45 +41,54 @@ header = (r / paths[3]).read_text()
 source = (r / paths[4]).read_text()
 (out / 'activities/settings').mkdir(parents=True, exist_ok=True)
 (out / 'activities/settings/SettingsActivity.h').write_text(
-    '#pragma once\n#include <functional>\n#include <string>\n#include <vector>\n#include <I18n.h>\n'
+    '#pragma once\n#include <functional>\n#include <span>\n#include <string>\n#include <vector>\n#include <I18n.h>\n'
     '#include "CrossPointSettings.h"\n#include "activities/settings/SettingsTabs.h"\n' +
+    '#include "components/SettingsChoiceStyle.h"\n'
+    'namespace tenorchrome {\n'
+    '#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO\n'
+    'constexpr bool kTouchShell = true;\n'
+    '#else\n'
+    'constexpr bool kTouchShell = false;\n'
+    '#endif\n}\n' +
     header[header.index('enum class SettingType'):header.index('class SettingsActivity final')])
 category = (r / 'test/settings_catalog/category/harness.cpp').read_text()
 boundaries = category[category.index('HalTiltSensor halTiltSensor;'):category.index('struct SettingsActivity {')]
 (out / 'Boundaries.inc').write_text(boundaries)
 fields = header[header.index('  std::vector<SettingInfo> displaySettings;'):header.index('  const std::vector<SettingInfo>* currentSettings')]
 (out / 'Fields.inc').write_text(fields)
-sigs = ['std::vector<SettingInfo>& SettingsActivity::danhSachCuaThe', 'void SettingsActivity::rebuildSettingsLists()',
+sigs = ['std::vector<SettingInfo>& SettingsActivity::danhSachCuaThe', 'bool SettingsActivity::listedAsRow(',
+        'void SettingsActivity::rebuildSettingsLists(',
         'std::string SettingsActivity::favoriteKey(', 'int SettingsActivity::focusFavorite(']
 methods = ''.join(method(source, s) for s in sigs)
 (out / 'Methods.inc').write_text(methods)
-home = (r / 'src/activities/home/HomeActivity.cpp').read_text()
-home = home[home.index('case Tab::CAI_DAT: {'):]
-home = home[:home.index('\n    }')]
-(out / 'HomeSettings.inc').write_text(home.split('{', 1)[1].replace('      break;', ''))
+# The Settings page rows are listed by homerows::settingsGroups(), shared by both shells: compile that.
+rows = (r / 'src/activities/home/HomeRows.cpp').read_text()
+(out / 'HomeSettings.inc').write_text(
+    'namespace homerows {\nstruct SettingsGroups { std::vector<int> ids; std::vector<std::string> labels; };\n' +
+    method(rows, 'SettingsGroups settingsGroups()') + '}\n')
 web = (r / 'src/network/CrossPointWebServer.cpp').read_text()
 (out / 'Web.inc').write_text(method(web, 'void CrossPointWebServer::handleGetSettings() const'))
 # The serializer first adopts the status bar switches for the stored mode, so the
 # production adopt step and the mode table it reads are compiled in as well.
 settings = (r / 'src/CrossPointSettings.cpp').read_text()
-adopt = 'void CrossPointSettings::adoptReaderStatusItems()'
-(out / 'StatusItems.inc').write_text(
-    settings[settings.index('namespace {\n// What each reader status bar mode shows'):settings.index(adopt)] +
-    method(settings, adopt))
-keys = (r / 'lib/I18n/I18nKeys.h').read_text()
+status_start = settings.index('namespace {\n// What each reader status bar mode shows')
+status_end = settings.index('ReaderRenderSpec CrossPointSettings::readerRenderSpec')
+(out / 'StatusItems.inc').write_text(settings[status_start:status_end])
+keys = (i18n / 'I18nKeys.h').read_text()
 keys = re.findall(r'^\s*(STR_[A-Z0-9_]+)\s*,', keys[keys.index('enum class StrId'):], re.M)
 (out / 'KeyNames.inc').write_text(',\n'.join(json.dumps(x) for x in keys))
 for name in ['HalTiltSensor', 'HalClock']:
     instance = name[0].lower() + name[1:]
     (out / (name+'.h')).write_text('#pragma once\nclass '+name+' { public: bool available=false; bool isAvailable() const { return available; } };\nextern '+name+' '+instance+';\n')
 incs = ['test/host_stubs', 'src', '.pio/libdeps/gh_release/ArduinoJson/src', 'lib/Epub', 'lib/Logging',
-        'lib/EpdFont', 'lib/Serialization', 'lib/KOReaderSync', 'lib/I18n',
-        'freeink-sdk/libs/hardware/BoardConfig/include', 'freeink-sdk/libs/ui/FreeInkUI/include']
+        'lib/EpdFont', 'lib/Serialization', 'lib/KOReaderSync',
+        'freeink-sdk/libs/hardware/BoardConfig/include', 'lib/BlePageTurner/include', 'freeink-sdk/libs/ui/FreeInkUI/include']
 common = [os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-g', '-ffunction-sections', '-fdata-sections',
           '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections',
           '-DENABLE_ARDUINO_FEATURES=0', '-DCROSSPOINT_VERSION="sleep-split"', '-I'+str(out)]
 if a.sanitize:
     common += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+common += ['-I' + str(i18n)]
 common += ['-I'+str(r/x) for x in incs]
 expected_web = json.loads((here/'web-schema-sha256.json').read_text())
 results = []
@@ -87,7 +98,7 @@ for profile in ['c3', 'pro', 'persistence']:
         cmd = [common[0], '-I'+str(here/'stubs'), *common[1:], str(here/'persistence.cpp')]
     else:
         cmd = common + defines + [str(here/'harness.cpp'), str(r/'src/ReaderFontSizes.cpp'),
-               str(r/'src/activities/settings/SettingsTabs.cpp'), str(r/'lib/I18n/I18n.cpp'), str(r/'lib/I18n/I18nStrings.cpp')]
+               str(r/'src/activities/settings/SettingsTabs.cpp'), str(i18n/'I18n.cpp'), str(i18n/'I18nStrings.cpp')]
     cmd += ['-o', str(out/profile)]
     (out/(profile+'-command.json')).write_text(json.dumps(cmd, indent=2)+'\n')
     build = subprocess.run(cmd, capture_output=True, text=True)
@@ -98,9 +109,10 @@ for profile in ['c3', 'pro', 'persistence']:
     if profile == 'persistence':
         cases = [([], 'persistence')]
     else:
-        cases = [([board, str(theme), str(imu), str(optional)], f'{board}-{theme}-{imu}-{optional}')
+        cases = [([board, str(imu), str(optional), str(shell)],
+                  f'{board}-{imu}-{optional}' + ('-ugly' if shell else ''))
                  for board in (['pro'] if profile == 'pro' else ['x3', 'x4'])
-                 for theme in [0, 1] for imu in [0, 1] for optional in [0, 1]]
+                 for imu in [0, 1] for optional in [0, 1] for shell in [0, 1]]
     for argv, case in cases:
         run = subprocess.run([str(out/profile), *argv], capture_output=True, text=True)
         (out/(case+'.log')).write_text(run.stdout+run.stderr)
@@ -109,11 +121,27 @@ for profile in ['c3', 'pro', 'persistence']:
             measured = json.loads(run.stdout)
             (out/(case+'-web.json')).write_text(json.dumps(measured['web'], sort_keys=True, indent=2)+'\n')
             result.update({k:v for k,v in measured.items() if k != 'web'})
-            if hashlib.sha256((out/(case+'-web.json')).read_bytes()).hexdigest() != expected_web[case]:
+            # The shell is chosen on the device: changing it from the page would skip shell::changed().
+            if any(row['key'] in ('uiShell', 'uiUglyLevel', 'uiShellSleepMemo') for row in measured['web']):
+                result['shell_row_on_web'] = True
+                result['exit'] = 1
+            if hashlib.sha256((out/(case+'-web.json')).read_bytes()).hexdigest() != expected_web.get(case):
                 result['web_schema_mismatch'] = True
                 result['exit'] = 1
             if a.web_baseline:
-                old = json.loads((a.web_baseline/(case+'-web.json')).read_text())
+                baseline_case = case.removesuffix('-ugly')
+                old = json.loads((a.web_baseline/(baseline_case+'-web.json')).read_text())
+                if case.endswith('-ugly'):
+                    old = [row for row in old if row['key'] not in ('wakeIntoBook', 'tipsEnabled')]
+                    old.append({'category': 'STR_CAT_DISPLAY', 'key': 'uglyStartScreen',
+                                'name': 'STR_UGLY_START_SCREEN',
+                                'options': ['STR_UGLY_START_BOOK', 'STR_UGLY_ROOT_SCREEN',
+                                            'STR_UGLY_START_RECENT'],
+                                'type': 'enum', 'value': 1})
+                    old.append({'category': 'STR_CAT_DISPLAY', 'key': 'uglyRootScreen',
+                                'name': 'STR_UGLY_ROOT_SCREEN',
+                                'options': ['STR_UGLY_START_DIARY', 'STR_UGLY_START_DESK'],
+                                'type': 'enum', 'value': 0})
                 if old != measured['web']:
                     result['web_schema_mismatch'] = True
                     result['exit'] = 1

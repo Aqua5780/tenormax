@@ -1,4 +1,5 @@
 #include "OpdsSettingsActivity.h"
+#include "activities/settings/X3SettingsLayout.h"
 
 #include <GfxRenderer.h>
 #include <I18n.h>
@@ -149,7 +150,12 @@ void OpdsSettingsActivity::handleSelection() {
       }
     };
     startActivityForResult(std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_PASSWORD),
-                                                                   editServer.password, 63, InputType::Text),
+                                                                   editServer.password, 63,
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+                                                                   InputType::Password),
+#else
+                                                                   InputType::Text),
+#endif
                            handler);
   } else if (nav.selected == 4 && !isNewServer) {
     // Delete flow is only available for existing servers.
@@ -168,17 +174,22 @@ void OpdsSettingsActivity::buildScreen(UiScreen& screen) {
   // Content below the GUI.drawHeader band, above the button hints; derived
   // from the safe area so board bezel insets apply (same as LanguageSelect).
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-  screen.setContentMarginFromScreen(
-      fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-                  static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
-                  static_cast<int16_t>(safe.x)});
+  if (x3settings::beginScreen(screen, renderer, tr(STR_CALIBRE_URL_HINT),
+                             showSaveError ? tr(STR_ERROR_GENERAL_FAILURE) : nullptr)) {
+    tabBandDrawn = true;
+  } else {
+    screen.setContentMarginFromScreen(
+        fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
+                    static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
+                    static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
+                    static_cast<int16_t>(safe.x)});
 
-  // URL hint where the old sub-header band sat.
-  const fui::Rect band = screen.takeTop(static_cast<int16_t>(metrics.tabBarHeight));
-  const int16_t pad = screen.theme().headerSidePadding;
-  screen.target().text(band.inset(fui::Insets{0, pad, 0, pad}), tr(STR_CALIBRE_URL_HINT), screen.theme().smallText);
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+    // URL hint where the old sub-header band sat.
+    const fui::Rect band = screen.takeTop(static_cast<int16_t>(metrics.tabBarHeight));
+    const int16_t pad = screen.theme().headerSidePadding;
+    screen.target().text(band.inset(fui::Insets{0, pad, 0, pad}), tr(STR_CALIBRE_URL_HINT), screen.theme().smallText);
+    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  }
 
   // fieldRowItems' labels/actionValue were set once in the constructor; only
   // the live value pointers (already pointing at editServer's own fields, no
@@ -210,6 +221,15 @@ const char* OpdsSettingsActivity::headerTitle() const {
 
 void OpdsSettingsActivity::drawFooter() {
   UiListActivity::drawFooter();
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* tip = tr(STR_CALIBRE_URL_HINT);
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip));
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect);
+    if (showSaveError)
+      tenorchrome::drawInfoInRect(renderer, tr(STR_ERROR_GENERAL_FAILURE),
+                                  x3settings::infoRect(renderer, tr(STR_ERROR_GENERAL_FAILURE), tip));
+    return;
+  }
   if (showSaveError) {
     GUI.drawPopup(renderer, tr(STR_ERROR_GENERAL_FAILURE));
   }

@@ -10,6 +10,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include "components/X3NavigationPath.h"
 
 inline unsigned long testMillis = 0;
 inline unsigned long millis() { return testMillis; }
@@ -50,6 +51,18 @@ enum StrId {
   STR_SELECT,
   STR_SHOW_NETWORKS,
   STR_TO_PREFIX,
+  STR_UGLY_WIFI_CONNECTED,
+  STR_UGLY_WIFI_CONNECTING,
+  STR_UGLY_WIFI_FAILED,
+  STR_UGLY_WIFI_SCANNING,
+  STR_UGLY_WIFI_TIP,
+  STR_UGLY_WIFI_NONE,
+  STR_UGLY_WIFI_SAVE_ASK,
+  STR_UGLY_WIFI_SAVE_YES,
+  STR_UGLY_WIFI_SAVE_NO,
+  STR_UGLY_WIFI_FORGET_ASK,
+  STR_UGLY_WIFI_FORGET_YES,
+  STR_UGLY_WIFI_FORGET_NO,
   STR_WIFI_NETWORKS,
   STR_WIFI_NOT_IN_RANGE,
   STR_YES,
@@ -64,6 +77,11 @@ inline const char* tr(const StrId id) {
   if (id == STR_TO_PREFIX) return "To: ";
   return "text";
 }
+
+struct TestI18n {
+  const char* get(const StrId id) const { return tr(id); }
+};
+inline TestI18n I18N;
 
 #define LOG_ERR(...)
 #define LOG_INF(...)
@@ -87,7 +105,7 @@ struct ThemeMetrics {
   int popupCornerRadius = 1;
 };
 
-enum class EpdFontFamily { BOLD };
+enum class EpdFontFamily { BOLD, REGULAR };
 constexpr int UI_10_FONT_ID = 10;
 constexpr int UI_12_FONT_ID = 12;
 constexpr int SMALL_FONT_ID = 8;
@@ -106,6 +124,8 @@ class GfxRenderer {
   int getScreenHeight() const { return 800; }
   int getLineHeight(int) const { return 20; }
   int getTextWidth(int, const char*) const { return 20; }
+  std::string truncatedText(int, const char* text, int, EpdFontFamily = EpdFontFamily::REGULAR) const { return text; }
+  void drawText(int, int, int, const char*) const {}
   FontCacheManager* getFontCacheManager() { return &cache; }
 };
 
@@ -169,6 +189,7 @@ class Activity {
  protected:
   GfxRenderer& renderer;
   MappedInputManager& mappedInput;
+  std::string navigationPrefix;
 
  public:
   inline static bool didFinish = false;
@@ -179,10 +200,14 @@ class Activity {
 
   Activity(const char*, GfxRenderer& renderer, MappedInputManager& input) : renderer(renderer), mappedInput(input) {}
   virtual ~Activity() = default;
+  virtual std::string navigationLabel() const { return {}; }
+  virtual std::string x3NavigationLabel() const { return navigationLabel(); }
+  virtual tenorchrome::X3PathIcon navigationIcon() const { return tenorchrome::X3PathIcon::More; }
   virtual void onEnter() {}
   virtual void onExit() {}
   virtual void loop() {}
   virtual void render(RenderLock&&) {}
+  virtual bool preventAutoSleep() { return false; }
   void requestUpdate(bool = false) { didRequestUpdate = true; }
   void startActivityForResult(std::unique_ptr<Activity>&& next, ActivityResultHandler handler) {
     child = std::move(next);
@@ -203,6 +228,7 @@ struct Rect {
   int16_t y = 0;
   int16_t width = 480;
   int16_t height = 800;
+  bool empty() const { return width <= 0 || height <= 0; }
 };
 struct Insets {
   int16_t top, right, bottom, left;
@@ -230,12 +256,23 @@ struct Styles {
 inline Styles defaultPopupStyles() { return {}; }
 constexpr uint8_t InputTouch = 1;
 constexpr uint8_t InputLongPress = 2;
+enum class BitmapFormat : uint8_t { BW1, Mask1 };
+struct BitmapRef {
+  const uint8_t* data = nullptr;
+  uint16_t width = 0;
+  uint16_t height = 0;
+  BitmapFormat format = BitmapFormat::BW1;
+  bool progmem = true;
+};
 struct ListItem {
   const char* label = nullptr;
   const char* value = nullptr;
   int16_t actionValue = 0;
+  const BitmapRef* valueIcons = nullptr;
 };
 struct ListProps {
+  bool scrollIndicator = true;
+  int16_t rowInset = 0;
   ListItem* items = nullptr;
   uint16_t count = 0;
   ActionId action = 0;
@@ -243,6 +280,7 @@ struct ListProps {
   int valueInset = 0;
   TextStyle labelText;
   bool balanceWrappedLabelWithValue = true;
+  bool partialTrailingRow = false;
   int selected = 0;
   int top = 0;
   int16_t rowHeight = 0;
@@ -274,21 +312,35 @@ struct Theme {
   TextStyle bodyText, smallText;
   int16_t rowHeight = 40;
   int16_t listRowGap = 0;
+  int16_t spaceMd = 8;
 };
 struct Frame {};
 struct Target {};
 class UiScreen {
  public:
   Theme valueTheme;
+  Rect content;
   Frame valueFrame;
   Target valueTarget;
   void setContentMarginFromScreen(Insets) {}
   void centeredText(const char*, TextStyle) {}
   Theme& theme() { return valueTheme; }
-  Rect body() const { return {}; }
+  Rect body() const { return content; }
+  // Same bounded bottom reservation as the SDK Screen, with fake display I/O.
+  Rect takeBottom(int16_t height) {
+    height = std::clamp<int16_t>(height, 0, content.height);
+    const Rect band{content.x, static_cast<int16_t>(content.y + content.height - height), content.width, height};
+    content.height = static_cast<int16_t>(content.height - height);
+    return band;
+  }
   Frame& frame() { return valueFrame; }
   Target& target() { return valueTarget; }
   void list(const ListProps&) {}
+  // The list viewport sync (#3668): hands the selection to the props, like ListNav::syncToProps.
+  template <typename Nav>
+  void syncListViewport(Nav& nav, ListProps& props, int) {
+    props.selected = nav.selected;
+  }
 };
 inline void button(Frame&, Rect, const ButtonProps&) {}
 inline void optionDialog(Frame&, Rect, const OptionDialogProps&) {}
@@ -306,6 +358,13 @@ struct ListNav {
 }  // namespace freeink::ui
 
 using UiScreen = freeink::ui::UiScreen;
+class PageScrollbar {
+ public:
+  static PageScrollbar& instance() { static PageScrollbar scrollbar; return scrollbar; }
+  template<class Renderer, class Target, class Rect, class Nav>
+  void drawList(const Renderer&, Target&, const Rect&, const Nav&, int) {}
+  template<class Renderer, class Target> void repaint(const Renderer&, Target&) {}
+};
 
 struct RouteResult {
   bool routed = false;
@@ -319,11 +378,19 @@ class FakeUiApp {
   void setScreen(Callback, void*) {}
   void clearTapFlash() {}
   bool invalidated() const { return false; }
+  freeink::ui::Rect publishedRect(int, int16_t) const { return {}; }
+};
+struct FakeUiTarget {
+  void setPaintingEnabled(bool) {}
 };
 class UiAppHost {
  protected:
+  FakeUiTarget uiTarget;
   FakeUiApp app;
   explicit UiAppHost(GfxRenderer&) {}
+  // The production X3 chrome compiles out this touch-only branch.
+  int swipeRows(MappedInputManager&, freeink::ui::ListNav&, int, int);
+  static void followStep(freeink::ui::ListNav& nav, int count) { nav.follow(count); }
   void resetUi() {}
   void renderUi() {}
   RouteResult routeTouch(MappedInputManager&, bool = false) { return {}; }
@@ -390,6 +457,7 @@ constexpr int WIFI_ALL_CHANNEL_SCAN = 0;
 constexpr int WIFI_CONNECT_AP_BY_SIGNAL = 0;
 class IPAddress {
  public:
+  std::string toString() const { return "192.0.2.1"; }
   uint8_t bytes[4] = {192, 168, 1, 2};
   uint8_t operator[](size_t index) const { return bytes[index]; }
 };
@@ -407,6 +475,7 @@ class WiFiClass {
   int disconnectCalls = 0;
   int beginCalls = 0;
   bool lastErase = false;
+  bool connectWhenStationReady = false;
   void reset() { *this = WiFiClass{}; }
   void persistent(bool) {}
   bool mode(wifi_mode_t mode) {
@@ -433,7 +502,7 @@ class WiFiClass {
   int encryptionType(int index) const { return found.at(static_cast<size_t>(index)).encryption; }
   void begin(const char*, const char* = nullptr) {
     beginCalls++;
-    connectionStatus = WL_IDLE_STATUS;
+    connectionStatus = connectWhenStationReady && currentMode == WIFI_STA ? WL_CONNECTED : WL_IDLE_STATUS;
   }
   wl_status_t status() const { return connectionStatus; }
   IPAddress localIP() const { return {}; }
@@ -473,6 +542,7 @@ class HalClock {
 inline HalClock halClock;
 
 struct CrossPointSettings {
+  uint8_t uiTextSize = 0;
   int clockHasBeenSynced = 0;
   int clockAutoTimezone = 0;
   uint8_t clockUtcOffsetQ = 48;
@@ -507,6 +577,7 @@ inline esp_err_t esp_read_mac(uint8_t* mac, int) {
   std::fill(mac, mac + 6, 1);
   return ESP_OK;
 }
+inline const char* defaultNetworkName() { return "tenor-cross"; }
 inline void deviceNetworkName(char* out, size_t size, const char* fallback) { std::snprintf(out, size, "%s", fallback); }
 struct FakeEsp {
   unsigned getFreeHeap() const { return 100000; }

@@ -1,8 +1,10 @@
 #pragma once
+#include "shells/ugly/UglyMarkSeed.h"
 
 #include <vector>
 
 #include "activities/UiListActivity.h"
+#include "components/TenorMenuChrome.h"
 
 // UiListActivity variant for screens with a tab band above the list (Settings,
 // Text Settings). Navigation keeps position 0 for the tab bar and 1..N for
@@ -20,10 +22,11 @@
 class UiTabListActivity : public UiListActivity {
  public:
   void onEnter() override;
-  void loop() override;
+  uint64_t uglyIconPageKey() override {
+    return static_cast<uint64_t>(static_cast<uint32_t>(activeTab())) << 32 | UiListActivity::uglyIconPageKey();
+  }
   void captureNavigation(MenuNavigationState& state) const override;
   void restoreNavigation(const MenuNavigationState& state) override;
-  bool managesTiltSensor() const override { return true; }
 
   struct CuaSoThe {
     int dau = 0;  // chi so the dau tien hien ra
@@ -51,18 +54,22 @@ class UiTabListActivity : public UiListActivity {
   static int theVuaMan(int beRong, int nhanRongNhat, int vien, int khoang, int tong);
 
  protected:
+  mutable ugly::MarkState tabMark_;
   virtual int preferredTabBarHeight() const;
   // Tab-bar action; subclass actions start at ACTION_TAB_USER.
   static constexpr freeink::ui::ActionId ACTION_TAB = ACTION_USER;
   static constexpr freeink::ui::ActionId ACTION_TAB_USER = ACTION_USER + 1;
 
-  UiTabListActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput);
+  UiTabListActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
+                    bool wantsTouchLongPress = false);
 
   // --- subclass contract (in addition to UiListActivity's) ------------------
   virtual int tabCount() const = 0;
   virtual int activeTab() const = 0;
   virtual const char* tabLabel(int index) const = 0;
-  virtual freeink::ui::BitmapRef tabIcon(int /*index*/) const { return {}; }
+  // `bold` asks for the selected tab's heavier drawing (stroke 4); the others are drawn grey in stroke 3.
+  virtual freeink::ui::BitmapRef tabIcon(int /*index*/, bool /*bold*/) const { return {}; }
+  virtual freeink::ui::TabIndicator tabIndicator(int) const { return freeink::ui::TabIndicator::None; }
 
   // Touch tap on a tab pill (bounds already checked).
   virtual void onTabAction(int index) = 0;
@@ -73,13 +80,10 @@ class UiTabListActivity : public UiListActivity {
   virtual bool allowsTiltTabNavigation() const { return true; }
   bool acceptsTiltTabNavigation() const;
   bool queueTiltTabNavigation(bool forward, bool backward);
-  // Row tilt shares the modal gate with tab tilt: a popup owning the screen
-  // stands both of them down.
-  virtual bool allowsTiltMenuNavigation() const { return allowsTiltTabNavigation(); }
-  bool acceptsTiltMenuNavigation() const;
-  // One gesture is one row, wrap included: the same intents the two front
-  // buttons queue.
-  bool queueTiltMenuNavigation(bool up, bool down);
+  // Row tilt shares the modal gate with tab tilt: a popup owning the screen stands the rows down
+  // (a value list takes the row tilt itself, tiltPopup).
+  bool allowsTiltMenuNavigation() const override { return allowsTiltTabNavigation(); }
+  void pollTilt() override;
   // Moi man the tu quyet nghia cua Chon va Quay lai; luat chung tu 14/09/2026 dem: Chon o thanh
   // the buoc xuong dong dau, Quay lai roi man mot nhip.
   bool handleButtons() override = 0;
@@ -102,7 +106,14 @@ class UiTabListActivity : public UiListActivity {
   freeink::ui::ListNav& activeNav() override;
   // Ring position of the active tab (0 = tab bar) for const contexts.
   int ringPos() const;
-  int favoriteSelectedRow() override { return ringPos() - 1; }
+  uint64_t selectionMarkKey() override {
+    return (static_cast<uint64_t>(activeTab()) << 32) | static_cast<uint32_t>(ringPos());
+  }
+  // Touch: a tap opens the row and moves neither the cursor nor the viewport, so the row last tapped is
+  // the one a hold pins. A screen whose ring means something on touch (Home's Recent card steps
+  // between books by it) says so here.
+  virtual bool touchRowMovesRing() const { return false; }
+  int favoriteSelectedRow() override { return tenorchrome::kTouchShell && !touchRowMovesRing() ? touchedRow : ringPos() - 1; }
   // ACTION_ROW lands as ring = row + 1, then activateIndex(row).
   void onRowAction(const freeink::ui::ActionEvent& event) override;
   // Release walks the row ring; continuous hold steps the tab. Both queue an
@@ -126,16 +137,23 @@ class UiTabListActivity : public UiListActivity {
   // Move to a ring position: tab bar rewinds the viewport, a row pulls the
   // viewport to itself. Landing on a row in a tab other than the one that last
   // held the cursor drops every other tab's remembered position (see rowTab).
-  void moveRingTo(int ringIndex);
+  // A row step passes its direction (+1/-1) so the viewport flips by whole pages
+  // (ButtonNavigator::pageTopAfterStep); 0 pulls it the minimal amount.
+  void moveRingTo(int ringIndex, int direction = 0);
   void commitTabNavigation();
 
   static constexpr int16_t MUI_TEN_LE = 14;   // mang le moi ben, danh cho mui ten
   static constexpr int MUI_TEN_NUA = 5;       // nua do mo chu V: cao 11, rong 7
   void veMuiTenThe(const freeink::ui::Rect& thanh, int16_t le);
+  // Tenor buttons-only bar: no outline; the selected tab a round white pill with a black 3 px ring and
+  // a stroke-4 icon, the others grey stroke-3 icons (or labels).
+  void veThanhTheTenor(UiScreen& screen, const freeink::ui::Rect& thanh, const freeink::ui::TabItem* tabs, int count,
+                       const freeink::ui::TextStyle& chu);
 
   // The shared tab band: theme-driven pill treatment (label-hugging Lyra vs
   // full-slot RoundedRaff), Lyra focused band wash, always-on divider.
   void buildTabBar(UiScreen& screen);
+  void drawChrome() override;
   // Ring-aware counterpart of syncListViewport: measures rows, applies the
   // one-shot follow to the remembered row, clamps, and writes
   // props.selectedIndex = ring - 1. hasSubtitle: see syncListViewport().
@@ -153,6 +171,12 @@ class UiTabListActivity : public UiListActivity {
   // tab-switch code can seed the target tab's ring/viewport.
   std::vector<freeink::ui::ListNav> tabNavs;
 
+  // When > 0, each tab pill is capped at its label width plus this padding
+  // per side, centered in its unchanged equal-width slot. With few tabs the
+  // default full-slot pill stretches across a third of the screen; screens
+  // with more tabs (Settings) keep the default of 0 (fill the slot).
+  int16_t tabPillMaxPad = 0;
+
  private:
   // Cua so the, ghi lai moi lan buildTabBar() chay.
   int cuaSoDau = 0;
@@ -166,5 +190,7 @@ class UiTabListActivity : public UiListActivity {
   int rowTab = -1;
   void forgetOtherTabs();
 
+  int touchedRow = -1;
   static void tabActionTrampoline(const freeink::ui::ActionEvent& event, void* user);
+  void showTabOrderMenu(int id);
 };

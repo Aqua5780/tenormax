@@ -9,6 +9,9 @@ extern HalClock halClock;  // Singleton
 class HalClock {
   bool _available = false;
   mutable Rtc _sdkRtc;
+  // The RTC keeps UTC and seeds the system clock at begin(); local time comes
+  // from newlib's localtime_r under the POSIX TZ rule set via setTimezone(),
+  // so zones with DST are correct year-round.
 
  public:
   // Call after BoardConfig has selected the active device.
@@ -20,7 +23,17 @@ class HalClock {
   // True when the running system clock has a supported UTC calendar date.
   bool hasValidTime() const;
 
-  // Get current hour (0-23) and minute (0-59).
+  // Set the POSIX TZ rule (e.g. "CET-1CEST,M3.5.0,M10.5.0/3") applied to every
+  // read. nullptr/empty falls back to UTC. Drops the read cache so the change
+  // shows immediately. Tenor: driven by timezones::applyToClock() (called at
+  // boot and whenever clockTimezone/clockDst/clockAutoTimezone change).
+  void setTimezone(const char* posixTz);
+
+  // Current wall-clock time in the configured timezone.
+  // Returns false until the system clock has valid time from NTP or the RTC.
+  bool localTime(struct tm& out) const;
+
+  // Get current local hour (0-23) and minute (0-59).
   // Returns false until the system clock has valid time from NTP or the RTC.
   bool getTime(uint8_t& hour, uint8_t& minute) const;
 
@@ -29,12 +42,16 @@ class HalClock {
   // Returns false after a full power loss until a valid time source is available.
   bool getDateTime(uint16_t& year, uint8_t& month, uint8_t& day, uint8_t& hour, uint8_t& minute) const;
 
-  // Format time into a caller-provided buffer.
+  // Minutes the configured timezone is ahead of UTC right now (daylight saving
+  // included), from the same system clock getDateTime() reads. Returns false
+  // while that clock has no valid time.
+  bool utcOffsetMinutes(int& minutes) const;
+
+  // Format the local time (configured timezone) into a caller-provided buffer.
   // 24h mode produces "HH:MM" (needs >=6 bytes); 12h mode produces "H:MM AM"/"HH:MM PM" (needs >=9 bytes).
-  // utcOffsetQuarterHoursBiased: biased quarter-hour offset (48 = UTC+0, 0 = UTC-12, 104 = UTC+14).
   // use12Hour: when true, format as 12-hour clock with AM/PM suffix.
   // Returns false until the system clock has valid time from NTP or the RTC.
-  bool formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased = 48, bool use12Hour = false) const;
+  bool formatTime(char* buf, size_t bufSize, bool use12Hour = false) const;
 
   // Sync system time from NTP, then update the external RTC when available.
   // Requires WiFi to be connected. An absent or failed RTC does not block NTP.

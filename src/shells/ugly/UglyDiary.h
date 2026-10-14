@@ -1,0 +1,62 @@
+#pragma once
+#include "shells/ugly/UglyMarkSeed.h"
+#include <atomic>
+#include <string>
+#include <vector>
+
+#include "RecentBooksStore.h"
+#include "UglyLogic.h"
+#include "UglyScreen.h"
+#if FREEINK_DEVICE_X4PRO
+#include "UglyTouch.h"
+#endif
+#include "activities/home/HomeRows.h"
+
+namespace ugly {
+
+// Tier 1: a few handwritten sentences. The underlined words are what the buttons walk.
+class Diary final : public Screen {
+ public:
+  Diary(GfxRenderer& renderer, MappedInputManager& mappedInput, bool cleanInitialRefresh)
+      : Screen("UglyDiary", renderer, mappedInput), cleanInitialRefresh(cleanInitialRefresh) {}
+  void onEnter() override;
+  void onTick() override;
+  void render(RenderLock&&) override;
+
+ protected:
+  bool onKey(Key key) override;
+
+ private:
+  mutable ugly::MarkState mark_;
+  enum Word : int8_t { READ = 1, SWAP = 2, DESK = 3 };
+  struct Paragraph {
+    std::vector<std::string> words;  // plain words of the sentence
+  };
+  void buildSentence();
+  void openBook();
+  void openPage(homerows::Page page);
+
+  bool cleanInitialRefresh;
+  // The wake's first frame is up: the main task writes state.json (never the render task).
+  std::atomic<bool> wakeStatePending{false};
+  bool hasBook = false;
+  RecentBook book;
+  int percent = 0, minutes = 0, days = 0;
+  logic::DiaryKind kind = logic::DiaryKind::NoBook;
+  std::vector<std::string> sentence;   // words of the first paragraph
+  std::string wake;                    // the greeting of the first frame after a wake
+  std::string titleText, ask, readText, orText, swapText, alsoText, deskText;
+  Word words[3];
+  int wordCount = 0;
+  int selected = 0;  // index in words[]
+  int shift = 0;     // room the greeting of a wake took above the title, kept for the frames after it
+#if FREEINK_DEVICE_X4PRO
+  // The underlined words as last drawn, for the finger (UglyTouch.h). Written by the frame, read under the lock.
+  touch::Word drawn[3];
+  Word drawnId[3];
+  int drawnCount = 0;
+  bool onTouch(Key key);
+#endif
+};
+
+}  // namespace ugly

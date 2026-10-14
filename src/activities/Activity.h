@@ -1,5 +1,6 @@
 #pragma once
 #include <Logging.h>
+#include <I18n.h>
 
 #include <cassert>
 #include <memory>
@@ -8,11 +9,13 @@
 
 #include "ActivityManager.h"  // for using the ActivityManager singleton
 #include "ActivityResult.h"
+#include "components/X3NavigationPath.h"
 #include "GfxRenderer.h"
 #include "MappedInputManager.h"
 #include "MenuNavigationMemory.h"
 #include "RenderLock.h"
 #include "util/ScreenshotInfo.h"
+#include "shells/ugly/UglyIcons.h"
 
 class Activity {
   friend class ActivityManager;
@@ -25,6 +28,7 @@ class Activity {
   ActivityResultHandler resultHandler;
   ActivityResult result;
   std::string navigationPrefix;
+  ugly::icons::FrameState uglyIconFrame;
   void drawNavigationHeader(const char* title);
 
  public:
@@ -38,6 +42,8 @@ class Activity {
   virtual void onPause() {}
   virtual void onResume() {}
   virtual std::string navigationLabel() const { return {}; }
+  virtual std::string x3NavigationLabel() const { return navigationLabel(); }
+  virtual tenorchrome::X3PathIcon navigationIcon() const { return tenorchrome::X3PathIcon::More; }
   virtual bool selectSettingsSibling(int) { return false; }
   virtual bool openPendingSettingsSibling() { return false; }
   virtual bool saveInputBeforeHome() { return false; }
@@ -48,6 +54,8 @@ class Activity {
   virtual void restoreNavigation(const MenuNavigationState&) {}
 
   virtual void render(RenderLock&&) {}
+  virtual bool renderIdleUpdate() { return false; }
+  virtual uint64_t uglyIconPageKey() { return 0; }
 
   // If immediate is true, the update will be triggered immediately.
   // Otherwise, it will be deferred until the end of the current loop iteration.
@@ -67,6 +75,11 @@ class Activity {
   // Returns true when the activity schedules its own forced refresh.
   virtual bool handleForcedRefresh() { return false; }
   virtual bool isHomeActivity() const { return false; }
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  // The Home card this screen is the root of, for the zone icon of the dynamic bar on the screens above it
+  // (a tenor/ugly notebook page). NONE: no zone root.
+  virtual HomeMenuItem zoneRoot() const { return HomeMenuItem::NONE; }
+#endif
   virtual bool handleHomeGesture() { return false; }
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
 

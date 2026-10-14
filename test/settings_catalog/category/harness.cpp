@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <string>
 #include <vector>
 #include <BoardConfig.h>
@@ -12,7 +14,6 @@
 #include <SdCardFontRegistry.h>
 #include "SettingsList.h"
 #include "activities/util/KeyboardLayoutSet.h"
-
 // The settings constructor is defined in src/CrossPointSettings.cpp, outside this slice;
 // it only lays the tenor/cross setup over the member initializers, as this one does.
 CrossPointSettings::CrossPointSettings() { applyTenorPreset(); }
@@ -65,9 +66,14 @@ void KOReaderCredentialStore::setServerUrl(const std::string&) {}
 void KOReaderCredentialStore::setMatchMethod(DocumentMatchMethod) {}
 void KOReaderCredentialStore::setSendMetadata(bool) {}
 void KOReaderCredentialStore::setSyncBehavior(KOReaderSyncBehavior) {}
+filebrowser::SortMode filebrowser::settingsSort() { return SortMode::Name; }
+void filebrowser::chooseSettingsSort(SortMode) {}
 
+struct RenderLock { template<class T> explicit RenderLock(T&) {} };
+namespace shell { bool isUgly() { return false; } }
 struct SettingsActivity {
-  struct Cursor { int selected = 0; bool followOnBuild = false; };
+  // Same shape as freeink::ui::ListNav: the selection is atomic (read by the render task).
+  struct Cursor { std::atomic<int> selected{0}; bool followOnBuild = false; };
   struct InputBoundary { bool hasTouch() const { return BoardConfig::hasTouch(); } } mappedInput;
   int selectedCategoryIndex = 0, settingsCount = 0;
   std::vector<SettingInfo> displaySettings, readerSettings, controlsSettings, systemSettings,
@@ -77,9 +83,16 @@ struct SettingsActivity {
   unsigned rebuilds = 0;
   void rebuildRowItems() { ++rebuilds; }
   std::vector<SettingInfo>& danhSachCuaThe(settingstabs::Tab tab);
-  void rebuildSettingsLists();
+  static bool listedAsRow(const SettingInfo& setting);
+  struct FormBoundary { void invalidate() {} } form_;
+  std::atomic<bool> formPaintReady_{false};
+  void bindForm() {}
+  void rebuildSettingsLists(bool lockHeld = false);
 };
+// The X4 Pro About & updates screen (InfoUpdateActivity) holds no rows on these boards.
+namespace infoupdate { inline bool holds(settingstabs::Action, bool = false) { return false; } }
 #include "CategoryMethods.inc"
+#include "StatusItems.inc"
 
 static bool check(bool value, const char* message) {
   if (!value) std::fprintf(stderr, "FAIL %s\n", message);
@@ -133,20 +146,60 @@ static bool dynamicLifetime() {
   return ok;
 }
 
+static bool longFontNames() {
+  SdCardFontRegistry registry;
+  auto& families = const_cast<std::vector<SdCardFontFamilyInfo>&>(registry.getFamilies());
+  families.push_back({"SP3 - Traveling Typewriter-BOLD1"});
+  families.push_back({"SP3 - Traveling Typewriter-BOLD2"});
+  families.push_back({std::string(63, 'n')});
+  auto setting = buildFontFamilySetting(&registry);
+  bool ok = true;
+  for (int i = 0; i < 3; ++i) {
+    setting.valueSetter(static_cast<uint8_t>(CrossPointSettings::BUILTIN_FONT_COUNT + i));
+    ok &= check(std::string(SETTINGS.sdFontFamilyName) == families[i].name,
+                "selected long font family name changed");
+    ok &= check(setting.valueGetter() == CrossPointSettings::BUILTIN_FONT_COUNT + i,
+                "selected long font family has no selection mark");
+  }
+  return ok;
+}
+
+static bool choiceSemantics(const SettingInfo& row) {
+  const auto labels = row.enumLabels();
+  const int count = row.type == SettingType::TOGGLE ? 2 : row.type == SettingType::ENUM
+      ? (row.enumStringValues.empty() ? labels.size() : row.enumStringValues.size())
+      : row.type == SettingType::VALUE ? (row.valueRange.max - row.valueRange.min) / row.valueRange.step + 1 : 0;
+  const bool states = labels.size() == 2 && row.enumStringValues.empty() &&
+      ((labels[0] == StrId::STR_STATE_OFF && labels[1] == StrId::STR_STATE_ON) ||
+       (labels[1] == StrId::STR_STATE_OFF && labels[0] == StrId::STR_STATE_ON));
+  bool ok = true;
+  for (bool touch : {false, true}) {
+    const auto expected = row.type == SettingType::TOGGLE || states ? SettingsChoiceStyle::Inline
+        : count < 2 ? SettingsChoiceStyle::None : count >= 7 ? SettingsChoiceStyle::Page : SettingsChoiceStyle::Popup;
+    const auto actual = settingsChoiceStyle(row, touch);
+    if (actual != expected) {
+      std::fprintf(stderr, "RED choice row=%d count=%d touch=%d expected=%d actual=%d\n",
+                   static_cast<int>(row.nameId), count, touch, static_cast<int>(expected), static_cast<int>(actual));
+      ok = false;
+    }
+    std::fprintf(stderr, "CHOICE %d %d %d %d %d\n", static_cast<int>(row.nameId), static_cast<int>(row.type),
+                 count, touch, static_cast<int>(actual));
+  }
+  return ok;
+}
+
 int main(int argc, char** argv) {
   const bool enforce = argc > 1 && std::string(argv[1]) == "--enforce";
   const std::string board = argc > 2 ? argv[2] : "x3";
-  const bool tenor = argc > 3 ? std::atoi(argv[3]) : true;
-  const bool rtc = argc > 4 ? std::atoi(argv[4]) : true;
-  const bool footnotes = argc > 5 ? std::atoi(argv[5]) : true;
-  const bool hasDictionaries = argc > 6 ? std::atoi(argv[6]) : true;
+  const bool rtc = argc > 3 ? std::atoi(argv[3]) : true;
+  const bool footnotes = argc > 4 ? std::atoi(argv[4]) : true;
+  const bool hasDictionaries = argc > 5 ? std::atoi(argv[5]) : true;
   if (board == "x3") BoardConfig::ACTIVE = BoardConfig::XTEINK_X3;
   else if (board == "x4") BoardConfig::ACTIVE = BoardConfig::XTEINK_X4;
   else BoardConfig::ACTIVE = BoardConfig::XTEINK_X4_PRO;
   gpio.x3 = board == "x3";
   halTiltSensor.available = gpio.x3;
   halClock.available = rtc;
-  SETTINGS.uiTheme = tenor ? CrossPointSettings::TENOR_UI : CrossPointSettings::CLASSIC;
   SETTINGS.shortPwrBtn = footnotes ? CrossPointSettings::FOOTNOTES : CrossPointSettings::IGNORE;
   bool ok = true;
   fonts(sdFontSystem.fonts, 128);
@@ -154,12 +207,31 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 8; ++i)
       discovered.push_back({std::to_string(i) + " Dictionary long owned label", "book"});
   const auto& catalog = getBaseSettingsList();
-  const auto themeRow = std::find_if(catalog.begin(), catalog.end(), [](const auto& row) {
-    return row.valuePtr == &CrossPointSettings::uiTheme;
+  for (const auto& row : catalog) ok &= choiceSemantics(row);
+  const auto homeRow = std::find_if(catalog.begin(), catalog.end(), [](const auto& row) {
+    return row.valuePtr == &CrossPointSettings::homeStyle;
   });
-  ok &= check(themeRow != catalog.end() && themeRow + 1 != catalog.end() &&
-              (themeRow + 1)->valuePtr == &CrossPointSettings::uiTextSize,
-              "UI text size immediately follows theme");
+  ok &= check(homeRow != catalog.end() && homeRow->enumLabels().size() == 3 &&
+              settingsChoiceStyle(*homeRow, true) == SettingsChoiceStyle::Popup,
+              "Home has 3 named choices in a popup");
+  if (homeRow != catalog.end())
+    ok &= check(settingHiddenOnThisBoard(*homeRow) == !BoardConfig::hasTouch(), "Home style belongs to touch boards");
+  ok &= choiceSemantics(buildFontFamilySetting(nullptr));
+  ok &= choiceSemantics(buildFontSizeSetting(nullptr));
+  SettingInfo states = SettingInfo::Enum(StrId::STR_NIGHT_MODE, &CrossPointSettings::screenInverted,
+                                        {StrId::STR_STATE_OFF, StrId::STR_STATE_ON});
+  ok &= choiceSemantics(states);
+  std::reverse(states.enumValues.begin(), states.enumValues.end());
+  ok &= choiceSemantics(states);
+  ok &= check(!catalog.empty() && catalog.front().valuePtr == &CrossPointSettings::uiTextSize,
+              "UI text size is the first catalog row");
+  const auto shellRow = std::find_if(catalog.begin(), catalog.end(), [](const auto& row) {
+    return row.valuePtr == &CrossPointSettings::uiShell;
+  });
+  ok &= check(shellRow != catalog.end() && shellRow + 2 != catalog.end() &&
+                  (shellRow + 1)->valuePtr == &CrossPointSettings::uiUglyLevel &&
+                  (shellRow + 2)->valuePtr == &CrossPointSettings::screenInverted,
+              "the interface row and the ugliness row sit just above night mode, the last screen row");
   SettingsActivity activity;
   for (auto& cursor : activity.tabNavs) cursor.selected = 10000;
   measuring = true;
@@ -168,8 +240,8 @@ int main(int argc, char** argv) {
   const size_t firstAllocs = allocs, firstBytes = bytes, firstLargest = largest;
   ok &= check(sdFontSystem.refreshes == 1 && activity.rebuilds == 1, "actual rebuild called discovery boundary and row renderer");
   size_t total = 0, capacity = 0;
-  std::printf("{\"board\":\"%s\",\"tenor\":%d,\"rtc\":%d,\"footnotes\":%d,\"dictionaries\":%d,\"sizeof\":%zu,\"catalog\":%zu,\"allocs\":%zu,\"bytes\":%zu,\"largest\":%zu,\"tabs\":[",
-              board.c_str(), tenor, rtc, footnotes, hasDictionaries, sizeof(SettingInfo), catalog.size(), firstAllocs, firstBytes, firstLargest);
+  std::printf("{\"board\":\"%s\",\"rtc\":%d,\"footnotes\":%d,\"dictionaries\":%d,\"sizeof\":%zu,\"catalog\":%zu,\"allocs\":%zu,\"bytes\":%zu,\"largest\":%zu,\"tabs\":[",
+              board.c_str(), rtc, footnotes, hasDictionaries, sizeof(SettingInfo), catalog.size(), firstAllocs, firstBytes, firstLargest);
   for (int tab = 0; tab < settingstabs::TAB_COUNT; ++tab) {
     const auto& rows = activity.danhSachCuaThe(static_cast<settingstabs::Tab>(tab));
     total += rows.size(); capacity += rows.capacity();
@@ -179,6 +251,7 @@ int main(int argc, char** argv) {
     std::printf("%s{\"size\":%zu,\"capacity\":%zu,\"rows\":[", tab ? "," : "", rows.size(), rows.capacity());
     for (size_t i = 0; i < rows.size(); ++i) {
       const auto& row = rows[i];
+      ok &= choiceSemantics(row);
       ok &= check(!row.inTextSettings, "text-only rows excluded from categories");
       std::printf("%s\"%d:%d:%s\"", i ? "," : "", static_cast<int>(row.nameId), static_cast<int>(row.action), row.key ? row.key : "");
     }
@@ -198,22 +271,65 @@ int main(int argc, char** argv) {
     ok &= check(readers[dictionaryIndex].valueGetter() == 8, "category dictionary survives discovery lifetime");
   }
   const auto clockAction = std::find_if(activity.systemSettings.begin(), activity.systemSettings.end(), [](const auto& row) {
-    return row.action == SettingAction::Clock;
+    return row.action == SettingAction::ClockSettings;
   });
   ok &= check(clockAction != activity.systemSettings.end(), "clock action remains available without RTC hardware");
-  if (tenor) {
+  {
     const auto labels = std::find_if(activity.displaySettings.begin(), activity.displaySettings.end(), [](const auto& row) {
       return row.valuePtr == &CrossPointSettings::tenorButtonSymbols;
     });
-    ok &= check(labels != activity.displaySettings.end() && labels+1 != activity.displaySettings.end() &&
-                (labels+1)->nameId == StrId::STR_STATUS_CORNERS, "clock adapter immediately follows labels");
+    if (BoardConfig::isX4Pro()) {
+      ok &= check(labels == activity.displaySettings.end() &&
+                  activity.displaySettings.back().nameId == StrId::STR_HOME_STYLE &&
+                  (activity.displaySettings.end()-2)->nameId == StrId::STR_STATUS_CORNERS,
+                  "touch shell ends with clock placement and Home style");
+      for (const auto* rows : {&activity.displaySettings, &activity.readerSettings})
+        for (const auto& row : *rows)
+          ok &= check(row.nameId != StrId::STR_SIDE_ARROW_HINTS && row.nameId != StrId::STR_READER_MENU_STYLE,
+                      "touch shell omits front button rows");
+    } else {
+      ok &= check(labels != activity.displaySettings.end() && labels+1 != activity.displaySettings.end() &&
+                  (labels+1)->nameId == StrId::STR_STATUS_CORNERS, "clock adapter immediately follows labels");
+    }
   }
   allocs = bytes = largest = 0;
   measuring = true;
   activity.rebuildSettingsLists();
   measuring = false;
   if (enforce) ok &= check(largest < catalog.size()*sizeof(SettingInfo), "repeat rebuild has no full-catalog allocation");
+  {
+    // The row "Ugliness" is on the screen only while the shell is tenor/ugly, right under the interface row.
+    const auto listed = [&] {
+      const auto& rows = activity.displaySettings;
+      return std::find_if(rows.begin(), rows.end(), [](const auto& row) { return row.valuePtr == &CrossPointSettings::uiUglyLevel; });
+    };
+    ok &= check(listed() == activity.displaySettings.end(), "tenor/cross does not list the ugliness row");
+    const size_t without = activity.displaySettings.size();
+    SETTINGS.uiShell = 1;
+    activity.rebuildSettingsLists();
+    const auto at = listed();
+    ok &= check(at != activity.displaySettings.end() && at != activity.displaySettings.begin() &&
+                    (at - 1)->valuePtr == &CrossPointSettings::uiShell && at + 1 != activity.displaySettings.end() &&
+                    (at + 1)->valuePtr == &CrossPointSettings::screenInverted,
+                "tenor/ugly lists the ugliness row right under the interface row");
+    const size_t extra = BoardConfig::hasTouch() ? 2 : 1;
+    ok &= check(activity.displaySettings.size() == without + extra && activity.displaySettings.capacity() == activity.displaySettings.size(),
+                "shell switch keeps exact capacity while exchanging tips for ugliness and adding Root");
+    const auto root = std::find_if(activity.displaySettings.begin(), activity.displaySettings.end(), [](const auto& row) {
+      return row.valuePtr == &CrossPointSettings::uglyRootScreen;
+    });
+    ok &= check(root != activity.displaySettings.end() && root->enumLabels().size() == 2,
+                "ugly lists Root with exactly Diary and Desk choices");
+    ok &= check(activity.tabNavs.size() > 0 && at->enumLabels().size() == 2, "two levels");
+    SETTINGS.uiShell = 0;
+    activity.rebuildSettingsLists();
+    ok &= check(listed() == activity.displaySettings.end(), "and leaving tenor/ugly takes the row away again");
+    ok &= check(std::none_of(activity.displaySettings.begin(), activity.displaySettings.end(), [](const auto& row) {
+                  return row.valuePtr == &CrossPointSettings::uglyRootScreen;
+                }), "leaving ugly hides Root again");
+  }
   ok &= dynamicLifetime();
+  ok &= longFontNames();
   std::printf("\n");
   return ok ? 0 : 1;
 }

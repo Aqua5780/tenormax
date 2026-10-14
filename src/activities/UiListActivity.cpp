@@ -1,6 +1,9 @@
 #include "UiListActivity.h"
+#include "InlineSymbols.h"
 
+#include <CrossPointSettings.h>
 #include <GfxRenderer.h>
+#include <HalTiltSensor.h>
 #include <I18n.h>
 #include <Logging.h>
 
@@ -8,12 +11,42 @@
 
 #include "MappedInputManager.h"
 #include "MenuCustomization.h"
+#include "MenuTiltInput.h"
+#include "activities/settings/SettingsChoiceActivity.h"
+#include "components/OptionPopup.h"
 #include "components/TenorMenuChrome.h"
 #include "components/SettledListRender.h"
 #include "components/UITheme.h"
+#include "components/UIThemeTokens.h"
+#include "components/icons/tenorRowMarks.h"
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyChrome.h"
+#include "shells/ugly/UglyInk.h"
 
 namespace fui = freeink::ui;
+
+void UiListActivity::showSettingsChoices(OptionPopup& popup, const StrId title,
+                                        const std::vector<std::string>& labels, const int selected, const int row,
+                                        std::function<void(int)> onSelect) {
+  if (settingsChoiceStyle(static_cast<int>(labels.size()), tenorchrome::kTouchShell) == SettingsChoiceStyle::Page) {
+    startActivityForResult(std::make_unique<SettingsChoiceActivity>(renderer, mappedInput, I18N.get(title), labels,
+                                                                  selected, std::move(onSelect)), nullptr);
+  } else {
+    popup.show(title, labels, selected, std::move(onSelect));
+    if (tenorchrome::kTouchShell) popup.alignValueTo(app.publishedRect(ACTION_ROW, static_cast<int16_t>(row)));
+  }
+  requestUpdate();
+}
+
+void UiListActivity::showSettingsChoices(OptionPopup& popup, const StrId title, const StrId* labels, const int count,
+                                        const int selected, const int row, std::function<void(int)> onSelect) {
+  std::vector<std::string> text;
+  text.reserve(count);
+  for (int index = 0; index < count; ++index) text.emplace_back(I18N.get(labels[index]));
+  showSettingsChoices(popup, title, text, selected, row, std::move(onSelect));
+}
+
 namespace {
 struct PinDecoration {
   fui::ListItem* row = nullptr;
@@ -34,12 +67,24 @@ UiListActivity::UiListActivity(const char* name, GfxRenderer& renderer, MappedIn
     : Activity(name, renderer, mappedInput), UiAppHost(renderer), wantsTouchLongPress(wantsTouchLongPress) {}
 
 void UiListActivity::onEnter() {
+  mark_.reset();
   Activity::onEnter();
+  PageScrollbar::instance().activate(nullptr);
   activeNav().reset();
+  fileSearchReveal.reset();
+  fileSearchRevealPending = false;
+  fileSearchDragTracked = false;
   resetUi();
   app.on(ACTION_ROW, &UiListActivity::rowActionTrampoline, this);
+  app.on(ACTION_FILE_SEARCH, &UiListActivity::fileSearchTrampoline, this);
   app.setScreen(&UiListActivity::screenTrampoline, this);
   requestUpdate();
+}
+
+void UiListActivity::onResume() {
+  PageScrollbar::instance().activate(nullptr);
+  fileSearchRevealPending = false;
+  fileSearchDragTracked = false;
 }
 
 void UiListActivity::screenTrampoline(UiScreen& screen, void* user) {
@@ -50,7 +95,22 @@ void UiListActivity::screenTrampoline(UiScreen& screen, void* user) {
 void UiListActivity::rowActionTrampoline(const fui::ActionEvent& event, void* user) {
   auto* self = static_cast<UiListActivity*>(user);
   if (event.value < 0 || event.value >= self->listCount()) return;
+  // Touch: no gray flash on the row that was tapped or held.
+  if (tenorchrome::kTouchShell) self->app.clearTapFlash();
   self->onRowAction(event);
+}
+
+void UiListActivity::showRowMenu(const StrId* labels, const int count, std::function<void(int)> onSelect,
+                                 const fui::ActionId anchorAction, const int anchorValue) {
+  rowMenu.showAnchored(app.publishedRect(anchorAction, static_cast<int16_t>(anchorValue)), labels, count,
+                       std::move(onSelect));
+  requestUpdate();
+}
+
+void UiListActivity::onRowLongPress(const int index) {
+  if (!tenorchrome::kTouchShell || !supportsFavorites() || favoriteKey(index).empty()) return;
+  const StrId label = rowIsPinned(index) ? StrId::STR_UNPIN_FAVORITE : StrId::STR_PIN_FAVORITE;
+  showRowMenu(&label, 1, [this, index](int) { queuePinToggle(index); }, ACTION_ROW, index);
 }
 
 void UiListActivity::onRowAction(const fui::ActionEvent& event) {
@@ -78,12 +138,69 @@ bool UiListActivity::handleButtons() {
 bool UiListActivity::routeListTouch() {
   // Touch goes through the FreeInkApp: render() registered the row hit rects;
   // route the snapshot and let the action trampoline dispatch.
-  const auto route = UiAppHost::routeTouch(mappedInput, wantsTouchLongPress);
+  const auto route = UiAppHost::routeTouch(mappedInput, wantsTouchLongPress, false, touchHoldMs());
   // No pressed-state repaint: the render it triggers would drop a slow tap's
   // release inside the uiReady window (tap-to-activate needed two taps), and
   // it costs a second e-ink refresh per tap.
   if (route.routed && app.invalidated()) requestUpdate();
   return static_cast<bool>(route);  // dispatched to the action handler
+}
+
+void UiListActivity::fileSearchTrampoline(const fui::ActionEvent&, void* user) {
+  auto* self = static_cast<UiListActivity*>(user);
+  if (self->canSearchFiles()) self->openFileSearch();
+}
+
+void UiListActivity::buildFileSearch(UiScreen& screen) {
+  if (!tenorchrome::kTouchShell || !canSearchFiles()) return;
+  if (fileSearchReveal.visible(true, *fileSearchText() != '\0')) {
+    const auto band = screen.takeTop(filesearch::SEARCH_HEIGHT, filesearch::SEARCH_GAP);
+    const fui::Rect field{16, band.y, static_cast<int16_t>(renderer.getScreenWidth() - 32), filesearch::SEARCH_HEIGHT};
+    if (uiTarget.paintingEnabled()) {
+      tenorchrome::drawPillRing(renderer, field.x, field.y, field.width, field.height, 2, true);
+      const char* label = *fileSearchText() ? fileSearchText() : tr(STR_SEARCH);
+      const auto text = uiMenuLabelText(screen.theme());
+      screen.target().text(field.inset(fui::Insets{0, 16, 0, 16}), label, text);
+    }
+    screen.frame().hit(field, ACTION_FILE_SEARCH, 0, fui::InputTouch);
+  }
+  fileSearchBody = screen.body();
+  fileSearchBody.height = static_cast<int16_t>(std::max(0, std::min<int>(fileSearchBody.bottom(),
+      tenorchrome::footBackTop(renderer.getScreenHeight()) - 8) - fileSearchBody.y));
+}
+
+bool UiListActivity::routeFileSearchDrag() {
+  if (!tenorchrome::kTouchShell || !canSearchFiles()) return false;
+  filesearch::Drag drag;
+  if (!mappedInput.wasVerticalSwipe(drag.deltaY, drag.heldMs, drag.startX, drag.startY)) return false;
+  drag.insideList = drag.startX >= 16 && drag.startX < renderer.getScreenWidth() - 16 &&
+                    drag.startY >= fileSearchBody.y && drag.startY < fileSearchBody.bottom();
+  drag.blocked = rowMenu.isActive() || (fileSearchDragTracked && fileSearchDragBlocked);
+  const bool atTop = fileSearchDragTracked ? fileSearchDragAtTop : activeNav().top == 0;
+  fileSearchDragTracked = false;
+  auto nextReveal = fileSearchRevealPending ? pendingFileSearchReveal : fileSearchReveal;
+  if (!nextReveal.update(drag, true, atTop, *fileSearchText() != '\0')) return false;
+  pendingFileSearchReveal = nextReveal;
+  fileSearchRevealPending = true;
+  return true;
+}
+
+// A tap on a faded end of a framed list: the row there is a glimpse of the page before or after, so the tap
+// turns to that page (a flick's step) and opens nothing.
+bool UiListActivity::routeFadedTap() {
+  if (!tenorchrome::kTouchShell) return false;
+  int x = 0, y = 0;
+  if (!mappedInput.wasScreenTapped(x, y)) return false;
+  const bool top = y >= fadeTopFrom && y < fadeTopTo;
+  const bool foot = y >= fadeFootFrom && y < fadeFootTo;
+  if (!top && !foot) return false;
+  auto& n = activeNav();
+  const int count = listCount();
+  const int rows = std::max(1, n.pageRowsFor(count));
+  const int step = rows > fadeKeepRows() ? rows - fadeKeepRows() : rows;
+  n.requestScroll(foot ? step : -step);
+  requestUpdate();
+  return true;
 }
 
 void UiListActivity::queueNavIntent(const NavIntent intent) {
@@ -179,7 +296,12 @@ void UiListActivity::stepSelection(const int direction) {
   const int count = listCount();
   n.selected =
       direction > 0 ? ButtonNavigator::nextIndex(n.selected, count) : ButtonNavigator::previousIndex(n.selected, count);
-  n.follow(count);
+  // Whole-page flips, not a row-by-row crawl: one press is still one repaint, and the rows a page
+  // really drew (pageRowsFor) decide where the selection leaves it. followPending stays armed so
+  // onListRendered() can correct a page whose wrapped rows fit fewer than estimated.
+  n.top = ButtonNavigator::pageTopAfterStep(n.selected, n.top, n.pageRowsFor(count), count);
+  n.followPending = true;
+  mark_.get(selectionMarkKey());
 }
 
 bool UiListActivity::applyPage(const int direction) {
@@ -191,6 +313,7 @@ bool UiListActivity::applyPage(const int direction) {
     // Start at the first displayed item. Following the old selection here
     // would pull the viewport back and turn Page Down into a one-row scroll.
     n.selected = n.top;
+    mark_.get(selectionMarkKey());
     n.followOnBuild = false;
     n.followPending = false;
   }
@@ -203,6 +326,7 @@ bool UiListActivity::applyBoundary(const bool last, const bool ring) {
   const int first = kepConTro(n.top, count);
   const int end = kepConTro(first + std::max(1, n.pageRowsFor(count)) - 1, count);
   n.selected = count > 0 ? (last ? end : first) + (ring ? 1 : 0) : 0;
+  mark_.get(selectionMarkKey());
   n.followOnBuild = false;
   n.followPending = false;
   return true;
@@ -226,18 +350,122 @@ bool UiListActivity::confirmReleased() {
 // Back never depends on the selection, so it is never held back.
 bool UiListActivity::backReleased() { return mappedInput.wasReleased(MappedInputManager::Button::Back); }
 
+void UiListActivity::pollTilt() {
+  menutilt::pollTabs(static_cast<uint8_t>(renderer.getOrientation()), false);
+  pollRowTilt();
+}
+
+bool UiListActivity::acceptsTiltMenuNavigation() const { return listCount() > 0 && allowsTiltMenuNavigation(); }
+
+bool UiListActivity::queueTiltMenuNavigation(const bool up, const bool down) {
+  if (!acceptsTiltMenuNavigation() || (!up && !down)) return false;
+  queueNavIntent(up ? NavIntent::StepPrev : NavIntent::StepNext);
+  return true;
+}
+
+void UiListActivity::pollRowTilt() {
+  OptionPopup* const popup = tiltPopup();
+  const bool popupOpen = popup != nullptr && popup->isActive();
+  const auto tilt = menutilt::pollRows(popupOpen || acceptsTiltMenuNavigation());
+  const bool up = tilt.previous;
+  const bool down = tilt.next;
+  if (popupOpen) {
+    if (up || down) {
+      popup->step(up ? -1 : 1);
+      requestUpdate();
+    }
+    return;
+  }
+  queueTiltMenuNavigation(up, down);
+}
+
 void UiListActivity::loop() {
+  pollTilt();
   loopInput();
   // Apply what this pass queued right away when the panel is idle, so a press
   // is reflected before the next pass instead of ten milliseconds later.
   if (navQueueCount > 0) applyPendingNav();
 }
 
+void UiListActivity::setPageScrollRegion(const int top, const int bottom, const int length, const int offset) {
+  if (bottom <= top || length <= bottom - top) return;
+  pageScrollRegion = {top, bottom, length, std::clamp(offset, 0, length - (bottom - top))};
+}
+
+void UiListActivity::measurePageScrollbar(UiScreen& screen, const fui::ListProps& props) {
+  if (!tenorchrome::kTouchShell && !rowsFramed) {
+    const int height = screen.body().height;
+    const int rows = std::max(1, activeNav().pageRowsFor(listCount()));
+    setPageScrollRegion(screen.body().y, screen.body().bottom(), listCount() * height / rows,
+                        activeNav().top * height / rows);
+    return;
+  }
+  if (!rowsFramed || shell::isUgly()) return;
+  const auto lines = rowFrameLines(rowFrameGap, rowFrameAir());
+  const int headerHeight = props.headerRowHeight > 0 ? props.headerRowHeight :
+                           screen.target().lineHeight(props.headerText.font) + 4;
+  const int rowWidth = screen.body().width - 2 * props.rowInset;
+  int length = lines.top + lines.bottom;
+  int offset = 0;
+  for (int row = 0; row < props.count; ++row) {
+    fui::ListItem item;
+    if (props.rowProvider) props.rowProvider(props.rowProviderCtx, static_cast<uint16_t>(row), item);
+    else if (props.items && row >= props.itemsWindowFirst &&
+             (props.itemsWindowCount == 0 || row - props.itemsWindowFirst < props.itemsWindowCount))
+      item = props.items[row - props.itemsWindowFirst];
+    else return;
+    const bool heading = item.sectionHeading && item.sectionHeading[0];
+    const int section = heading ? headerHeight + props.rowGap + (row > 0 ? props.sectionGap : 0) : 0;
+    const int height = fui::measureListRow(screen.target(), screen.frame().assets(),
+                                          static_cast<int16_t>(rowWidth), props, item,
+                                          fui::listValueEndsRow(props, item, static_cast<uint16_t>(row))).height;
+    const int span = height + section + (row + 1 < props.count ? props.rowGap : 0);
+    length += span;
+    if (row < activeNav().top) offset += span;
+    if (row == activeNav().top && row > 0 && heading) offset += props.sectionGap;
+  }
+  setPageScrollRegion(screen.body().y - lines.top, rowFrameFloor, length, offset);
+}
+
+void UiListActivity::drawPageScrollbar() {
+  const auto& region = pageScrollRegion;
+  PageScrollbar::instance().draw(renderer, uiTarget, region.top, region.bottom, region.length, region.offset,
+                                 &activeNav());
+}
+
 void UiListActivity::loopInput() {
+  if (tenorchrome::kTouchShell && canSearchFiles()) {
+    uint8_t contacts = 0;
+    int touchX = 0, touchY = 0;
+    if (mappedInput.touchContactsAt(contacts, touchX, touchY) && contacts > 0) {
+      if (!fileSearchDragTracked) {
+        fileSearchDragAtTop = activeNav().top == 0;
+        fileSearchDragBlocked = rowMenu.isActive();
+        fileSearchDragTracked = true;
+      }
+      fileSearchDragBlocked |= contacts != 1 || rowMenu.isActive();
+    } else {
+      int deltaY = 0;
+      unsigned long heldMs = 0;
+      if (!mappedInput.wasVerticalSwipe(deltaY, heldMs)) fileSearchDragTracked = false;
+    }
+  } else {
+    fileSearchDragTracked = false;
+    fileSearchRevealPending = false;
+  }
   // The render task owns the lock for a whole frame (panel refresh included),
   // so the queue is drained with a non-waiting lock and the buttons are read
   // on every pass either way. A press landing mid-frame is queued, not lost.
   const bool panelFree = applyPendingNav();
+
+  if (fileSearchRevealPending) {
+    RenderLock lock(RenderLock::TryTake{});
+    if (lock.acquired()) {
+      fileSearchReveal = pendingFileSearchReveal;
+      fileSearchRevealPending = false;
+      requestUpdate();
+    }
+  }
 
   if (!pendingFavorite.empty()) {
     if (!panelFree) return;  // a one-shot wish, safe to retry next pass
@@ -248,9 +476,12 @@ void UiListActivity::loopInput() {
     requestUpdate();
     return;
   }
+  if (rowMenu.handleInput(mappedInput, [this] { requestUpdate(); })) return;
   if (handleCustomInput()) return;
-  if (pendingPin || (supportsFavorites() && !favoriteKey(favoriteSelectedRow()).empty() &&
-                     mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, 700))) {
+  const int favoriteRow = favoriteSelectedRow();
+  const bool buttonHeld = supportsFavorites() && !favoriteKey(favoriteRow).empty() &&
+                          mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, 700);
+  if (pendingPin || buttonHeld) {
     // A hold fires once, so it is never dropped: it is applied as soon as the
     // panel frees the lock.
     RenderLock lock(RenderLock::TryTake{});
@@ -259,18 +490,46 @@ void UiListActivity::loopInput() {
       return;
     }
     pendingPin = false;
-    const int row = favoriteSelectedRow();
+    const int row = pendingPinRow >= 0 ? pendingPinRow : favoriteRow;
+    pendingPinRow = -1;
+    const bool pinFromTouch = pendingPinFromTouch;
+    pendingPinFromTouch = false;
+    if (!pinFromTouch && buttonHoldOpensRowMenu(row)) {
+      onRowLongPress(row);
+      return;
+    }
     const std::string key = favoriteKey(row);
     if (!key.empty()) {
       favoriteSaveFailed = !toggleFavorite(row);
+      LOG_INF("FAV", "pin %s row=%d ok=%d pins=%u key=%s", pinFromTouch ? "touch" : "select", row,
+              favoriteSaveFailed ? 0 : 1, static_cast<unsigned>(menucustom::state().pinCount), key.c_str());
       favoritesChanged();
       requestUpdate();
     }
     return;
   }
   if (handleButtons()) return;
+  if (routeFileSearchDrag()) return;
+  if (routeFadedTap()) return;
   if (routeListTouch()) return;
 
+  // Touch: a flick turns a page, a slow drag moves the rows the finger travelled (one rule, swipeRows);
+  // nothing is drawn when the list cannot move that way.
+  if (tenorchrome::kTouchShell) {
+    auto& n = activeNav();
+    const int count = listCount();
+    // A faded list keeps the last row of a page as the faded first row of the next.
+    const int rows = swipeRows(mappedInput, n, count, ACTION_ROW, fadeKeepRows());
+    if (rows == 0) {
+      navigateButtons();
+      return;
+    }
+    if ((rows > 0 && n.top + n.pageRowsFor(count) < count) || (rows < 0 && n.top > 0)) {
+      n.requestScroll(rows);
+      requestUpdate();
+    }
+    return;
+  }
   // Swipes scroll the viewport; the selection stays put (it may scroll
   // off-screen) and button navigation pulls the view back to it.
   const auto swipe = mappedInput.wasSwipe();
@@ -320,7 +579,212 @@ void UiListActivity::navigateButtons() {
   }
 }
 
+bool UiListActivity::rowHasPopupMark(const void* list, const uint16_t row) {
+  return static_cast<const UiListActivity*>(list)->rowChoiceStyle(row) == SettingsChoiceStyle::Popup;
+}
+
+void UiListActivity::frameRows(fui::ListProps& props) {
+  props.scrollIndicator = false;
+  rowsFramed = framedByDesign() && listFramed();
+  // A row's pop-up mark is drawn over the rows (renderUi), so list() asks which rows carry one: a value with
+  // nothing after it ends on the trailing column.
+  props.rowHasMarkCtx = this;
+  props.rowHasMark = &UiListActivity::rowHasPopupMark;
+  for (int row = 0; row < props.count; ++row)
+    if (settingsChoiceCount(row) > 0) {
+      props.chevronColumn = true;
+      props.labelText.centerInkY = true;
+      props.valueText.centerInkY = true;
+      break;
+    }
+  const int switchScale = tenorchrome::kTouchShell ? 0 : normalizedUiTextSize(SETTINGS.uiTextSize);
+  props.toggleWidth = 46 + switchScale * 8;
+  props.toggleHeight = 26 + switchScale * 4;
+  props.toggleRadius = props.toggleHeight / 2;
+  props.toggleKnobRadius = (props.toggleHeight - 8) / 2;
+  props.toggleKnobInset = 4;
+  props.toggleBorderWidth = 2;
+  props.chosenMark = fui::bitmapFromIcon(icon_row_chosen_24);
+  if (!rowsFramed) {
+    // Buttons (X3/X4): the row past the last full one shows its top, faded (fadeMoreBelow), in place of a "more"
+    // chevron.
+    if (tenorchrome::enabled()) {
+      props.partialTrailingRow = true;
+      // The fade leaves a row's words legible only in its first 3/4: less of the next row than that and the
+      // last row that fits is the glimpse instead (measured on the real rows).
+      props.partialTrailingMinPercent = 75;
+      // The last page reaches the foot: its last row ends less than a row above it.
+      props.fillLastPage = true;
+    }
+    return;
+  }
+  // Touch (C1): the rows sit in a round frame 16 px in from the screen edges, their text 16 px into it.
+  if (tenorchrome::kTouchShell) {
+    props.rowInset = tenorchrome::FOOT_BACK_X;
+    props.sidePadding = 16;
+  } else {
+    // The cursor pill stands 16 px inside the ring, its words keep the pill's own padding.
+    props.rowInset = static_cast<int16_t>(tenorchrome::frameSpan(renderer).x + 16);
+  }
+  // The value in use in a list of choices (ListItem::chosen): bold, with the tick at the row's end.
+  fui::ListItem first;
+  if (props.rowProvider && props.count > 0) props.rowProvider(props.rowProviderCtx, props.topIndex, first);
+  rowsHaveIcons = props.rowProvider ? static_cast<bool>(first.icon) : props.items && props.count > 0 && props.items[0].icon;
+  // The edges fade where rows go on (drawRowFrame), in place of the scroll bar; the row past the last
+  // full one shows its top in the bottom band.
+  props.partialTrailingRow = true;
+}
+
+namespace {
+using tenorchrome::fadeBand;
+}  // namespace
+
+bool UiListActivity::framedByDesign() const {
+  return tenorchrome::kTouchShell ||
+         (framedOnButtons() && tenorchrome::x3ScreenLayoutEnabled() && !shell::isUgly());
+}
+
+UiListActivity::RowFrameLines UiListActivity::rowFrameLines(const int rowGap, const int air) {
+  // A 1 px rule in the gap and a 2 px ring: the rule sits `rule` px above the next row, the ring's inner edge as far
+  // from the first and last rows as a rule is from the rows beside it.
+  const int rule = (std::max(0, rowGap) + 1) / 2;
+  return {rule, std::max(rule + 1, air), std::max(std::max(0, rowGap) - rule + 2, air)};
+}
+
+void UiListActivity::reserveRowFrame(UiScreen& screen, const int rowGap) {
+  if (rowsFramed) {
+    // The gap list() lays the rows out with: on touch boards the theme's touch gap is the least (resolveListProps).
+    rowFrameGap = tenorchrome::kTouchShell ? std::max<int>(rowGap, screen.theme().listTouchRowGap) : rowGap;
+    const auto lines = rowFrameLines(rowFrameGap, rowFrameAir());
+    screen.takeTop(static_cast<int16_t>(lines.top));
+    rowFrameFloor = screen.body().y + screen.body().height;
+    screen.takeBottom(static_cast<int16_t>(lines.bottom));
+    return;
+  }
+  rowFrameFloor = screen.body().y + screen.body().height;
+  // The fade under the last full row stops short of the scroll bar at the body's right edge, with 2 px of air.
+  rowFadeRight = screen.body().x + screen.body().width - screen.theme().listScrollWidth - 2;
+}
+
+void UiListActivity::drawRowFrame(const RowFrameStyle& style) {
+  fadeTopFrom = fadeTopTo = fadeFootFrom = fadeFootTo = 0;
+  drawnRowFrameCount = 0;
+  if (!rowsFramed) return;
+  const auto lines = rowFrameLines(rowFrameGap, rowFrameAir());
+  const auto span = tenorchrome::frameSpan(renderer);
+  const bool ring = framedByDesign() && !fileList();
+  // Rows on a page that scrolls under the chrome (Stats): the frame is cut to their band.
+  const auto clip = renderer.getClipRect();
+  if (style.clipBottom > style.clipTop)
+    renderer.setClipRect(0, style.clipTop, renderer.getScreenWidth(), style.clipBottom - style.clipTop);
+  // The rows this layout drew and registered (a partial row at the foot registers none; a disabled
+  // row registers none either, the frame takes it in by the pitch of the others).
+  const auto& n = activeNav();
+  const int count = std::min(listCount(), n.top + n.pageRowsFor(listCount()));
+  fui::Rect first{}, last{};
+  int firstIndex = -1, lastIndex = -1;
+  int groupTop = 0;  // a page with groups: the ring top of the group still open
+  int groupFirst = -1;
+  bool grouped = false;
+  for (int i = n.top; i < count; ++i) {
+    const fui::Rect r = app.publishedRect(ACTION_ROW, static_cast<int16_t>(i));
+    if (r.height <= 0) continue;
+    if (first.height <= 0) {
+      first = r;
+      firstIndex = i;
+      groupFirst = i;
+      groupTop = r.y - lines.top;
+    } else if (rowStartsGroup(i)) {
+      // The group above ends at its last row; its heading stands between the 2 frames.
+      const int groupBottom = last.y + last.height + lines.bottom;
+      if (ring) tenorchrome::drawPanel(renderer, groupTop, groupBottom - groupTop);
+      if (drawnRowFrameCount < MAX_DRAWN_ROW_FRAMES)
+        drawnRowFrames[drawnRowFrameCount++] = {ACTION_ROW, groupFirst, lastIndex,
+                                                 {static_cast<int16_t>(span.x),
+                                                  static_cast<int16_t>(groupTop),
+                                                  static_cast<int16_t>(span.width),
+                                                  static_cast<int16_t>(groupBottom - groupTop)}};
+      groupTop = r.y - lines.top;
+      groupFirst = i;
+      grouped = true;
+    } else if (i > n.top) {
+      // Grey dotted rule from the text's edge, over every row but the first.
+      tenorchrome::drawRowRule(renderer, r.y - lines.rule, span.x + 16 + (rowsHaveIcons ? 41 : 0), span.x + span.width - 17);
+    }
+    last = r;
+    lastIndex = i;
+  }
+  if (first.height <= 0) {
+    renderer.setClipRect(clip[0], clip[1], clip[2], clip[3]);
+    return;
+  }
+  // A page with groups has headings between its rows, so no one pitch.
+  const int pitch = lastIndex > firstIndex ? (last.y - first.y) / (lastIndex - firstIndex) : first.height;
+  if (!grouped) {
+    first.y = static_cast<int16_t>(first.y - (firstIndex - n.top) * pitch);
+    last.height = static_cast<int16_t>(last.height + (count - 1 - lastIndex) * pitch);
+  }
+  const int ringTop = first.y - lines.top;
+  const int lastTop = grouped ? groupTop : ringTop;
+  const int fullBottom = last.y + last.height + lines.bottom;
+  const bool more = count < listCount();
+  const int floor = std::min(renderer.getScreenHeight() - tenorchrome::footBackReserve(), rowFrameFloor);
+  // Rows after the page: the frame goes on to the list's foot around the next row's top, and both fade there
+  // (founder 06/10: no row outside its frame). A rule still parts it from the last full row.
+  // A next row that opens a group closes this frame at the last full row; its heading shows in the fade.
+  const bool frameGoesOn = more && !rowStartsGroup(count);
+  const int ringBottom = frameGoesOn ? std::max(fullBottom, floor) : fullBottom;
+  if (ring) tenorchrome::drawPanel(renderer, lastTop, ringBottom - lastTop);
+  if (drawnRowFrameCount < MAX_DRAWN_ROW_FRAMES)
+    drawnRowFrames[drawnRowFrameCount++] = {ACTION_ROW, grouped ? groupFirst : firstIndex, lastIndex,
+                                             {static_cast<int16_t>(span.x),
+                                              static_cast<int16_t>(lastTop),
+                                              static_cast<int16_t>(span.width),
+                                              static_cast<int16_t>(ringBottom - lastTop)}};
+  if (frameGoesOn && floor > fullBottom)
+    tenorchrome::drawRowRule(renderer, last.y + last.height + rowFrameGap - lines.rule, span.x + 16 + (rowsHaveIcons ? 41 : 0),
+                span.x + span.width - 17);
+  if (pageScrollRegion.length > 0) {
+    if (!more && style.clipBottom <= style.clipTop)
+      pageScrollRegion.offset = pageScrollRegion.length - (pageScrollRegion.bottom - pageScrollRegion.top);
+  } else if (n.top > 0 || more) {
+    const int full = count - n.top;
+    const int bottom = std::min(floor, ringBottom);
+    const int height = bottom - ringTop;
+    setPageScrollRegion(ringTop, bottom, listCount() * height / std::max(1, full),
+                         n.top * height / std::max(1, full));
+    if (!more) pageScrollRegion.offset = pageScrollRegion.length - height;
+  }
+  // Rows before: the first row (the last full row of the page before, a flick keeps it) and its part of the
+  // frame fade. Rows after: the frame's part under the last full row fades with the next row's top.
+  constexpr int TOP_BAND = 64;
+  if (n.top > 0) {
+    fadeBand(renderer, ringTop, TOP_BAND, true);
+    fadeTopFrom = ringTop;
+    fadeTopTo = first.y + first.height;
+  }
+  if (more && floor > fullBottom) {
+    fadeBand(renderer, fullBottom, floor - fullBottom, false);
+    fadeFootFrom = fullBottom;
+    fadeFootTo = floor;
+  }
+  renderer.setClipRect(clip[0], clip[1], clip[2], clip[3]);
+}
+
+bool UiListActivity::rowFrameFor(const freeink::ui::ActionId action, const int value,
+                                 freeink::ui::Rect& out) const {
+  for (int i = 0; i < drawnRowFrameCount; ++i) {
+    const auto& frame = drawnRowFrames[i];
+    if (frame.action == action && value >= frame.first && value <= frame.last) {
+      out = frame.rect;
+      return true;
+    }
+  }
+  return false;
+}
+
 void UiListActivity::syncListViewport(UiScreen& screen, fui::ListProps& props, const bool hasSubtitle) {
+  frameRows(props);
   reserveFixedMenuContent(screen);
   reserveFavoriteHint(screen);
   decoratePinnedRows(props);
@@ -336,44 +800,92 @@ void UiListActivity::syncListViewport(UiScreen& screen, fui::ListProps& props, c
     const auto& metrics = UITheme::getInstance().getMetrics();
     rowHeight = static_cast<int16_t>(hasSubtitle ? metrics.listWithSubtitleRowHeight : metrics.listRowHeight);
     props.rowHeight = rowHeight;
+    // A row with a subtitle grows to its text plus this padding, so the selected pill's ring clears a descender.
+    props.rowPaddingY = TENOR_PILL_ROW_PADDING_Y;
   }
   const int rowGap = props.rowGap >= 0 ? props.rowGap : screen.theme().listRowGap;
-  reserveMoreBelowChevron(screen, rowHeight, rowGap);
 
-  activeNav().syncToProps(screen.body(), rowHeight, rowGap, listCount(), props);
+  if (tenorchrome::kTouchShell && activeNav().followOnBuild) {
+    // Touch: a row to show (the chapter being read) brings the page it is on, pages counted from the
+    // first row. The page size is the one laid out, so renderUi applies it after the first pass.
+    pageAnchorRow = kepConTro(activeNav().selected, listCount());
+    activeNav().followOnBuild = false;
+  }
+  reserveRowFrame(screen, rowGap);
+  // Touch: the rows a page holds are counted with the height and gap list() lays them out with (56 + 6 on
+  // the X4 Pro), not the theme's touch target (74): the follow and the end clamp land on the real last page.
+  const auto laid = rowsFramed ? screen.resolveListProps(props) : props;
+  activeNav().syncToProps(screen.body(), rowsFramed ? laid.rowHeight : rowHeight, rowsFramed ? laid.rowGap : rowGap,
+                          listCount(), props);
+  keepUglyRows(props);
+  measurePageScrollbar(screen, laid);
 
   activeNav().selected = kepConTro(activeNav().selected, listCount());
-  props.selectedIndex = static_cast<int16_t>(activeNav().selected);
+  // The touch shell has no cursor row: a tap opens or changes the row, nothing waits "selected".
+  props.selectedIndex = tenorchrome::kTouchShell ? int16_t{-1} : static_cast<int16_t>(activeNav().selected);
 }
 
 void UiListActivity::renderUi() {
   tabBandDrawn = false;
   favoriteHintY = -1;
+  // Only a list built in this paint pass owns a row frame.
+  rowsFramed = false;
+  pageScrollRegion = {};
   UiAppHost::renderUi();
   restorePinnedRows();
-  // Con dong ben duoi thi noi bang mot mui ten chu V o chan man, khong bang mot
-  // con so o goc tren: it nguoi nhin thanh cuon, va cho goc tren thuoc ve ten
-  // the ben canh, thu duy nhat o do dang doc.
-  if (tenorchrome::enabled() && activeNav().top + activeNav().pageRows() < listCount()) {
-    tenorchrome::drawMoreBelowChevron(renderer, favoriteHintY);
+  if (pageAnchorRow >= 0) {
+    // A row already on screen leaves the list where it is (a list coming back to its place).
+    auto& n = activeNav();
+    const int rows = std::max(1, n.pageRowsFor(listCount()));
+    // Pages as a flick turns them: a faded list keeps one row of the page before.
+    const int step = rows > fadeKeepRows() ? rows - fadeKeepRows() : rows;
+    if (pageAnchorRow < n.top || pageAnchorRow >= n.top + rows) {
+      n.top = pageAnchorRow / step * step;
+      n.rebuildNeeded = true;
+    }
+    pageAnchorRow = -1;
   }
-  drawPageHints();
+  if (!uiTarget.paintingEnabled()) return;
+  drawRowFrame(rowFrameStyle());
+  if (pinMarkAfterName()) drawPinMarks();
+  if (tenorchrome::enabled()) {
+    for (int row = activeNav().top; row < listCount(); ++row) {
+      const auto rect = app.publishedRect(ACTION_ROW, static_cast<int16_t>(row));
+      if (rect.height > 0 && rowChoiceStyle(row) == SettingsChoiceStyle::Popup)
+        tenorchrome::drawSettingsPopupMark(renderer, activeNav().trailingInkRight - (tenorchrome::POPUP_MARK_WIDTH - 1),
+                                           rect.y + rect.height / 2);
+    }
+  }
+  if (tenorchrome::enabled() && !tenorchrome::kTouchShell && !rowsFramed) fadeMoreBelow();
+  if (!(rowsFramed && !tenorchrome::kTouchShell)) drawPageHints();
   if (favoriteHintY >= 0) {
-    if (const char* hint = favoriteHintText()) tenorchrome::drawTip(renderer, hint, favoriteHintLinesAbove());
+    if (const char* hint = favoriteHintText()) {
+      if ((tabBandDrawn || shell::uglyParts()) && tenorchrome::x3ScreenLayoutEnabled()) {
+        const int height = tenorchrome::tipHeight(renderer, hint);
+        if (favoriteSaveFailed)
+          tenorchrome::drawInfoInRect(renderer, hint, {24, favoriteHintY, renderer.getScreenWidth() - 48, height});
+        else
+          tenorchrome::drawTipInRect(renderer, hint, tenorchrome::x3ScreenLayout(renderer, height).tipRect);
+      } else {
+        tenorchrome::drawTip(renderer, hint, favoriteHintLinesAbove());
+      }
+    }
   }
+  drawPageScrollbar();
+  if (rowsFramed && !tenorchrome::kTouchShell) drawPageHints(true);
 }
 
-void UiListActivity::drawPageHints() {
-  if (mappedInput.hasTouch() || SETTINGS.uiTheme != CrossPointSettings::TENOR_UI || !SETTINGS.tenorSideArrows) return;
+bool UiListActivity::drawsSideArrows() const {
+  return tenorchrome::enabled() && !tenorchrome::kTouchShell && SETTINGS.tenorSideArrows && showsSideArrows();
+}
+
+void UiListActivity::drawPageHints(const bool overScrollbar) {
+  if (!drawsSideArrows()) return;
   constexpr int cy = 195;
-  const int right = renderer.getScreenWidth() - 1 - 4;  // mirror of column 4 on the left
-  // Paint after the list: drawing during screen construction is covered by
-  // the list background on full-width menus such as Settings.
-  for (int dx = 0; dx <= 6; ++dx) {
-    const int halfHeight = dx * 4 / 6;
-    renderer.drawLine(4 + dx, cy - halfHeight, 4 + dx, cy + halfHeight, true);
-    renderer.drawLine(right - dx, cy - halfHeight, right - dx, cy + halfHeight, true);
-  }
+  inlineSymbols::drawShape(renderer, inlineSymbols::Shape::Left, 7, cy, 8, true);
+  // The scroll bar's thumb is drawn first on a framed list and the arrow over it, white where they meet.
+  inlineSymbols::drawShape(renderer, inlineSymbols::Shape::Right, renderer.getScreenWidth() - 1 - 7, cy, 8,
+                           !(overScrollbar && PageScrollbar::instance().thumbCovers(cy)));
 }
 
 int UiListActivity::kepConTro(const int chon, const int soDong) {
@@ -388,11 +900,175 @@ void UiListActivity::drawChrome() {
 }
 
 void UiListActivity::drawFooter() {
+  if (shell::uglyParts() && tenorchrome::x3ScreenLayoutEnabled() && favoriteHintY >= 0) {
+    if (const char* hint = favoriteHintText()) {
+      const int height = tenorchrome::tipHeight(renderer, hint);
+      if (favoriteSaveFailed)
+        tenorchrome::drawInfoInRect(renderer, hint, {24, favoriteHintY, renderer.getScreenWidth() - 48, height});
+      else
+        tenorchrome::drawTipInRect(renderer, hint, tenorchrome::x3ScreenLayout(renderer, height).tipRect);
+    }
+  }
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 
+void UiListActivity::keepUglyRows(const fui::ListProps& props) {
+  uglyItems_ = props.items;
+  uglyItemsFirst_ = props.itemsWindowFirst;
+  uglyRowProvider_ = props.rowProvider;
+  uglyRowCtx_ = props.rowProviderCtx;
+}
+
+namespace {
+// A run of words the list laid out, kept to be written by hand where it stands.
+struct UglyRun {
+  fui::Rect rect;
+  std::string text;
+  fui::TextAlign align;
+  bool locked;
+  uint8_t lines;
+};
+}  // namespace
+
+bool UiListActivity::renderUglyList() {
+  if (!uglySkin() || !shell::uglyParts()) return false;
+  // The list lays out as usual with its own ink off and its words kept; what a screen draws past the list stays.
+  std::vector<UglyRun> runs;
+  renderer.clearScreen();
+  uiTarget.setPaintingEnabled(false);
+  uiTarget.setTextSink(
+      [](void* ctx, const fui::Rect rect, const char* text, const fui::TextStyle& style) {
+        // A disabled row's words come in light gray: the row is locked.
+        static_cast<std::vector<UglyRun>*>(ctx)->push_back(
+            {rect, text, style.align, !style.inverted && style.color == fui::Color::LightGray, style.maxLines});
+      },
+      &runs);
+  renderSettledList(activeNav(), [&] {
+    runs.clear();
+    renderUi();
+  });
+  uiTarget.setTextSink(nullptr, nullptr);
+  uiTarget.setPaintingEnabled(true);
+  drawChrome();
+  // A value at the right end of the line a label stands on: the hand writes wider than the layout's font, so the pair
+  // may no longer fit side by side.
+  for (auto& value : runs) {
+    if (value.align != fui::TextAlign::Right) continue;
+    for (auto& label : runs)
+      if (label.align == fui::TextAlign::Left && label.rect.y == value.rect.y && label.rect.height == value.rect.height &&
+          label.rect.x < value.rect.x)
+        uglychrome::apart(renderer, label.rect, label.text.c_str(), value.rect, value.text.c_str());
+  }
+#ifdef UGLY_FRAME_LOG
+  for (const auto& run : runs) LOG_INF("UGLY", "part=word text=%s", run.text.c_str());
+#endif
+  const int count = listCount(), first = std::max(0, activeNav().top);
+  auto itemAt = [&](int row) {
+    fui::ListItem item;
+    if (uglyRowProvider_) uglyRowProvider_(uglyRowCtx_, static_cast<uint16_t>(row), item);
+    else if (uglyItems_ && row >= uglyItemsFirst_) item = uglyItems_[row - uglyItemsFirst_];
+    return item;
+  };
+  // The trailing preview has words but no hit rect. Use its laid-out label for icon painting only.
+  const int preview = first + activeNav().pageRowsFor(count);
+  auto iconRowBox = [&](int row) {
+    const auto box = app.publishedRect(ACTION_ROW, static_cast<int16_t>(row));
+    if (!box.empty() || row != preview) return box;
+    const auto item = itemAt(row);
+    if (item.icon && item.label) {
+      const auto above = app.publishedRect(ACTION_ROW, static_cast<int16_t>(row - 1));
+      for (auto run = runs.rbegin(); run != runs.rend(); ++run)
+        if (run->align == fui::TextAlign::Left && run->text == item.label && run->rect.y >= above.bottom())
+          return run->rect;
+    }
+    return box;
+  };
+  // The circle needs 34 pixels to the label's left, beyond the icon's 24 pixels of ink.
+  for (int row = first; row < count && row < first + 64; ++row) {
+    const auto box = iconRowBox(row);
+    if (box.empty() || !itemAt(row).icon) continue;
+    for (auto& run : runs) {
+      const int mid = run.rect.y + run.rect.height / 2;
+      if (run.align != fui::TextAlign::Left || mid < box.y || mid >= box.bottom()) continue;
+      run.rect.x += 28;
+      run.rect.width = std::max<int16_t>(0, run.rect.width - 28);
+      break;
+    }
+  }
+  std::vector<fui::Rect> ink;
+  ink.reserve(runs.size());
+  for (const auto& run : runs)
+    ink.push_back(uglychrome::words(renderer, run.rect, run.text.c_str(), run.align, run.locked, run.lines));
+  // The marks go on the rows that took a place on screen. A locked row has no place to choose and gets none, but
+  // the cursor can stand on it: there it keeps the circle, round the label.
+  for (int row = first; row < count && row < first + 64; ++row) {
+    const auto box = iconRowBox(row);
+    if (box.empty() && row != activeNav().selected) continue;
+    const auto item = itemAt(row);
+    if (item.icon && !box.empty()) {
+      for (size_t i = 0; i < runs.size(); ++i) {
+        const auto& at = runs[i].rect;
+        const int mid = at.y + at.height / 2;
+        if (runs[i].align != fui::TextAlign::Left || mid < box.y || mid >= box.bottom()) continue;
+        const auto bounds = ugly::inkBounds(renderer, {ink[i].x, at.y - 4, ink[i].right(), at.bottom() + 6});
+        ink[i] = {static_cast<int16_t>(bounds.x0), static_cast<int16_t>(bounds.y0),
+                  static_cast<int16_t>(bounds.x1 - bounds.x0), static_cast<int16_t>(bounds.y1 - bounds.y0)};
+        ugly::iconAsset(renderer, item.icon.data,
+                        ugly::rowInkBox(at.x - item.icon.width - 38, bounds.y0, bounds.y1),
+                        ugly::iconFrameSeed(), item.icon.width, item.icon.height, true);
+        break;
+      }
+    }
+  }
+  // Keep every label measurement clear of the selection circles from earlier rows.
+  for (int row = first; row < count && row < first + 64; ++row) {
+    const auto box = app.publishedRect(ACTION_ROW, static_cast<int16_t>(row));
+    if (box.empty() && row != activeNav().selected) continue;
+    const auto item = itemAt(row);
+    if (box.empty()) {
+      for (size_t i = 0; item.label && i < runs.size(); ++i)
+        if (runs[i].align == fui::TextAlign::Left && runs[i].text == item.label) {
+          uglychrome::ring(renderer, ink[i], mark_.get(selectionMarkKey()));
+          break;
+        }
+      continue;
+    }
+    uglychrome::Marks marks{row == activeNav().selected, item.chosen, item.opensNext, item.toggle, item.toggleChecked};
+    // The circle goes round the row's label: the first words written from the row's left half.
+    for (size_t i = 0; marks.selected && i < runs.size(); ++i) {
+      const auto& at = runs[i].rect;
+      const int mid = at.y + at.height / 2;
+      if (runs[i].align == fui::TextAlign::Left && mid >= box.y && mid < box.bottom() && at.x < box.x + box.width / 2) {
+        marks.around = ink[i];
+        break;
+      }
+    }
+    uglychrome::marks(renderer, box, marks, mark_.get(selectionMarkKey()));
+  }
+  drawFooter();
+  if (tenorchrome::kTouchShell) {
+    const int first = std::max(0, activeNav().top);
+    const int rows = std::max(1, activeNav().pageRowsFor(listCount()));
+    const auto topRow = app.publishedRect(ACTION_ROW, first);
+    if (topRow.height > 0) {
+      const int height = std::max(1, rowFrameFloor - topRow.y);
+      setPageScrollRegion(topRow.y, rowFrameFloor, listCount() * height / rows, first * height / rows);
+    }
+    drawPageScrollbar();
+  }
+#ifdef UGLY_FRAME_LOG
+  LOG_INF("UGLY", "part=rows runs=%d", static_cast<int>(runs.size()));
+#endif
+  return true;
+}
+
 void UiListActivity::render(RenderLock&&) {
+  if (rowMenu.processRender(renderer, mappedInput)) return;
+  if (renderUglyList()) {
+    renderer.displayBuffer();
+    return;
+  }
   renderSettledList(activeNav(), [&] {
     renderer.clearScreen();
     drawChrome();
@@ -415,8 +1091,23 @@ void UiListActivity::restoreNavigation(const MenuNavigationState& state) {
 }
 
 void UiListActivity::reserveFixedMenuContent(UiScreen& screen) {
-  if (tenorchrome::enabled() && screen.body().y < tenorchrome::contentTop())
-    screen.takeTop(static_cast<int16_t>(tenorchrome::contentTop() - screen.body().y));
+  if (tenorchrome::x3ScreenLayoutEnabled() && ownsX3Chrome() && !shell::uglyParts()) return;
+  if (shell::uglyParts() && tenorchrome::x3ScreenLayoutEnabled()) {
+    const auto body = tenorchrome::x3ScreenLayout(renderer).bodyRect;
+    if (screen.body().y < body.y) screen.takeTop(static_cast<int16_t>(body.y - screen.body().y));
+    if (screen.body().bottom() > body.bottom())
+      screen.takeBottom(static_cast<int16_t>(screen.body().bottom() - body.bottom()));
+    return;
+  }
+  if (tabBandDrawn && tenorchrome::x3ScreenLayoutEnabled()) return;
+  const int top = tabBandDrawn ? tenorchrome::contentTopUnderTabs() : tenorchrome::contentTop();
+  if (tenorchrome::enabled() && screen.body().y < top) screen.takeTop(static_cast<int16_t>(top - screen.body().y));
+  // Touch: the rows stop above the round back button at the foot, where a screen has one.
+  if (!tabBandDrawn && tenorchrome::wantsFootBack(name.c_str())) {
+    const int bottom = screen.body().y + screen.body().height;
+    const int limit = renderer.getScreenHeight() - tenorchrome::footBackReserve();
+    if (bottom > limit) screen.takeBottom(static_cast<int16_t>(bottom - limit));
+  }
 }
 
 int UiListActivity::focusFavorite(const std::string& key) {
@@ -430,20 +1121,39 @@ int UiListActivity::focusFavorite(const std::string& key) {
   return -1;
 }
 void UiListActivity::reserveFavoriteHint(UiScreen& screen) {
+  if (tenorchrome::x3ScreenLayoutEnabled() && ownsX3Chrome() && !shell::uglyParts()) return;
+  if ((tabBandDrawn || shell::uglyParts()) && tenorchrome::x3ScreenLayoutEnabled()) {
+    if (!supportsFavorites() && !favoriteSaveFailed) return;
+    const char* hint = favoriteHintText();
+    if (!hint || (!favoriteSaveFailed && !tenorchrome::tipShown(hint))) return;
+    const int height = tenorchrome::tipHeight(renderer, hint);
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, favoriteSaveFailed ? 0 : height);
+    favoriteHintY = favoriteSaveFailed ? layout.bodyRect.bottom() - height : layout.tipRect.y;
+    const int limit = favoriteSaveFailed ? favoriteHintY - 8 : layout.bodyRect.bottom();
+    const int bottom = screen.body().bottom();
+    if (bottom > limit) screen.takeBottom(static_cast<int16_t>(bottom - limit));
+    return;
+  }
   if (!supportsFavorites() || SETTINGS.globalStatusBarHidden()) return;
   const char* hint = favoriteHintText();
-  if (!hint) return;
+  if (!hint || !tenorchrome::tipShown(hint)) return;
   favoriteHintY = tenorchrome::tipTopY(renderer, hint, favoriteHintLinesAbove());
   const int bottom = screen.body().y + screen.body().height;
   const int reservedTop = favoriteHintY - 2;
   if (bottom > reservedTop) screen.takeBottom(static_cast<int16_t>(bottom - reservedTop));
 }
 
-void UiListActivity::reserveMoreBelowChevron(UiScreen& screen, const int16_t rowHeight, const int rowGap) {
-  if (!tenorchrome::enabled() || listCount() <= fui::listVisibleRows(screen.body(), rowHeight, rowGap)) return;
-  const int bottom = screen.body().y + screen.body().height;
-  const int reservedTop = tenorchrome::moreBelowChevronTopY(renderer, favoriteHintY) - 2;
-  if (bottom > reservedTop) screen.takeBottom(static_cast<int16_t>(bottom - reservedTop));
+void UiListActivity::fadeMoreBelow() {
+  // Buttons: rows go on below, so the band under the last full row fades over the next row's top, down to the
+  // list's foot (as X4 Pro's framed lists do). The scroll bar beside it stays whole.
+  const auto& n = activeNav();
+  const int count = listCount();
+  const int last = n.top + n.pageRowsFor(count) - 1;
+  if (last < 0 || last + 1 >= count) return;
+  const fui::Rect r = app.publishedRect(ACTION_ROW, static_cast<int16_t>(last));
+  if (r.height <= 0) return;  // a disabled last row registers no rect: the scroll bar alone says there is more
+  const int y0 = r.y + r.height;
+  fadeBand(renderer, y0, rowFrameFloor - y0, false, 0, rowFadeRight);
 }
 
 const char* UiListActivity::favoriteHintText() {
@@ -467,7 +1177,7 @@ void UiListActivity::decoratePinnedRows(fui::ListProps& props) {
   if (!props.items) return;
   const int end = props.itemsWindowCount ? props.itemsWindowFirst + props.itemsWindowCount : props.count;
   for (int i = props.itemsWindowFirst; i < end && pinDecorationCount < pinDecorations.size(); ++i) {
-    if (!rowIsPinned(i)) continue;
+    if (!rowIsPinned(i) || pinMarkAfterName()) continue;
     auto& d = pinDecorations[pinDecorationCount++];
     d.row = const_cast<fui::ListItem*>(&props.items[i - props.itemsWindowFirst]);
     d.original = d.row->label;

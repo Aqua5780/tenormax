@@ -1,20 +1,20 @@
 #include "ButtonSymbols.h"
 
-#include <HalGPIO.h>
 #include <I18n.h>
+#include <InlineSymbolBitmaps.h>
 
 #include <cstring>
 
 #include "CrossPointSettings.h"
+#include "TenorMenuChrome.h"
 #include "fontIds.h"
-extern HalGPIO gpio;
 namespace buttonSymbols {
 using inlineSymbols::Shape;
 bool font(int id) { return id == UI_10_FONT_ID || id == UI_12_FONT_ID || id == SMALL_FONT_ID; }
 inlineSymbols::Spec resolve(int id) {
   if (id == 10)
-    return {SETTINGS.uiTheme == CrossPointSettings::TENOR_UI && !gpio.hasTouch() ? Shape::MarginStar : Shape::Star,
-            nullptr};
+    return {tenorchrome::enabled() ? Shape::MarginPin : Shape::Star, nullptr,
+            !tenorchrome::kTouchShell && !SETTINGS.tenorSideArrows ? 15 : 8};
   if (id == 9) return {Shape::Erase, nullptr};
   if (id == 6) return {Shape::Star, nullptr};
   constexpr Shape shapes[] = {Shape::Select, Shape::Back, Shape::Up, Shape::Down, Shape::Left, Shape::Right};
@@ -24,16 +24,13 @@ inlineSymbols::Spec resolve(int id) {
     id = (id == 7) != reverse ? 5 : 4;
   }
   if (id < 0 || id > 5) return {Shape::None, ""};
-  if (SETTINGS.uiTheme == CrossPointSettings::TENOR_UI && SETTINGS.tenorButtonSymbols && !gpio.hasTouch())
+  if (tenorchrome::enabled() && SETTINGS.tenorButtonSymbols)
     return {shapes[id], nullptr};
   const StrId labels[] = {StrId::STR_SELECT,   StrId::STR_BACK,     StrId::STR_DIR_UP,
                           StrId::STR_DIR_DOWN, StrId::STR_DIR_LEFT, StrId::STR_DIR_RIGHT};
   return {shapes[id], I18N.get(labels[id])};
 }
 void install() { inlineSymbols::configure(resolve, font); }
-namespace {
-constexpr int kNutNet = 14;
-
 int labelId(const char* label) {
   if (!label) return -1;
   const StrId labels[] = {StrId::STR_SELECT,   StrId::STR_BACK,     StrId::STR_DIR_UP,
@@ -49,62 +46,33 @@ int labelId(const char* label) {
   return id;
 }
 
-void veTamGiac(const GfxRenderer& r, const int x, const int y, const int net, const int dir, const bool doc,
-               const bool black) {
-  for (int c = 0; c < net; ++c) {
-    const int dai = net - c;
-    const int le = (dai - 1) / 2;
-    const int half = net / 2;
-    if (doc) {
-      const int py = dir < 0 ? y + half - 1 - c : y - half + c;
-      r.drawLine(x - le, py, x - le + dai - 1, py, black);
-    } else {
-      const int px = dir < 0 ? x + half - c : x - half + c;
-      r.drawLine(px, y - le, px, y - le + dai - 1, black);
-    }
-  }
-}
-
-void veMuiTen(const GfxRenderer& r, const inlineSymbols::Shape shape, const int x, const int y, const bool black,
-              const int net = kNutNet) {
-  if (shape == inlineSymbols::Shape::Up || shape == inlineSymbols::Shape::Down) {
-    veTamGiac(r, x, y, net, shape == inlineSymbols::Shape::Up ? -1 : 1, true, black);
-    return;
-  }
-  const int dir = shape == inlineSymbols::Shape::Right ? 1 : -1;
-  const int ngangY = y - 1;
-  if (shape == inlineSymbols::Shape::Back) {
-    // Shares the return-arrow geometry with inline text hints, so the footer
-    // symbol and the inline one stay the same shape.
-    inlineSymbols::drawShape(r, shape, x, ngangY, net, black);
-    return;
-  }
-  veTamGiac(r, x, ngangY, net, dir, false, black);
-}
-
-}  // namespace
-
 SymbolBounds horizontalBounds(const char* label, const int net) {
   const int id = labelId(label);
   if (id < 0 || id > 5) return {0, 0};
   const auto shape = resolve(id).shape;
-  const int half = net / 2;
-  const int triangleMin = half - net + 1;
-  const int triangleMax = half;
-  if (shape == Shape::Back || shape == Shape::Select) {
-    // Back and Select are bitmap glyphs (see InlineSymbols.cpp); the footer
-    // centers them the same way drawShape() does, so their ink extent is
-    // exactly the glyph width split around that center.
+  if (shape == Shape::Back || shape == Shape::Select || shape == Shape::Up || shape == Shape::Down ||
+      shape == Shape::Left || shape == Shape::Right) {
     const int w = inlineSymbols::glyphWidth(shape, net);
     return {w / 2, w - 1 - w / 2};
   }
-  if (shape == Shape::Up || shape == Shape::Down) {
-    const int rowLeft = (net - 1) / 2;
-    return {rowLeft, net - 1 - rowLeft};
-  }
-  if (shape == Shape::Left) return {-triangleMin, triangleMax};
-  if (shape == Shape::Right) return {half, net - 1 - half};
   return {0, 0};
+}
+
+// Rows to move a key symbol from the centre of its own box to where the strip puts it. The four keys share one shaft
+// (Back's), and the whole row stands from Enter's top row to Back's bottom row. Enter's top row is the first row of the
+// strip, which puts Back's top row 6 (net 14) or 8 (net 18) rows above the anchor y; every glyph then hangs from there
+// by its own `top`, counted from Back's top row.
+static int barShift(const Shape shape, const int net) {
+  using namespace inlineSymbolBitmaps;
+  const bool large = net >= 16;
+  const Glyph* glyph = nullptr;
+  if (shape == Shape::Back) glyph = large ? &kBackNet18 : &kBackNet14;
+  if (shape == Shape::Select) glyph = large ? &kSelectNet18 : &kSelectNet14;
+  if (shape == Shape::Up) glyph = large ? &kUpNet18 : &kUpNet14;
+  if (shape == Shape::Down) glyph = large ? &kDownNet18 : &kDownNet14;
+  if (shape == Shape::Left) glyph = large ? &kLeftNet18 : &kLeftNet14;
+  if (shape == Shape::Right) glyph = large ? &kRightNet18 : &kRightNet14;
+  return glyph ? glyph->top + glyph->height / 2 - (large ? 8 : 6) : 0;
 }
 
 bool drawLabel(const GfxRenderer& renderer, const char* label, int x, int y, const int net) {
@@ -112,11 +80,7 @@ bool drawLabel(const GfxRenderer& renderer, const char* label, int x, int y, con
   if (id < 0) return false;
   const auto spec = resolve(id);
   if (spec.label) return false;
-  if (spec.shape == inlineSymbols::Shape::Select) {
-    inlineSymbols::drawShape(renderer, spec.shape, x, y, net, true);
-  } else {
-    veMuiTen(renderer, spec.shape, x, y, true, net);
-  }
+  inlineSymbols::drawShape(renderer, spec.shape, x, y + barShift(spec.shape, net), net, true);
   return true;
 }
 }  // namespace buttonSymbols

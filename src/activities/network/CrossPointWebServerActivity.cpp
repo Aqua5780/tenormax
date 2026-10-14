@@ -1,5 +1,7 @@
 #include "CrossPointWebServerActivity.h"
 
+#include "activities/X3ActivityLayout.h"
+
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <FontCacheManager.h>
@@ -9,6 +11,7 @@
 #include <Memory.h>
 #include <WiFi.h>
 
+#include <cctype>
 #include <cstddef>
 
 #include "CrossPointSettings.h"
@@ -18,32 +21,33 @@
 #include "MappedInputManager.h"
 #include "NetworkModeSelectionActivity.h"
 #include "SdCardFontSystem.h"
+#include "SettingsList.h"
+#include "FontPackInstaller.h"
 #include "SilentRestart.h"
 #include "UIFontTiers.h"
 #include "WifiSelectionActivity.h"
 #include "activities/network/CalibreConnectActivity.h"
 #include "activities/reader/ReaderActivity.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/QrUtils.h"
 #include "util/TaskWatchdog.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyNote.h"
 
 namespace {
-// AP Mode configuration
-constexpr const char* AP_SSID_DEFAULT = "tenor-cross";
-constexpr const char* AP_HOSTNAME_DEFAULT = "tenor-cross";
-
 // The access-point SSID and the mDNS label both follow the user's device name,
 // so a reader renamed in settings is recognisable from a phone's Wi-Fi list.
 const char* apSsid() {
   static char buf[64];
-  deviceNetworkName(buf, sizeof(buf), AP_SSID_DEFAULT);
+  deviceNetworkName(buf, sizeof(buf), defaultNetworkName());
   return buf;
 }
 
 const char* apHostname() {
   static char buf[64];
-  deviceNetworkName(buf, sizeof(buf), AP_HOSTNAME_DEFAULT);
+  deviceNetworkName(buf, sizeof(buf), defaultNetworkName());
   return buf;
 }
 constexpr uint8_t AP_CHANNEL = 1;
@@ -53,24 +57,33 @@ constexpr int QR_CODE_HEIGHT = 198;
 
 // Network names are sanitised ASCII. Wrap addresses without hiding any byte
 // behind an ellipsis; a fixed scratch line avoids allocating a list of lines.
+// A line that would run past flowBottom (the foot of the code drawn beside the text) restarts under it, at wideTop,
+// from wideX across wideWidth: a long name wraps along the code, then under it, instead of a column of one letter.
 int drawNetworkText(const GfxRenderer& renderer, const int font, const char* text, const int x, int y, const int width,
-                    const bool centered = false) {
+                    const bool centered = false, const int flowBottom = 0, const int wideX = 0, const int wideTop = 0,
+                    const int wideWidth = 0) {
   const int lineHeight = renderer.getLineHeight(font);
   size_t remaining = strlen(text);
   while (remaining != 0) {
+    int lineX = x, lineWidth = width;
+    if (flowBottom && y + lineHeight > flowBottom) {
+      y = std::max(y, wideTop);
+      lineX = wideX;
+      lineWidth = wideWidth;
+    }
     char line[64];
     const size_t capacity = std::min(remaining, sizeof(line) - 1);
     memcpy(line, text, capacity);
     line[capacity] = '\0';
     size_t count = capacity;
-    if (renderer.getTextWidth(font, line) > width) {
+    if (renderer.getTextWidth(font, line) > lineWidth) {
       size_t low = 1;
       size_t high = capacity;
       while (low < high) {
         const size_t mid = (low + high + 1) / 2;
         const char saved = line[mid];
         line[mid] = '\0';
-        const bool fits = renderer.getTextWidth(font, line) <= width;
+        const bool fits = renderer.getTextWidth(font, line) <= lineWidth;
         line[mid] = saved;
         if (fits) {
           low = mid;
@@ -79,15 +92,50 @@ int drawNetworkText(const GfxRenderer& renderer, const int font, const char* tex
         }
       }
       count = low;
+      // Break where an address breaks: after a "/" or a "-", before a ".", in the later half of the line; and never leave
+      // a line of punctuation alone, the next line carries at least 2 letters or digits.
+      if (count < remaining) {
+        for (size_t i = count; i > count / 2; --i) {
+          if (text[i - 1] == '/' || text[i - 1] == '-' || text[i] == '.') {
+            count = i;
+            break;
+          }
+        }
+        const auto carries = [&](const size_t from) {
+          int letters = 0;
+          for (size_t i = from; i < remaining; ++i) letters += std::isalnum(static_cast<unsigned char>(text[i])) ? 1 : 0;
+          return letters;
+        };
+        while (count > 1 && carries(count) < 2) --count;
+      }
       line[count] = '\0';
     }
-    const int left = centered ? x + (width - renderer.getTextWidth(font, line)) / 2 : x;
+    const int left = centered ? lineX + (lineWidth - renderer.getTextWidth(font, line)) / 2 : lineX;
     renderer.drawText(font, left, y, line);
     text += count;
     remaining -= count;
     y += lineHeight;
   }
   return y;
+}
+
+// The bold line over a name or an address: wraps by words inside the column beside the code, two lines at most.
+int drawNetworkHeading(const GfxRenderer& renderer, const char* text, const int x, int y, const int width) {
+  for (const auto& line : renderer.wrappedText(UI_10_FONT_ID, text, width, 2, EpdFontFamily::BOLD)) {
+    renderer.drawText(UI_10_FONT_ID, x, y, line.c_str(), true, EpdFontFamily::BOLD);
+    y += renderer.getLineHeight(UI_10_FONT_ID);
+  }
+  return y;
+}
+
+// The network name in the sub-header stops 8 px short of the signal bars beside it (a symbol keeps 6 px or more from
+// its text at every size), so a long name ends in an ellipsis instead of running into them.
+constexpr int WIFI_BARS_WIDTH = 22;  // 4 bars of 4 px, 3 gaps of 2 px
+std::string subHeaderLabel(const GfxRenderer& renderer, const std::string& ssid, const bool withBars) {
+  if (!withBars) return ssid;
+  const int side = UITheme::getInstance().getMetrics().contentSidePadding;
+  const int room = renderer.getScreenWidth() - 2 * side - WIFI_BARS_WIDTH - 8;
+  return renderer.truncatedText(UI_10_FONT_ID, ssid.c_str(), room, EpdFontFamily::REGULAR);
 }
 
 // DNS server for captive portal (redirects all DNS queries to our IP)
@@ -135,9 +183,17 @@ void CrossPointWebServerActivity::onEnter() {
 
   LOG_INF("WEBACT", "Enter after reader closed heap=%u largest=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
+  // The settings catalog (~16 KB on the X3) a settings screen or a pinned setting built stays cached after it: returned
+  // here, under the render lock, with every screen that borrowed its rows gone (the reader does the same). With it held,
+  // Wi-Fi and the server left the X3 8 KB, and an upload stalled.
+  {
+    RenderLock lock(*this);
+    releaseBaseSettingsList();
+  }
+
   // Heap-critical transition: WiFi (~45KB) plus the web server have to fit in
   // what's left of the ~380KB parts. SD-font caches retained for the CJK UI
-  // fallback (mini glyph/kern arenas, kern class tables) are rebuildable on
+  // fallback (mini glyph/kern arenas, ligature tables) are rebuildable on
   // demand - release them up front instead of aborting in startWebServer()
   // when the heap comes up short (observed on X3 with a Korean SD font).
   if (auto* fcm = renderer.getFontCacheManager()) {
@@ -197,6 +253,9 @@ void CrossPointWebServerActivity::onExit() {
     state = WebServerActivityState::SHUTTING_DOWN;
     stopDnsServer();
     MDNS.end();
+#ifdef TENOR_PRESS_PROBE
+    LOG_INF("FTX", "mdns ended t=%lu", millis());
+#endif
 
     // Skip reboot if WiFi was never activated (e.g. user backed out of mode selection).
     if (WiFi.getMode() != WIFI_MODE_NULL) {
@@ -206,6 +265,9 @@ void CrossPointWebServerActivity::onExit() {
         WiFi.disconnect(false);
       }
       delay(30);
+#ifdef TENOR_PRESS_PROBE
+      LOG_INF("FTX", "wifi down t=%lu heap=%u largest=%u", millis(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
       // The restart hands back the heap Wi-Fi fragmented; the reader then opens
       // on a clean heap, the same way it would after a cold boot.
       if (toBook) {
@@ -392,6 +454,16 @@ void CrossPointWebServerActivity::startWebServer() {
   });
   // A slow or stalled upload keeps handleClient() busy for as long as bytes trickle in;
   // a Back tap latched meanwhile ends it instead of waiting behind it.
+  webServer->setFontPackApplier([this](const char* path) {
+    RenderLock lock(*this);
+    if (auto* cache = renderer.getFontCacheManager()) cache->releaseSdFontCaches();
+    if (FontPackInstaller::scan()) {
+      sdFontSystem.markRegistryDirty();
+      sdFontSystem.ensureLoaded(renderer);
+      requestUpdate();
+    }
+    return !Storage.exists(path);
+  });
   webServer->setUploadCancel([this] { return backLatch.latched(); });
   // A stalled upload asks no cancel: the tap itself cuts its socket.
   backLatch.setTapHook([](void* server) { static_cast<CrossPointWebServer*>(server)->interruptUpload(); },
@@ -442,10 +514,26 @@ void CrossPointWebServerActivity::stopServerAndLeave() {
     webServer->stop();
     webServer.reset();
   }
+#ifdef TENOR_PRESS_PROBE
+  LOG_INF("FTX", "server stopped t=%lu heap=%u largest=%u", millis(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
   leave();
 }
 
 void CrossPointWebServerActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() && isApMode && state == WebServerActivityState::SERVER_RUNNING &&
+      (mappedInput.wasReleased(MappedInputManager::Button::Left) || mappedInput.wasReleased(MappedInputManager::Button::Right))) {
+    x3Step = 1 - x3Step;
+    requestUpdate();
+    return;
+  }
+  if (tenorchrome::x3ScreenLayoutEnabled() &&
+      x3Info.turn(mappedInput.wasReleased(MappedInputManager::Button::Up) ? -1 :
+                  mappedInput.wasReleased(MappedInputManager::Button::Down) ? 1 : 0)) {
+    requestUpdate();
+    return;
+  }
+
   // Handle different states
   if (state == WebServerActivityState::SERVER_RUNNING) {
     // Main already sampled input for this pass. Preserve that release edge and
@@ -522,7 +610,9 @@ void CrossPointWebServerActivity::loop() {
 
       // Service one request pass, then let main sample input again. skipLoopDelay()
       // keeps the next pass immediate while the server is running. A synchronous
-      // handler finishes before ActivityManager can tear down the server.
+      // handler finishes before ActivityManager can tear down the server. This
+      // replaces upstream's up-to-500-iteration tight loop (#3652-style main-loop
+      // contention: a long blocking loop here starved input/render the same way).
       webServer->handleClient();
       lastHandleClientTime = millis();
       if (backLatch.consume()) {
@@ -541,9 +631,60 @@ void CrossPointWebServerActivity::loop() {
 }
 
 void CrossPointWebServerActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    if (state != WebServerActivityState::SERVER_RUNNING && state != WebServerActivityState::AP_STARTING) return;
+    // The step ("Connect to Wi-Fi", "Open address") says what to do with the code under it: information, shown
+    // whether tips are on or off, and part of the block with the words and the code, never a tip over the bar.
+    const char* step = state == WebServerActivityState::SERVER_RUNNING ?
+        (isApMode && x3Step == 0 ? tr(STR_CONNECT_WIFI_HINT) : tr(STR_OPEN_URL_HINT)) : nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer);
+    renderer.clearScreen();
+    const std::string hostname = std::string("http://") + apHostname() + ".local/";
+    const std::string address = "http://" + connectedIP + "/";
+    auto body = layout.bodyRect;
+    const bool showQr = state == WebServerActivityState::SERVER_RUNNING;
+    const auto information = {state == WebServerActivityState::AP_STARTING ? tr(STR_STARTING_HOTSPOT) : nullptr,
+        connectedSSID.c_str(), address.c_str(), hostname.c_str(), isApMode ? (x3Step == 0 ? "1/2" : "2/2") : nullptr};
+    if (showQr) {
+      // The words, the code and the step under it stand together and the whole block sits in the middle of the
+      // room above the bar, an 8 px clear gap at the top and the bottom at the least.
+      constexpr int gapToCode = 16, gapToStep = 8;
+      const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
+      bool paged = false;
+      const int fit = x3activity::InfoPages::fit(
+          renderer, body.width, body.height - QR_CODE_HEIGHT - gapToCode - gapToStep - lineHeight, information, &paged);
+      const int used = paged ? fit : fit - lineHeight;
+      // The first row of ink, not its line box, starts the block.
+      const int slack = renderer.getTextInkTop(SMALL_FONT_ID, connectedSSID.c_str(), EpdFontFamily::REGULAR);
+      const int blockHeight = used - slack + gapToCode + QR_CODE_HEIGHT + gapToStep + lineHeight;
+      const int top = body.y + std::max(0, (body.height - blockHeight) / 2 - slack);
+      auto text = body;
+      text.y = top;
+      text.height = fit;
+      x3Info.draw(renderer, text, information);
+      const std::string payload = isApMode && x3Step == 0 ? std::string("WIFI:T:nopass;S:") + connectedSSID + ";;" :
+          isApMode ? hostname : address;
+      const int qrTop = top + used + gapToCode;
+      QrUtils::drawQrCode(renderer, Rect{(renderer.getScreenWidth() - QR_CODE_WIDTH) / 2, qrTop, QR_CODE_WIDTH, QR_CODE_HEIGHT}, payload);
+      tenorchrome::drawInfoInRect(renderer, step,
+                                  tenorchrome::X3ScreenRect{0, qrTop + QR_CODE_HEIGHT + gapToStep, renderer.getScreenWidth(), lineHeight}, 1);
+    } else {
+      x3Info.draw(renderer, body, information);
+    }
+    x3activity::drawBar(renderer, layout.barRect, isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER), navigationPrefix.c_str());
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    renderer.displayBuffer();
+    return;
+  }
+
   // Only render our own UI when server is running
   // Subactivities handle their own rendering
   if (state == WebServerActivityState::SERVER_RUNNING || state == WebServerActivityState::AP_STARTING) {
+    if (shell::uglyParts()) {
+      renderUgly();
+      return;
+    }
     renderer.clearScreen();
     const auto& metrics = UITheme::getInstance().getMetrics();
     const auto pageWidth = renderer.getScreenWidth();
@@ -553,8 +694,6 @@ void CrossPointWebServerActivity::render(RenderLock&&) {
                    isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER), nullptr);
 
     if (state == WebServerActivityState::SERVER_RUNNING) {
-      GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                        connectedSSID.c_str());
       renderServerRunning();
     } else {
       const auto height = renderer.getLineHeight(UI_10_FONT_ID);
@@ -571,19 +710,23 @@ void CrossPointWebServerActivity::renderServerRunning() const {
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
                  isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER), nullptr);
-  GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                    connectedSSID.c_str());
-
-  if (!isApMode) {
-    renderWifiIndicator(metrics.topPadding + metrics.headerHeight);
+  // The top of a touch screen is the status strip alone (time, icons, battery); the network name goes inside the first
+  // frame. A screen with the sub-header row keeps it for the readers that have no frames.
+  const bool framed = tenorchrome::roundFrames();
+  if (!framed) {
+    GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
+                      subHeaderLabel(renderer, connectedSSID, !isApMode).c_str());
+    if (!isApMode) renderWifiIndicator(metrics.topPadding + metrics.headerHeight);
   }
 
   // Version-4 QR codes have 6 px modules here. Leave four modules clear on
   // either side, including between the code and the larger address text.
   constexpr int qrQuiet = 24;
-  const int left = std::max<int>(metrics.contentSidePadding, qrQuiet);
+  // Touch (C1): each code and its words in a round frame; the code keeps its quiet zone inside the frame.
+  const int left = framed ? tenorchrome::FOOT_BACK_X + qrQuiet : std::max<int>(metrics.contentSidePadding, qrQuiet);
   const int bodyWidth = pageWidth - 2 * left;
-  int startY = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + qrQuiet;
+  const int contentTop = framed ? tenorchrome::contentTop() + tenorchrome::INFO_TOP_GAP : metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight;
+  int startY = contentTop + qrQuiet;
   const int height10 = renderer.getLineHeight(UI_10_FONT_ID);
   const std::string hostnameUrl = std::string("http://") + apHostname() + ".local/";
   const std::string ipUrl = "http://" + connectedIP + "/";
@@ -595,16 +738,29 @@ void CrossPointWebServerActivity::renderServerRunning() const {
     const std::string wifiConfig = std::string("WIFI:T:nopass;S:") + connectedSSID + ";;";
     const Rect qrBoundsWifi(left, startY, QR_CODE_WIDTH, QR_CODE_HEIGHT);
     QrUtils::drawQrCode(renderer, qrBoundsWifi, wifiConfig);
-    renderer.drawText(UI_10_FONT_ID, textX, startY, tr(STR_CONNECT_WIFI_HINT), true, EpdFontFamily::BOLD);
-    const int nameBottom =
-        drawNetworkText(renderer, UI_12_FONT_ID, connectedSSID.c_str(), textX, startY + height10 + 8, textWidth);
-    startY = std::max(startY + QR_CODE_HEIGHT, nameBottom) + 2 * qrQuiet;
+    const int nameTop = drawNetworkHeading(renderer, tr(STR_CONNECT_WIFI_HINT), textX, startY, textWidth) + 8;
+    const int nameBottom = drawNetworkText(renderer, UI_12_FONT_ID, connectedSSID.c_str(), textX, nameTop, textWidth,
+                                           false, startY + QR_CODE_HEIGHT, left, startY + QR_CODE_HEIGHT + 8, bodyWidth);
+    const int firstBottom = std::max(startY + QR_CODE_HEIGHT, nameBottom);
+    if (framed) tenorchrome::drawPanel(renderer, startY - qrQuiet, firstBottom - startY + 2 * qrQuiet);
+    startY = firstBottom + (framed ? 5 * qrQuiet / 2 : 2 * qrQuiet);
 
     const Rect qrBoundsUrl(left, startY, QR_CODE_WIDTH, QR_CODE_HEIGHT);
     QrUtils::drawQrCode(renderer, qrBoundsUrl, hostnameUrl);
-    renderer.drawText(UI_10_FONT_ID, textX, startY, tr(STR_OPEN_URL_HINT), true, EpdFontFamily::BOLD);
-    drawNetworkText(renderer, UI_12_FONT_ID, apDisplayIp.c_str(), textX, startY + height10 + 8, textWidth);
+    const int ipTop = drawNetworkHeading(renderer, tr(STR_OPEN_URL_HINT), textX, startY, textWidth) + 8;
+    const int ipBottom = drawNetworkText(renderer, UI_12_FONT_ID, apDisplayIp.c_str(), textX, ipTop, textWidth, false,
+                                         startY + QR_CODE_HEIGHT, left, startY + QR_CODE_HEIGHT + 8, bodyWidth);
+    if (framed)
+      tenorchrome::drawPanel(renderer, startY - qrQuiet, std::max(startY + QR_CODE_HEIGHT, ipBottom) - startY + 2 * qrQuiet);
   } else {
+    const int frameTop = framed ? contentTop : startY - qrQuiet / 2;
+    if (framed) {
+      // The network joined, as the first line of the frame.
+      startY = contentTop + qrQuiet / 2;
+      const std::string name = renderer.truncatedText(UI_10_FONT_ID, connectedSSID.c_str(), bodyWidth, EpdFontFamily::REGULAR);
+      renderer.drawCenteredText(UI_10_FONT_ID, startY, name.c_str());
+      startY += height10 + 8;
+    }
     renderer.drawCenteredText(UI_10_FONT_ID, startY, tr(STR_OPEN_URL_HINT), true, EpdFontFamily::BOLD);
     startY += height10;
     renderer.drawCenteredText(UI_10_FONT_ID, startY, tr(STR_SCAN_QR_HINT), true, EpdFontFamily::BOLD);
@@ -614,11 +770,78 @@ void CrossPointWebServerActivity::renderServerRunning() const {
     QrUtils::drawQrCode(renderer, qrBounds, ipUrl);
     startY += QR_CODE_HEIGHT + qrQuiet;
     startY = drawNetworkText(renderer, UI_12_FONT_ID, ipUrl.c_str(), left, startY, bodyWidth, true);
-    drawNetworkText(renderer, UI_12_FONT_ID, hostnameUrl.c_str(), left, startY + 12, bodyWidth, true);
+    const int textBottom = drawNetworkText(renderer, UI_12_FONT_ID, hostnameUrl.c_str(), left, startY + 12, bodyWidth, true);
+    if (framed) tenorchrome::drawPanel(renderer, frameTop, textBottom + qrQuiet / 2 - frameTop);
   }
 
-  const auto labels = mappedInput.mapLabels(tr(STR_EXIT), "", "", "");
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+}
+
+// The same two pages by hand: the codes stay exact so a phone reads them, and every address and network name
+// stays in the UI font, because a jumping letter in an address is a typo.
+void CrossPointWebServerActivity::renderUgly() const {
+  [[maybe_unused]] const uint32_t started = millis();
+  const char* title = isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER);
+  ugly::Hints hints;
+  if (state == WebServerActivityState::AP_STARTING) {
+    ugly::notePage(renderer, mappedInput, title, tr(STR_UGLY_HOTSPOT_STARTING), nullptr, -1, hints);
+    return;
+  }
+  using ugly::Size;
+  constexpr int X = ugly::NOTE_X;
+  const int w = renderer.getScreenWidth(), h = renderer.getScreenHeight();
+  const int room = w - X - 30;
+  ugly::notePaper(renderer, title);
+  const std::string hostnameUrl = std::string("http://") + apHostname() + ".local/";
+  if (isApMode) {
+    // Step 1 beside the code of the network, step 2 beside the code of the address. Four modules (24 px) stay
+    // clear around each code, the margin line included.
+    constexpr int QR_X = 52;
+    const int textX = QR_X + QR_CODE_WIDTH + 24;
+    const int textWidth = w - 20 - textX;
+    int top = 116;
+    QrUtils::drawQrCode(renderer, Rect(QR_X, top, QR_CODE_WIDTH, QR_CODE_HEIGHT),
+                        std::string("WIFI:T:nopass;S:") + connectedSSID + ";;");
+    int lines = ugly::paragraph(renderer, Size::S30, textX, top + 30, textWidth, 38, tr(STR_UGLY_HOTSPOT_STEP1));
+    const int nameBottom =
+        drawNetworkText(renderer, UI_12_FONT_ID, connectedSSID.c_str(), textX, top + 30 + lines * 38 - 16, textWidth);
+    top = std::max(top + QR_CODE_HEIGHT, nameBottom) + 40;
+    QrUtils::drawQrCode(renderer, Rect(QR_X, top, QR_CODE_WIDTH, QR_CODE_HEIGHT), hostnameUrl);
+    lines = ugly::paragraph(renderer, Size::S30, textX, top + 30, textWidth, 38, tr(STR_UGLY_HOTSPOT_STEP2));
+    drawNetworkText(renderer, UI_12_FONT_ID, ("http://" + connectedIP).c_str(), textX, top + 30 + lines * 38 - 16,
+                    textWidth);
+  } else {
+    // The network and its signal in pen strokes on the line under the name.
+    constexpr int BARS = 4;
+    const int barsX = w - 30 - BARS * 8;
+    drawNetworkText(renderer, UI_10_FONT_ID, connectedSSID.c_str(), X, 100, barsX - 12 - X);
+    if (WiFi.status() == WL_CONNECTED && consecutiveDisconnects == 0) {
+      for (int i = 0; i < BARS; ++i) {
+        const int x = barsX + i * 8, bottom = 122, height = 6 + i * 4;
+        ugly::line(renderer, x, bottom, x + 1, bottom - height, 300 + i, i < lastWifiBars ? 3 : 1);
+      }
+    } else {
+      ugly::line(renderer, barsX, 106, barsX + 18, 122, 310, 2);
+      ugly::line(renderer, barsX, 122, barsX + 18, 106, 311, 2);
+    }
+    const int lines = ugly::paragraph(renderer, Size::S30, X, 176, room, 40, tr(STR_UGLY_SERVER_HINT));
+    int y = 176 + (lines - 1) * 40 + 24;
+    const std::string ipUrl = "http://" + connectedIP + "/";
+    QrUtils::drawQrCode(renderer, Rect((w - QR_CODE_WIDTH) / 2, y, QR_CODE_WIDTH, QR_CODE_HEIGHT), ipUrl);
+    y = drawNetworkText(renderer, UI_12_FONT_ID, ipUrl.c_str(), X, y + QR_CODE_HEIGHT + 20, room, true);
+    drawNetworkText(renderer, UI_12_FONT_ID, hostnameUrl.c_str(), X, y + 12, room, true);
+  }
+  // Leaving is the only key here, with a word about the radio left on.
+  const int exitLines = ugly::paragraph(renderer, Size::S22, X, 0, room, 28, tr(STR_UGLY_SERVER_EXIT), false);
+  ugly::paragraph(renderer, Size::S22, X, h - 60 - (exitLines - 1) * 28, room, 28, tr(STR_UGLY_SERVER_EXIT));
+  hints.back = true;
+  ugly::statusBar(renderer, mappedInput, hints);
+  renderer.displayBuffer();
+#ifdef UGLY_FRAME_LOG
+  LOG_INF("UGLY", "Server frame ap=%d total=%lums heap=%u", isApMode ? 1 : 0,
+          static_cast<unsigned long>(millis() - started), ESP.getFreeHeap());
+#endif
 }
 
 void CrossPointWebServerActivity::renderWifiIndicator(int subHeaderTop) const {

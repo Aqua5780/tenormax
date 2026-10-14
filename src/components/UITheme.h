@@ -7,6 +7,7 @@
 
 #include "CrossPointSettings.h"
 #include "components/themes/BaseTheme.h"
+#include "components/themes/TenorTheme.h"
 
 class UITheme {
   // Static instance
@@ -21,7 +22,8 @@ class UITheme {
   enum class StatusBarScope { Global, Reader };
 
   const ThemeMetrics& getMetrics() const;
-  const BaseTheme& getTheme() const { return *currentTheme; }
+  // Falls back to a built-in Classic theme while no theme could be allocated.
+  const BaseTheme& getTheme() const { return currentTheme ? *currentTheme : fallbackTheme; }
   // Vung an toan = man hinh tru dai day that: dai nhan nut VA lan trang thai cua
   // dung pham vi dang ve (menu ngoai hay trong trinh doc), lay gia tri lon hon.
   Rect getScreenSafeArea(const GfxRenderer& renderer, bool hasFrontButtonHints = false,
@@ -34,8 +36,9 @@ class UITheme {
                                       EpdFontFamily::Style style = EpdFontFamily::REGULAR,
                                       TextVerticalAlignment verticalAlignment = TextVerticalAlignment::CENTER);
   void reload();
-  void setTheme(CrossPointSettings::UI_THEME type);
+  void setTheme();
   static std::string getCoverThumbPath(std::string coverBmpPath, int coverHeight);
+  static std::string getCoverThumbPath(std::string coverBmpPath, int coverWidth, int coverHeight);
   static UIIcon getFileIcon(const std::string& filename);
   // Thanh trang thai co hai pham vi doc lap: ngoai trinh doc (menu) va trong
   // trinh doc. Cung mot ham tra chieu cao that cho tung pham vi.
@@ -45,7 +48,8 @@ class UITheme {
   static int getProgressBarHeight();
 
  private:
-  const ThemeMetrics* currentMetrics;
+  BaseTheme fallbackTheme;
+  const ThemeMetrics* currentMetrics = &TenorMetrics::values;
   std::unique_ptr<BaseTheme> currentTheme;
   mutable ThemeMetrics adjustedMetrics;
   mutable bool metricsValid = false;

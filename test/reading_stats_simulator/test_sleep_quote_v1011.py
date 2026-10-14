@@ -31,9 +31,18 @@ import unittest
 import zipfile
 
 from PIL import Image, ImageDraw
+
+from pill_row import pill_band
 from cai_dat_truoc_tenor import truoc_tenor
 
 REPO = Path(__file__).resolve().parents[2]
+
+# The suite adapter sets this from its reviewed profile and frozen binary hash.
+# Standalone execution uses the UC8279 program path below.
+DISPLAY_CONTROLLER = os.environ.get('TEST_DISPLAY_CONTROLLER', 'UC8279')
+if DISPLAY_CONTROLLER not in ('UC8279', 'UC8253'):
+    raise ValueError('TEST_DISPLAY_CONTROLLER must be UC8279 or UC8253')
+SLEEP_FULL_MODES = ['0', '0', '0'] if DISPLAY_CONTROLLER == 'UC8279' else ['0']
 PROGRAM = Path(os.environ.get('TEST_PROGRAM', REPO / '.pio/build/simulator_x3_uc8279/program'))
 # Four records shaped like a real reader's store: one book with a very long title, one day,
 # no minute, anchored, and a 190-character quote among them.
@@ -129,10 +138,10 @@ class SleepQuoteTest(unittest.TestCase):
             write_epub(sd / book.lstrip('/'), title)
             store = sd / '.crosspoint'
             store.mkdir(parents=True)
-            (store / 'settings.json').write_text(json.dumps(truoc_tenor({'language': 'VI', 'sleepScreen': 3})))
+            (store / 'settings.json').write_text(json.dumps(truoc_tenor({'language': 'VI', 'sleepScreen': 3, 'sleepBwFold': 1})))
             (store / 'state.json').write_text(json.dumps({'showBootScreen': False, 'openEpubPath': book}))
             log = cls.run_sim(sd, f'{SLEEP_AT}:SLEEP;9000:QUIT')
-            (store / 'settings.json').write_text(json.dumps(truoc_tenor({'language': 'VI', 'sleepScreen': 3, 'sleepBwRefresh': 0})))
+            (store / 'settings.json').write_text(json.dumps(truoc_tenor({'language': 'VI', 'sleepScreen': 3, 'sleepBwFold': 0})))
             log += cls.run_sim(sd, f'{SLEEP_AT}:SLEEP;9000:QUIT')
             made = list(store.glob('epub_*/cover_*.bmp'))
             assert len(made) == 2, 'Cover sleeps made no black and white and 4-level covers\n' + log
@@ -184,7 +193,7 @@ class SleepQuoteTest(unittest.TestCase):
         for book in covers:
             for cache in self.caches[book]:
                 shutil.copytree(cache, store / cache.name)
-        (store / 'settings.json').write_text(json.dumps(truoc_tenor(settings or {'language': 'VI', 'sleepScreen': 10})))
+        (store / 'settings.json').write_text(json.dumps(truoc_tenor({'sleepBwFold': 1, **(settings or {'language': 'VI', 'sleepScreen': 10})})))
         (store / 'state.json').write_text(json.dumps({'showBootScreen': False}))
         return sd
 
@@ -246,24 +255,24 @@ class SleepQuoteTest(unittest.TestCase):
         self.assert_quote_frame(image)
         self.assertGreater(self.dithered(image, COVER_BOX), 30, 'cover tile has no cover')
         sleep = self.sleep_part(log)
-        # Black, white, then the sleep frame: the visible refresh the default switch promises.
-        self.assertEqual(re.findall(r'displayBuffer, mode=(\d)', sleep), ['0', '0', '0'], sleep)
+        # UC8279 clears black/white before the frame; UC8253 FULL cleans the panel in 1 paint.
+        self.assertEqual(re.findall(r'displayBuffer, mode=(\d)', sleep), SLEEP_FULL_MODES, sleep)
         self.assertRegex(sleep, r'Sleep quote tile ms=\d+ from \d+x\d+ ok=1')
         self.assertNotIn('[BRAND] sleep', sleep)
 
     def test_cover_corners_are_rounded_in_both_sleep_paths(self):
         # The cover tile is rounded like every cover (TenorRadius.h cover(96) = 6 px, a continuous
         # corner reaching about 1.6 r along each edge), on X3's dithered black-and-white path
-        # (sleepBwRefresh on, the default) and on the gray path (off). The fixture's cover is dark
+        # (sleepBwFold on; the fixtures turn it on, it is off by default since v1.0.52) and on the gray path (off). The fixture's cover is dark
         # at the top and mid gray at the bottom, so a square tile has ink in every corner.
         record = {'schema': 1, 'path': SECOND_BOOK, 'title': SECOND_TITLE, 'text': SHORT_TEXT,
                   'spine': 2, 'page': 4, 'day': 20260923, 'gio': 600}
         name = f'{quote_id(record, 0):016x}.json'
         x0, y0, x1, y1 = COVER_BOX[0], COVER_BOX[1], COVER_BOX[2] - 1, COVER_BOX[3] - 1
         for refresh in (1, 0):
-            with self.subTest(sleepBwRefresh=refresh):
+            with self.subTest(sleepBwFold=refresh):
                 sd = self.make_sd([(name, json.dumps(record, ensure_ascii=False).encode())], covers=[SECOND_BOOK],
-                                  settings={'language': 'VI', 'sleepScreen': 10, 'sleepBwRefresh': refresh})
+                                  settings={'language': 'VI', 'sleepScreen': 10, 'sleepBwFold': refresh})
                 log, image = self.sleep_once(sd, f'S2-bia-bo-goc-{refresh}')
                 self.assertEqual(self.fit(log)[3], 1, log)
                 px = image.load()
@@ -318,8 +327,8 @@ class SleepQuoteTest(unittest.TestCase):
         # The title starts at the margin, inside where the tile would have been.
         self.assertGreater(self.ink(image, (48, 596, 144, 700)), 50)
         sleep = self.sleep_part(log)
-        # Black, white, then the sleep frame: the visible refresh the default switch promises.
-        self.assertEqual(re.findall(r'displayBuffer, mode=(\d)', sleep), ['0', '0', '0'], sleep)
+        # UC8279 clears black/white before the frame; UC8253 FULL cleans the panel in 1 paint.
+        self.assertEqual(re.findall(r'displayBuffer, mode=(\d)', sleep), SLEEP_FULL_MODES, sleep)
 
     def book_without_cover(self, name, raw, book_on_card=True):
         """The quote's book as a reader leaves it: the book file and its metadata cache, but
@@ -456,13 +465,16 @@ class SleepQuoteTest(unittest.TestCase):
             with self.subTest(language=language):
                 sd = self.make_sd([], settings={'language': language, 'uiTheme': 4, 'sleepScreen': 10})
                 shot = sd / 'popup.bmp'
-                self.run_sim(sd, '1000:UP;1500:RIGHT;2000:CONFIRM;3000:DOWN;4000:CONFIRM;6000:QUIT',
+                self.run_sim(sd, '1000:UP;2000:CONFIRM;3000:DOWN;4000:CONFIRM;6000:QUIT',
                              shots=f'5200:{shot}')
                 image = Image.open(shot).convert('L')
                 if SHOTS:
                     image.save(Path(SHOTS) / f'cai-dat-{language}.png')
-                # The popup's selected row (the new value) is a filled bar with light text.
-                self.assertGreater(self.ink(image.resize((528, 792)), (90, 445, 440, 492)), 8000)
+                # The popup's selected row (the new value) is a white pill ringed in black (v1.0.52). The list
+                # has one more value (the tenor/ugly doodle), so a page of four now ends one place lower.
+                band = pill_band(image.resize((528, 792)), 300, 600)
+                self.assertIsNotNone(band, 'no selected pill in the popup')
+                self.assertTrue(400 <= band[0] and band[1] <= 470, band)
                 self.assertEqual(json.loads((sd / '.crosspoint/settings.json').read_text())['sleepScreen'], 10)
 
     def test_chinese_place_line(self):

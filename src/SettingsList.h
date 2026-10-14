@@ -15,14 +15,19 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "CrossPointSettings.h"
+#include "HomeButtonSettings.h"
 #include "KOReaderCredentialStore.h"
 #include "QuickAction.h"
+#include "activities/home/FileBrowserState.h"
 #include "ReaderFontSizes.h"
+#include "shells/ugly/UglyLevel.h"
 #include "activities/settings/SettingsActivity.h"
+#include "components/UITheme.h"
 #include "platform/SimulatorBoardCompat.h"
 #include "util/DictionaryRegistry.h"
 
@@ -186,14 +191,34 @@ inline SettingInfo buildDictionarySetting(const std::vector<DictionaryEntry>& di
   return s;
 }
 
-// Indexed by CrossPointSettings::LONG_PRESS_MENU_FUNCTION. The tilt toggle is
-// last, so a board without an IMU drops it without shifting a stored index.
-inline std::vector<StrId> buildLongPressMenuValues(const bool hasTilt) {
-  static constexpr StrId VALUES[] = {StrId::STR_KOSYNC,      StrId::STR_DISABLED,      StrId::STR_BOOKMARK_OPTION,
-                                     StrId::STR_DICTIONARY,  StrId::STR_READER_MENU,   StrId::STR_FILE_TRANSFER,
-                                     StrId::STR_TILT_PAGE_TURN};
-  static_assert(std::size(VALUES) == CrossPointSettings::LONG_PRESS_MENU_FUNCTION_COUNT, "one label per function");
-  return {VALUES, VALUES + std::size(VALUES) - (hasTilt ? 0 : 1)};
+// Hold-Select row. The list shows the functions this board offers, in stored-number order; what is saved is
+// the number (CrossPointSettings.cpp saves and loads it by hand, like the dictionary). A board without an IMU
+// leaves the tilt toggle out, so there Save quotation sits at list position 6 and is still stored as 7.
+inline SettingInfo buildLongPressMenuSetting(const bool hasTilt) {
+  static constexpr StrId LABELS[] = {StrId::STR_KOSYNC,     StrId::STR_DISABLED,        StrId::STR_BOOKMARK_OPTION,
+                                     StrId::STR_DICTIONARY, StrId::STR_READER_MENU,     StrId::STR_FILE_TRANSFER,
+                                     StrId::STR_TILT_PAGE_TURN, StrId::STR_QUOTES_SAVE_ACTION,
+                                     StrId::STR_BLE_CONNECT_REMOTE};
+  static_assert(std::size(LABELS) == CrossPointSettings::LONG_PRESS_MENU_FUNCTION_COUNT, "one label per function");
+  std::vector<StrId> offered;
+  for (uint8_t number = 0; number < std::size(LABELS); ++number) {
+#if !FREEINK_CAP_BLE_HID_HOST
+    if (number == CrossPointSettings::LP_MENU_CONNECT_REMOTE) continue;
+#endif
+    if (hasTilt || number != CrossPointSettings::LP_MENU_TILT_PAGE_TURN) offered.push_back(LABELS[number]);
+  }
+  const uint8_t skipped = hasTilt ? 0 : 1;  // list positions after the tilt number sit one lower
+  return SettingInfo::DynamicEnum(
+      StrId::STR_LONG_PRESS_MENU, std::move(offered),
+      [skipped]() -> uint8_t {
+        const uint8_t number = SETTINGS.longPressMenuFunction;
+        return number > CrossPointSettings::LP_MENU_TILT_PAGE_TURN ? number - skipped : number;
+      },
+      [skipped](const uint8_t position) {
+        SETTINGS.longPressMenuFunction =
+            position >= CrossPointSettings::LP_MENU_TILT_PAGE_TURN ? position + skipped : position;
+      },
+      "longPressMenuFunction", StrId::STR_CAT_CONTROLS);
 }
 
 // Tenor shows the two visible corner layouts. Legacy value 0 reads as right,
@@ -235,18 +260,55 @@ inline void releaseBaseSettingsList() {
   std::vector<SettingInfo>().swap(settings_catalog::storage());
 }
 
-inline const std::vector<SettingInfo>& getBaseSettingsList() {
-  auto& baseList = settings_catalog::storage();
-  if (!baseList.empty()) return baseList;
-#if defined(TENOR_UI_ACCEPTANCE) && defined(ESP_PLATFORM)
-  static bool catalogMeasured = false;
-  if (!catalogMeasured) {
-    logSerial.printf("SETTING_CATALOG:fixed:before,info_size=%u,size=0,capacity=0,free=%u,min=%u,largest=%u,loop_stack_free=%u\n",
-                     static_cast<unsigned>(sizeof(SettingInfo)), ESP.getFreeHeap(), ESP.getMinFreeHeap(),
-                     ESP.getMaxAllocHeap(), static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-  }
-#endif
-  baseList = [] {
+// These rows also appear over the saved reader page. Build only the requested
+// descriptor, with static labels, so the lookup works even with an exhausted heap.
+inline std::optional<SettingInfo> getBaseTextSetting(const char* key) {
+  if (!key) return std::nullopt;
+  static constexpr StrId spacing[] = {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT,
+                                      StrId::STR_WIDE, StrId::STR_VERY_WIDE};
+  static constexpr StrId indent[] = {StrId::STR_STATE_OFF, StrId::STR_INK_DEFAULT, StrId::STR_WIDE};
+  static constexpr StrId ink[] = {StrId::STR_READER_INK_0, StrId::STR_READER_INK_1,
+                                  StrId::STR_READER_INK_2, StrId::STR_READER_INK_3,
+                                  StrId::STR_READER_INK_4, StrId::STR_READER_INK_5};
+  SettingInfo row;
+  if (strcmp(key, "letterSpacing") == 0)
+    row = SettingInfo::StaticEnum(StrId::STR_LETTER_SPACING, &CrossPointSettings::letterSpacing, spacing,
+                                  "letterSpacing", StrId::STR_CAT_READER);
+  else if (strcmp(key, "wordSpacing") == 0)
+    row = SettingInfo::StaticEnum(StrId::STR_WORD_SPACING, &CrossPointSettings::wordSpacing, spacing,
+                                  "wordSpacing", StrId::STR_CAT_READER);
+  else if (strcmp(key, "extraParagraphSpacing") == 0)
+    row = SettingInfo::StaticEnum(StrId::STR_EXTRA_SPACING, &CrossPointSettings::extraParagraphSpacing, spacing,
+                                  "extraParagraphSpacing", StrId::STR_CAT_READER);
+  else if (strcmp(key, "screenMargin") == 0)
+    row = SettingInfo::Value(StrId::STR_SCREEN_MARGIN, &CrossPointSettings::screenMargin,
+                             {CrossPointSettings::SCREEN_MARGIN_MIN, CrossPointSettings::SCREEN_MARGIN_MAX,
+                              CrossPointSettings::SCREEN_MARGIN_STEP}, "screenMargin", StrId::STR_CAT_READER);
+  else if (strcmp(key, "paragraphIndent") == 0)
+    row = SettingInfo::StaticEnum(StrId::STR_PARAGRAPH_INDENT, &CrossPointSettings::paragraphIndent, indent,
+                                  "paragraphIndent", StrId::STR_CAT_READER);
+  else if (strcmp(key, "embeddedStyle") == 0)
+    row = SettingInfo::Toggle(StrId::STR_EMBEDDED_STYLE, &CrossPointSettings::embeddedStyle,
+                              "embeddedStyle", StrId::STR_CAT_READER);
+  else if (strcmp(key, "hyphenationEnabled") == 0)
+    row = SettingInfo::Toggle(StrId::STR_HYPHENATION, &CrossPointSettings::hyphenationEnabled,
+                              "hyphenationEnabled", StrId::STR_CAT_READER);
+  else if (strcmp(key, "readerInkWeight") == 0)
+    row = SettingInfo::StaticEnum(StrId::STR_READER_INK_WEIGHT, &CrossPointSettings::readerInkWeight, ink,
+                                  "readerInkWeight", StrId::STR_CAT_READER);
+  else if (strcmp(key, "textAntiAliasing") == 0)
+    row = SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing,
+                              "textAntiAliasing", StrId::STR_CAT_READER);
+  else
+    return std::nullopt;
+  row.inTextSettings = true;
+  return row;
+}
+
+// Every base descriptor, built one at a time and handed to emit (SettingInfo&&). Settings save and load
+// walk it here instead of keeping the whole catalog (~15 KB on the X3) for the life of the program.
+// One body for every caller: a template copied the 100 rows' code into each (28 KB of flash on x3-ble).
+inline void forEachBaseSetting(const std::function<void(SettingInfo&&)>& emit) {
     // Enum settings are persisted as numeric values. Assign these labels by enum
     // value so a reordered menu or enum cannot silently swap their behavior.
     std::vector<StrId> sleepScreenValues(CrossPointSettings::SLEEP_SCREEN_MODE_COUNT);
@@ -261,6 +323,7 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
     sleepScreenValues[CrossPointSettings::TENOR] = StrId::STR_SLEEP_TENOR;
     sleepScreenValues[CrossPointSettings::STATS] = StrId::STR_SLEEP_STATS;
     sleepScreenValues[CrossPointSettings::QUOTE] = StrId::STR_SLEEP_QUOTE;
+    sleepScreenValues[CrossPointSettings::UGLY] = StrId::STR_SLEEP_UGLY;
 
     std::vector<StrId> statusBarClockValues(CrossPointSettings::STATUS_BAR_CLOCK_MODE_COUNT);
     statusBarClockValues[CrossPointSettings::STATUS_BAR_CLOCK_HIDE] = StrId::STR_HIDE;
@@ -268,273 +331,288 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
     statusBarClockValues[CrossPointSettings::STATUS_BAR_CLOCK_LEFT] = StrId::STR_DIR_LEFT;
 
     const bool hasTilt = halTiltSensor.isAvailable();
-    // 70 unconditional descriptors; the IMU branch adds the Motion sensor tab: reader,
-    // tab and row tilt, the two flick strengths, the two hard shake rows, face down, face up
-    // and double tap.
-    // Cold-catalog tests cover each capability branch and the IMU variant.
-    constexpr size_t fixedCount = 70
-#if defined(FREEINK_CAP_FRONTLIGHT) && FREEINK_CAP_FRONTLIGHT
-                                  + 1
-#endif
-#if defined(FREEINK_CAP_WARMLIGHT) && FREEINK_CAP_WARMLIGHT
-                                  + 1
-#endif
-        ;
-    std::vector<SettingInfo> v;
-    v.reserve(fixedCount + (hasTilt ? 10 : 0));
     // --- Display ---
-    v.push_back(SettingInfo::Enum(StrId::STR_UI_THEME, &CrossPointSettings::uiTheme,
-                          {StrId::STR_THEME_CLASSIC, StrId::STR_THEME_LYRA, StrId::STR_THEME_LYRA_EXTENDED,
-                           StrId::STR_THEME_ROUNDEDRAFF, StrId::STR_THEME_TENOR},
-                          "uiTheme", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_UI_TEXT_SIZE, &CrossPointSettings::uiTextSize,
+    emit(SettingInfo::Enum(StrId::STR_UI_TEXT_SIZE, &CrossPointSettings::uiTextSize,
                           {StrId::STR_UI_SIZE_SMALL, StrId::STR_UI_SIZE_MEDIUM, StrId::STR_UI_SIZE_LARGE},
                           "uiTextSize", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_HIDE_GLOBAL_STATUS_BAR, &CrossPointSettings::globalStatusBarMode,
+    emit(SettingInfo::Enum(StrId::STR_HIDE_GLOBAL_STATUS_BAR, &CrossPointSettings::globalStatusBarMode,
                           {StrId::STR_STATUS_BAR_SMALL, StrId::STR_STATE_OFF, StrId::STR_STATUS_BAR_LARGE},
                           "globalStatusBarMode", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Toggle(StrId::STR_SIDE_ARROW_HINTS, &CrossPointSettings::tenorSideArrows, "tenorSideArrows",
+    emit(SettingInfo::Toggle(StrId::STR_BUTTON_HINTS, &CrossPointSettings::tenorButtonHints, "tenorButtonHints",
                             StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_BUTTON_LABELS, &CrossPointSettings::tenorButtonSymbols,
+    emit(SettingInfo::Toggle(StrId::STR_TIPS, &CrossPointSettings::tipsEnabled, "tipsEnabled",
+                            StrId::STR_CAT_DISPLAY));
+    emit(SettingInfo::Toggle(StrId::STR_SIDE_ARROW_HINTS, &CrossPointSettings::tenorSideArrows, "tenorSideArrows",
+                            StrId::STR_CAT_DISPLAY));
+    emit(SettingInfo::Enum(StrId::STR_BUTTON_LABELS, &CrossPointSettings::tenorButtonSymbols,
                           {StrId::STR_LABELS_TEXT, StrId::STR_LABELS_SYMBOLS}, "tenorButtonSymbols",
                           StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_HIDE_BATTERY, &CrossPointSettings::hideBatteryPercentage,
+    emit(SettingInfo::Enum(StrId::STR_HIDE_BATTERY, &CrossPointSettings::hideBatteryPercentage,
                           {StrId::STR_NEVER, StrId::STR_IN_READER, StrId::STR_ALWAYS}, "hideBatteryPercentage",
                           StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_REFRESH_FREQ, &CrossPointSettings::refreshFrequency,
+    emit(SettingInfo::Enum(StrId::STR_REFRESH_FREQ, &CrossPointSettings::refreshFrequency,
                           {StrId::STR_PAGES_1, StrId::STR_PAGES_5, StrId::STR_PAGES_10, StrId::STR_PAGES_15,
                            StrId::STR_PAGES_30, StrId::STR_NEVER},
                           "refreshFrequency", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Toggle(StrId::STR_SUNLIGHT_FADING_FIX, &CrossPointSettings::fadingFix, "fadingFix",
+    emit(SettingInfo::Toggle(StrId::STR_SUNLIGHT_FADING_FIX, &CrossPointSettings::fadingFix, "fadingFix",
                             StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Toggle(StrId::STR_NIGHT_MODE, &CrossPointSettings::screenInverted, "screenInverted",
+    // Just above night mode, so the first rows and the last row of the screen group keep their place. The shell is chosen at run time: 0 tenor/cross (what every earlier release shows), 1 tenor/ugly.
+    emit(SettingInfo::Enum(StrId::STR_UI_SHELL, &CrossPointSettings::uiShell,
+                          {StrId::STR_SHELL_CROSS, StrId::STR_SHELL_UGLY}, "uiShell", StrId::STR_CAT_DISPLAY));
+    // Right under the shell. The screen lists it only while the shell is tenor/ugly (SettingsActivity), the saved file keeps it always.
+    emit(SettingInfo::Enum(StrId::STR_SHELL_LEVEL, &CrossPointSettings::uiUglyLevel,
+                          {StrId::STR_SHELL_LEVEL_PLAIN, StrId::STR_SHELL_LEVEL_AF}, "uiUglyLevel", StrId::STR_CAT_DISPLAY));
+    emit(SettingInfo::Toggle(StrId::STR_NIGHT_MODE, &CrossPointSettings::screenInverted, "screenInverted",
                             StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_SLEEP_SCREEN, &CrossPointSettings::sleepScreen, std::move(sleepScreenValues),
+    emit(SettingInfo::Enum(StrId::STR_SLEEP_SCREEN, &CrossPointSettings::sleepScreen, std::move(sleepScreenValues),
                           "sleepScreen", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_SLEEP_COVER_MODE, &CrossPointSettings::sleepScreenCoverMode,
+    emit(SettingInfo::Enum(StrId::STR_SLEEP_COVER_MODE, &CrossPointSettings::sleepScreenCoverMode,
                           {StrId::STR_FIT, StrId::STR_CROP}, "sleepScreenCoverMode", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_SLEEP_COVER_FILTER, &CrossPointSettings::sleepScreenCoverFilter,
+    emit(SettingInfo::Enum(StrId::STR_SLEEP_COVER_FILTER, &CrossPointSettings::sleepScreenCoverFilter,
                           {StrId::STR_NONE_OPT, StrId::STR_FILTER_CONTRAST, StrId::STR_INVERTED},
                           "sleepScreenCoverFilter", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_QUICK_RESUME_TIMEOUT, &CrossPointSettings::quickResumeSleepScreen,
+    emit(SettingInfo::Enum(StrId::STR_QUICK_RESUME_TIMEOUT, &CrossPointSettings::quickResumeSleepScreen,
                           {StrId::STR_STATE_OFF, StrId::STR_STATE_ON}, "quickResumeSleepScreen",
                           StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Enum(StrId::STR_WAKE_INTO_BOOK, &CrossPointSettings::wakeIntoBook,
+    emit(SettingInfo::Enum(StrId::STR_WAKE_INTO_BOOK, &CrossPointSettings::wakeIntoBook,
                           {StrId::STR_STATE_OFF, StrId::STR_STATE_ON}, "wakeIntoBook", StrId::STR_CAT_DISPLAY));
-    v.push_back(SettingInfo::Toggle(StrId::STR_SLEEP_BW_REFRESH, &CrossPointSettings::sleepBwRefresh, "sleepBwRefresh",
+    emit(SettingInfo::Toggle(StrId::STR_WAKE_NOTICE, &CrossPointSettings::wakeNotice, "wakeNotice",
+                                    StrId::STR_CAT_DISPLAY));
+    emit(SettingInfo::Toggle(StrId::STR_SLEEP_BW_REFRESH, &CrossPointSettings::sleepBwFold, "sleepBwFold",
                                     StrId::STR_CAT_DISPLAY));
 #if FREEINK_CAP_FRONTLIGHT
-    v.push_back(SettingInfo::Toggle(StrId::STR_RESTORE_LIGHT_ON_WAKE, &CrossPointSettings::frontlightRestoreOnWake,
+    emit(SettingInfo::Toggle(StrId::STR_RESTORE_LIGHT_ON_WAKE, &CrossPointSettings::frontlightRestoreOnWake,
                             "frontlightRestoreOnWake", StrId::STR_CAT_DISPLAY));
 #endif
 
     // --- Reader ---
     // Built-in font-family entry. Replaced per-call with a registry-aware
     // version when SD fonts are installed.
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_FONT_FAMILY, &CrossPointSettings::fontFamily,
+    emit(std::move(SettingInfo::Enum(StrId::STR_FONT_FAMILY, &CrossPointSettings::fontFamily,
                           {StrId::STR_NOTO_SERIF, StrId::STR_NOTO_SANS}, "fontFamily", StrId::STR_CAT_READER)
             .withTextSettings()));
     // Placeholder: the selectable sizes depend on the active font family, so
     // this entry is always replaced by buildFontSizeSetting() below. It only
     // fixes the setting's position in the Reader category.
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_FONT_SIZE, nullptr, {}, "fontSize", StrId::STR_CAT_READER).withTextSettings()));
+    emit(std::move(SettingInfo::Enum(StrId::STR_FONT_SIZE, nullptr, {}, "fontSize", StrId::STR_CAT_READER).withTextSettings()));
     // Layout group, in the order the approved plan fixes: the four spacing
     // kinds first, then alignment, margin and paragraph indent. The style
     // group (embedded style, drop cap, hyphenation, ink weight, AA) follows.
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_LINE_SPACING, &CrossPointSettings::lineSpacing,
+    emit(std::move(SettingInfo::Enum(StrId::STR_LINE_SPACING, &CrossPointSettings::lineSpacing,
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+                          {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT, StrId::STR_WIDE,
+                           StrId::STR_VERY_WIDE, StrId::STR_LINE_SPACING_130, StrId::STR_LINE_SPACING_160},
+#else
                           {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT, StrId::STR_WIDE,
                            StrId::STR_VERY_WIDE},
+#endif
                           "lineSpacing", StrId::STR_CAT_READER)
             .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_LETTER_SPACING, &CrossPointSettings::letterSpacing,
-                          {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT, StrId::STR_WIDE,
-                           StrId::STR_VERY_WIDE},
-                          "letterSpacing", StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_WORD_SPACING, &CrossPointSettings::wordSpacing,
-                          {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT, StrId::STR_WIDE,
-                           StrId::STR_VERY_WIDE},
-                          "wordSpacing", StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_EXTRA_SPACING, &CrossPointSettings::extraParagraphSpacing,
-                          {StrId::STR_INK_DEFAULT, StrId::STR_VERY_NARROW, StrId::STR_TIGHT, StrId::STR_WIDE,
-                           StrId::STR_VERY_WIDE},
-                          "extraParagraphSpacing", StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_PARA_ALIGNMENT, &CrossPointSettings::paragraphAlignment,
+    emit(std::move(*getBaseTextSetting("letterSpacing")));
+    emit(std::move(*getBaseTextSetting("wordSpacing")));
+    emit(std::move(*getBaseTextSetting("extraParagraphSpacing")));
+    emit(std::move(SettingInfo::Enum(StrId::STR_PARA_ALIGNMENT, &CrossPointSettings::paragraphAlignment,
                           {StrId::STR_JUSTIFY, StrId::STR_ALIGN_LEFT, StrId::STR_CENTER, StrId::STR_ALIGN_RIGHT,
                            StrId::STR_BOOK_S_STYLE},
                           "paragraphAlignment", StrId::STR_CAT_READER)
             .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Value(StrId::STR_SCREEN_MARGIN, &CrossPointSettings::screenMargin,
-                           {CrossPointSettings::SCREEN_MARGIN_MIN, CrossPointSettings::SCREEN_MARGIN_MAX,
-                            CrossPointSettings::SCREEN_MARGIN_STEP},
-                           "screenMargin", StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_PARAGRAPH_INDENT, &CrossPointSettings::paragraphIndent,
-                          {StrId::STR_STATE_OFF, StrId::STR_INK_DEFAULT, StrId::STR_WIDE}, "paragraphIndent",
-                          StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Toggle(StrId::STR_EMBEDDED_STYLE, &CrossPointSettings::embeddedStyle, "embeddedStyle",
-                            StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_FOCUS_READING, &CrossPointSettings::dropCapMode,
+    emit(std::move(*getBaseTextSetting("screenMargin")));
+    emit(std::move(*getBaseTextSetting("paragraphIndent")));
+    emit(std::move(*getBaseTextSetting("embeddedStyle")));
+    emit(std::move(SettingInfo::Enum(StrId::STR_FOCUS_READING, &CrossPointSettings::dropCapMode,
                           {StrId::STR_STATE_OFF, StrId::STR_INK_DEFAULT, StrId::STR_SPACING_LARGE}, "dropCapMode",
                           StrId::STR_CAT_READER)
             .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Toggle(StrId::STR_HYPHENATION, &CrossPointSettings::hyphenationEnabled, "hyphenationEnabled",
-                            StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(SettingInfo::Enum(
+    emit(std::move(*getBaseTextSetting("hyphenationEnabled")));
+    emit(SettingInfo::Enum(
             StrId::STR_ORIENTATION, &CrossPointSettings::orientation,
             {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW, StrId::STR_ORIENTATION_INVERTED, StrId::STR_LANDSCAPE_CCW},
             "orientation", StrId::STR_CAT_READER));
 
-    v.push_back(std::move(SettingInfo::Enum(StrId::STR_READER_INK_WEIGHT, &CrossPointSettings::readerInkWeight,
-                          {StrId::STR_READER_INK_0, StrId::STR_READER_INK_1, StrId::STR_READER_INK_2,
-                           StrId::STR_READER_INK_3}, "readerInkWeight",
-                          StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(std::move(SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing, "textAntiAliasing",
-                            StrId::STR_CAT_READER)
-            .withTextSettings()));
-    v.push_back(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
+    emit(std::move(*getBaseTextSetting("readerInkWeight")));
+    emit(std::move(*getBaseTextSetting("textAntiAliasing")));
+    emit(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
                           {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
                           "imageRendering", StrId::STR_CAT_READER));
     // Thanh trang thai trong trinh doc: sau muc, doc lap voi thanh ngoai.
-    v.push_back(SettingInfo::Enum(StrId::STR_HIDE_READER_STATUS_BAR, &CrossPointSettings::readerStatusBarMode,
+    emit(SettingInfo::Enum(StrId::STR_HIDE_READER_STATUS_BAR, &CrossPointSettings::readerStatusBarMode,
                           {StrId::STR_STATE_OFF, StrId::STR_STATUS_BAR_CLOCK_BATTERY, StrId::STR_STATUS_BAR_DEFAULT,
                            StrId::STR_STATUS_BAR_CHAPTER_PROGRESS, StrId::STR_STATUS_BAR_CHAPTER_CLOCK,
-                           StrId::STR_STATUS_BAR_CHAPTER_BATTERY},
+                           StrId::STR_STATUS_BAR_CHAPTER_BATTERY, StrId::STR_STATUS_BAR_CLOCK_CHAPTER_PROGRESS,
+                           StrId::STR_STATUS_BAR_BOOK_DETAILS},
                           "readerStatusBarMode", StrId::STR_CAT_READER));
-    v.push_back(SettingInfo::Enum(StrId::STR_SIDE_BTN_LAYOUT, &CrossPointSettings::sideButtonLayout,
-                          {StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_DISABLED, StrId::STR_NEXT_NEXT},
+    emit(SettingInfo::Enum(StrId::STR_SIDE_BTN_LAYOUT, &CrossPointSettings::sideButtonLayout,
+                          {StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_DISABLED, StrId::STR_NEXT_NEXT,
+                           StrId::STR_PREV_PREV},
                           "sideButtonLayout", StrId::STR_CAT_READER));
-    v.push_back(SettingInfo::Enum(StrId::STR_READER_MENU_STYLE, &CrossPointSettings::readerMenuStyle,
+    emit(SettingInfo::Enum(StrId::STR_READER_MENU_STYLE, &CrossPointSettings::readerMenuStyle,
                           {StrId::STR_MENU_STYLE_LIST, StrId::STR_MENU_STYLE_TOOLBAR}, "readerMenuStyle",
                           StrId::STR_CAT_READER));
     // --- Controls ---
-    v.push_back(SettingInfo::Enum(
-            StrId::STR_TOUCH_READER_CONTROLS, &CrossPointSettings::touchReaderControls,
-            {StrId::STR_STATE_OFF, StrId::STR_STATE_TAP, StrId::STR_STATE_SWIPE, StrId::STR_STATE_INVERTED_TAP},
-            "touchReaderControls", StrId::STR_CAT_CONTROLS));
+    // touchReaderControls is a master toggle (#3586); direction gestures are
+    // separate pageTurnGesture/previousPageGesture settings. All three are
+    // touch-only (settingHiddenOnThisBoard hides them without a touch controller).
+    emit(SettingInfo::Toggle(StrId::STR_TOUCH_READER_CONTROLS, &CrossPointSettings::touchReaderControls,
+                            "touchReaderControls", StrId::STR_CAT_CONTROLS));
+    emit(SettingInfo::Enum(StrId::STR_NEXT_PAGE_GESTURE, &CrossPointSettings::pageTurnGesture,
+                          {StrId::STR_TAP_AND_SWIPE, StrId::STR_TAP_ONLY, StrId::STR_SWIPE_ONLY,
+                           StrId::STR_INVERTED_TAP, StrId::STR_DISABLED},
+                          "pageTurnGesture", StrId::STR_CAT_CONTROLS));
+    emit(SettingInfo::Enum(StrId::STR_PREV_PAGE_GESTURE, &CrossPointSettings::previousPageGesture,
+                          {StrId::STR_TAP_AND_SWIPE, StrId::STR_TAP_ONLY, StrId::STR_SWIPE_ONLY,
+                           StrId::STR_INVERTED_TAP, StrId::STR_DISABLED},
+                          "previousPageGesture", StrId::STR_CAT_CONTROLS));
+    emit(SettingInfo::Enum(StrId::STR_BACK_TAP_ZONE, &CrossPointSettings::backTapZone,
+                          {StrId::STR_PERCENT_15, StrId::STR_PERCENT_20, StrId::STR_PERCENT_25, StrId::STR_PERCENT_33},
+                          "backTapZone", StrId::STR_CAT_CONTROLS));
+    emit(SettingInfo::Toggle(StrId::STR_READER_TAP_TIP, &CrossPointSettings::readerTapTip, "readerTapTip",
+                                    StrId::STR_CAT_CONTROLS));
     // Persisted under the legacy "tapForReaderMenu" key: old saves map
     // 0 = Off, 1 = Tap.
-    v.push_back(SettingInfo::Enum(StrId::STR_SHOW_READER_MENU, &CrossPointSettings::showReaderMenu,
+    emit(SettingInfo::Enum(StrId::STR_SHOW_READER_MENU, &CrossPointSettings::showReaderMenu,
                           {StrId::STR_STATE_OFF, StrId::STR_STATE_TAP, StrId::STR_STATE_SWIPE_UP}, "tapForReaderMenu",
                           StrId::STR_CAT_CONTROLS));
-    v.push_back(SettingInfo::Toggle(StrId::STR_FRONT_BTN_FOLLOW_ORIENTATION, &CrossPointSettings::frontButtonFollowOrientation,
+    emit(SettingInfo::Toggle(StrId::STR_FRONT_BTN_FOLLOW_ORIENTATION, &CrossPointSettings::frontButtonFollowOrientation,
                             "frontButtonFollowOrientation", StrId::STR_CAT_CONTROLS));
-    v.push_back(SettingInfo::Enum(StrId::STR_KEYBOARD_GEOMETRY, &CrossPointSettings::keyboardAligned,
+    emit(SettingInfo::Enum(StrId::STR_KEYBOARD_GEOMETRY, &CrossPointSettings::keyboardAligned,
                           {StrId::STR_KEYBOARD_STAGGERED, StrId::STR_KEYBOARD_ALIGNED}, "keyboardAligned",
                           StrId::STR_CAT_KEYBOARD));
-    v.push_back(SettingInfo::Toggle(StrId::STR_KEYBOARD_AXIS_SWAP, &CrossPointSettings::keyboardAxisSwapped,
+    emit(SettingInfo::Toggle(StrId::STR_KEYBOARD_AXIS_SWAP, &CrossPointSettings::keyboardAxisSwapped,
                             "keyboardAxisSwapped", StrId::STR_CAT_KEYBOARD));
-    v.push_back(SettingInfo::String(StrId::STR_DEVICE_NAME, &SETTINGS.deviceName[0], sizeof(SETTINGS.deviceName), "deviceName"));
-    v.push_back(SettingInfo::Enum(StrId::STR_LONG_PRESS_BEHAVIOR, &CrossPointSettings::longPressButtonBehavior,
+    emit(SettingInfo::String(StrId::STR_DEVICE_NAME, &SETTINGS.deviceName[0], sizeof(SETTINGS.deviceName), "deviceName"));
+    emit(SettingInfo::Enum(StrId::STR_LONG_PRESS_BEHAVIOR, &CrossPointSettings::longPressButtonBehavior,
                           {StrId::STR_LONG_PRESS_BEHAVIOR_OFF, StrId::STR_LONG_PRESS_BEHAVIOR_SKIP,
                            StrId::STR_LONG_PRESS_BEHAVIOR_ORIENTATION},
                           "longPressButtonBehavior", StrId::STR_CAT_CONTROLS));
-    v.push_back(SettingInfo::Enum(StrId::STR_LONG_PRESS_MENU, &CrossPointSettings::longPressMenuFunction,
-                          buildLongPressMenuValues(hasTilt), "longPressMenuFunction", StrId::STR_CAT_CONTROLS));
+    emit(buildLongPressMenuSetting(hasTilt));
+    // X4 Pro only; hidden elsewhere by settingHiddenOnThisBoard (#3089).
+    emit(SettingInfo::Toggle(StrId::STR_DBL_CLICK_PWR_LIGHT, &CrossPointSettings::doubleClickPwrLight,
+                            "doubleClickPwrLight", StrId::STR_CAT_CONTROLS));
     // Short power press and hard shake share one list of actions (QuickAction.h).
-    v.push_back(SettingInfo::Enum(StrId::STR_SHORT_PWR_BTN, &CrossPointSettings::shortPwrBtn,
+    emit(SettingInfo::Enum(StrId::STR_SHORT_PWR_BTN, &CrossPointSettings::shortPwrBtn,
                           quickaction::powerLabels(), "shortPwrBtn", StrId::STR_CAT_CONTROLS));
-    v.push_back(SettingInfo::Toggle(StrId::STR_PWR_BTN_FOOTNOTE_BACK, &CrossPointSettings::pwrBtnFootnoteBack,
+    emit(SettingInfo::Toggle(StrId::STR_PWR_BTN_FOOTNOTE_BACK, &CrossPointSettings::pwrBtnFootnoteBack,
                             "pwrBtnFootnoteBack", StrId::STR_CAT_CONTROLS));
-    // --- Motion sensor (only with the QMI8658 IMU, X3) ---
+    emit(SettingInfo::Toggle(StrId::STR_BACK_SHORT_TO_FILE_BROWSER, &CrossPointSettings::backShortToFileBrowser,
+                            "backShortToFileBrowser", StrId::STR_CAT_CONTROLS));
+    // Home button shortcuts (#3516): tap/double-tap/long-press, home-key boards only.
+    for (unsigned i = 0; i < 3; ++i) {
+      emit(SettingInfo::StaticEnum(home_button::GESTURE_LABELS[i], home_button::FIELDS[i],
+                                          home_button::ACTION_LABELS, home_button::KEYS[i], StrId::STR_CAT_CONTROLS));
+    }
+    // --- Gestures (only with the QMI8658 IMU, X3) ---
     // Keys and values are the ones these rows had in Reader and Controls, so a saved
     // file reads the same here.
     if (hasTilt) {
-      v.push_back(SettingInfo::Enum(StrId::STR_TILT_PAGE_TURN, &CrossPointSettings::tiltPageTurn,
+      emit(SettingInfo::Enum(StrId::STR_TILT_PAGE_TURN, &CrossPointSettings::tiltPageTurn,
                             // STR_INVERTED means inverted colours elsewhere; tilt needs a
                             // reversed direction, so it gets a word of its own.
                             {StrId::STR_STATE_OFF, StrId::STR_NORMAL, StrId::STR_TILT_INVERTED}, "tiltPageTurn",
                             StrId::STR_CAT_MOTION));
-      v.push_back(SettingInfo::Enum(StrId::STR_TILT_TAB_NAVIGATION, &CrossPointSettings::tiltTabNavigation,
+      emit(SettingInfo::Enum(StrId::STR_TILT_TAB_NAVIGATION, &CrossPointSettings::tiltTabNavigation,
                             {StrId::STR_STATE_OFF, StrId::STR_NORMAL, StrId::STR_TILT_INVERTED},
                             "tiltTabNavigation", StrId::STR_CAT_MOTION));
       // Row tilt sits next to tab tilt: same band of gestures, other axis.
-      v.push_back(SettingInfo::Enum(StrId::STR_TILT_MENU_NAVIGATION, &CrossPointSettings::tiltMenuNavigation,
+      emit(SettingInfo::Enum(StrId::STR_TILT_MENU_NAVIGATION, &CrossPointSettings::tiltMenuNavigation,
                             {StrId::STR_STATE_OFF, StrId::STR_NORMAL, StrId::STR_TILT_INVERTED},
                             "tiltMenuNavigation", StrId::STR_CAT_MOTION));
       // Flick strength per axis: side flicks turn pages and tabs, up/down
       // flicks move menu rows, and wrists differ on each.
-      v.push_back(SettingInfo::Enum(StrId::STR_TILT_STRENGTH_H, &CrossPointSettings::tiltStrengthH,
+      emit(SettingInfo::Enum(StrId::STR_TILT_STRENGTH_H, &CrossPointSettings::tiltStrengthH,
                             {StrId::STR_TILT_LIGHT, StrId::STR_UI_SIZE_MEDIUM, StrId::STR_TILT_STRONG},
                             "tiltStrengthH", StrId::STR_CAT_MOTION));
-      v.push_back(SettingInfo::Enum(StrId::STR_TILT_STRENGTH_V, &CrossPointSettings::tiltStrengthV,
+      emit(SettingInfo::Enum(StrId::STR_TILT_STRENGTH_V, &CrossPointSettings::tiltStrengthV,
                             {StrId::STR_TILT_LIGHT, StrId::STR_UI_SIZE_MEDIUM, StrId::STR_TILT_STRONG},
                             "tiltStrengthV", StrId::STR_CAT_MOTION));
       // A hard shake, face down, face up and a double tap each run one of the power
       // button's actions on any screen, chosen from the shake's list (QuickAction.h).
-      v.push_back(SettingInfo::Enum(StrId::STR_SHAKE_ACTION, &CrossPointSettings::shakeAction,
+      emit(SettingInfo::Enum(StrId::STR_SHAKE_ACTION, &CrossPointSettings::shakeAction,
                             quickaction::shakeLabels(), "shakeAction", StrId::STR_CAT_MOTION));
-      v.push_back(SettingInfo::Enum(StrId::STR_SHAKE_STRENGTH, &CrossPointSettings::shakeStrength,
+      emit(SettingInfo::Enum(StrId::STR_SHAKE_STRENGTH, &CrossPointSettings::shakeStrength,
                             {StrId::STR_TILT_LIGHT, StrId::STR_UI_SIZE_MEDIUM, StrId::STR_TILT_STRONG},
                             "shakeStrength", StrId::STR_CAT_MOTION));
-      v.push_back(SettingInfo::Enum(StrId::STR_FACE_DOWN_ACTION, &CrossPointSettings::faceDownAction,
+      emit(SettingInfo::Enum(StrId::STR_FACE_DOWN_ACTION, &CrossPointSettings::faceDownAction,
                             quickaction::shakeLabels(), "faceDownAction", StrId::STR_CAT_MOTION));
-      v.push_back(SettingInfo::Enum(StrId::STR_FACE_UP_ACTION, &CrossPointSettings::faceUpAction,
+      emit(SettingInfo::Enum(StrId::STR_FACE_UP_ACTION, &CrossPointSettings::faceUpAction,
                             quickaction::shakeLabels(), "faceUpAction", StrId::STR_CAT_MOTION));
-      v.push_back(SettingInfo::Enum(StrId::STR_DOUBLE_TAP_ACTION, &CrossPointSettings::doubleTapAction,
+      emit(SettingInfo::Enum(StrId::STR_DOUBLE_TAP_ACTION, &CrossPointSettings::doubleTapAction,
                             quickaction::shakeLabels(), "doubleTapAction", StrId::STR_CAT_MOTION));
+      emit(SettingInfo::Enum(StrId::STR_SCREEN_TAP_ACTION, &CrossPointSettings::screenTapAction,
+                            quickaction::shakeLabels(), "screenTapAction", StrId::STR_CAT_MOTION));
+      emit(SettingInfo::Enum(StrId::STR_EDGE_TAP_ACTION, &CrossPointSettings::edgeTapAction,
+                            quickaction::shakeLabels(), "edgeTapAction", StrId::STR_CAT_MOTION));
     }
 
     // --- System ---
-    v.push_back(SettingInfo::Value(
+    emit(SettingInfo::Value(
             StrId::STR_TIME_TO_SLEEP, &CrossPointSettings::sleepTimeoutMinutes,
             {CrossPointSettings::MIN_SLEEP_TIMEOUT_MINUTES, CrossPointSettings::MAX_SLEEP_TIMEOUT_MINUTES, 1},
             "sleepTimeoutMinutes", StrId::STR_CAT_SYSTEM));
-    v.push_back(SettingInfo::Toggle(StrId::STR_SHOW_HIDDEN_FILES, &CrossPointSettings::showHiddenFiles, "showHiddenFiles",
+    emit(SettingInfo::Toggle(StrId::STR_SHOW_HIDDEN_FILES, &CrossPointSettings::showHiddenFiles, "showHiddenFiles",
                             StrId::STR_CAT_SYSTEM));
-    v.push_back(SettingInfo::Toggle(StrId::STR_REMOVE_READ_FROM_RECENTS, &CrossPointSettings::removeReadBooksFromRecents,
+    // The File order of the running shell, kept in file-browser.json beside its last folder.
+    emit(SettingInfo::DynamicEnum(
+        StrId::STR_FILE_SORT, {StrId::STR_FILE_SORT_NAME, StrId::STR_FILE_SORT_MODIFIED, StrId::STR_FILE_SORT_SIZE},
+        [] { return static_cast<uint8_t>(filebrowser::sortModeValue(filebrowser::settingsSort())); },
+        [](const uint8_t v) { filebrowser::chooseSettingsSort(filebrowser::sortModeFromValue(v)); },
+        nullptr, StrId::STR_CAT_SYSTEM));
+    emit(SettingInfo::Toggle(StrId::STR_LIBRARY_USE_METADATA, &CrossPointSettings::libraryUseMetadata,
+                            "libraryUseMetadata", StrId::STR_CAT_SYSTEM));
+    emit(SettingInfo::Toggle(StrId::STR_REMOVE_READ_FROM_RECENTS, &CrossPointSettings::removeReadBooksFromRecents,
                             "removeReadBooksFromRecents", StrId::STR_CAT_SYSTEM));
-    v.push_back(SettingInfo::Toggle(StrId::STR_MOVE_FINISHED_TO_READ, &CrossPointSettings::moveFinishedToReadFolder,
+    emit(SettingInfo::Toggle(StrId::STR_MOVE_FINISHED_TO_READ, &CrossPointSettings::moveFinishedToReadFolder,
                             "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM));
 
     // OPDS download folder: persisted + web-exposed, but category-less so it
     // is hidden from the on-device Settings screen (edited via OPDS UI).
-    v.push_back(SettingInfo::String(StrId::STR_OPDS_DOWNLOAD_FOLDER, &SETTINGS.opdsDownloadFolder[0],
+    emit(SettingInfo::String(StrId::STR_OPDS_DOWNLOAD_FOLDER, &SETTINGS.opdsDownloadFolder[0],
                             sizeof(SETTINGS.opdsDownloadFolder), "opdsDownloadFolder"));
     // OPDS download filename format: persisted + web-exposed, category-less so it
     // is hidden from the on-device Settings screen (cycled from the OPDS UI).
-    v.push_back(SettingInfo::Enum(StrId::STR_OPDS_FILENAME_FORMAT, &CrossPointSettings::opdsFilenameFormat,
+    emit(SettingInfo::Enum(StrId::STR_OPDS_FILENAME_FORMAT, &CrossPointSettings::opdsFilenameFormat,
                           {StrId::STR_FMT_AUTHOR_TITLE, StrId::STR_FMT_TITLE_AUTHOR, StrId::STR_FMT_TITLE},
                           "opdsFilenameFormat"));
 
+    // The sleep screen tenor/ugly took over: persisted only, category-less (so not on the device) and kept
+    // off the web page by getSettingsList().
+    emit(SettingInfo::Value(StrId::STR_UI_SHELL, &CrossPointSettings::uiShellSleepMemo,
+                           {0, CrossPointSettings::SLEEP_SCREEN_MODE_COUNT, 1}, "uiShellSleepMemo"));
+    emit(SettingInfo::Toggle(StrId::STR_UI_SHELL, &CrossPointSettings::uiShellClockMemo, "uiShellClockMemo"));
+    emit(SettingInfo::Toggle(StrId::STR_UI_SHELL, &CrossPointSettings::uiShellClockOnce, "uiShellClockOnce"));
+    emit(SettingInfo::Toggle(StrId::STR_UI_SHELL, &CrossPointSettings::uglyBatteryHidden, "uglyBatteryHidden"));
+
     // Frontlight quick-panel state: persisted and web-exposed, but hidden
     // from the on-device Settings screen because the swipe panel owns it.
-    v.push_back(SettingInfo::Value(StrId::STR_BRIGHTNESS, &CrossPointSettings::frontlightBrightness, {0, 100, 5},
+    emit(SettingInfo::Value(StrId::STR_BRIGHTNESS, &CrossPointSettings::frontlightBrightness, {0, 100, 5},
                            "frontlightBrightness"));
 #if FREEINK_CAP_WARMLIGHT
-    v.push_back(SettingInfo::Value(StrId::STR_WARMTH, &CrossPointSettings::frontlightWarmth, {0, 100, 5}, "frontlightWarmth"));
+    emit(SettingInfo::Value(StrId::STR_WARMTH, &CrossPointSettings::frontlightWarmth, {0, 100, 5}, "frontlightWarmth"));
 #endif
-    v.push_back(SettingInfo::Toggle(StrId::STR_FRONTLIGHT, &CrossPointSettings::frontlightOn, "frontlightOn"));
+    emit(SettingInfo::Toggle(StrId::STR_FRONTLIGHT, &CrossPointSettings::frontlightOn, "frontlightOn"));
 
     // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
-    v.push_back(SettingInfo::DynamicString(
+    emit(SettingInfo::DynamicString(
             StrId::STR_KOREADER_USERNAME, [] { return KOREADER_STORE.getUsername(); },
             [](const std::string& v) {
               KOREADER_STORE.setCredentials(v, KOREADER_STORE.getPassword());
               KOREADER_STORE.saveToFile();
             },
             "koUsername", StrId::STR_KOREADER_SYNC));
-    v.push_back(SettingInfo::DynamicString(
+    emit(SettingInfo::DynamicString(
             StrId::STR_KOREADER_PASSWORD, [] { return KOREADER_STORE.getPassword(); },
             [](const std::string& v) {
               KOREADER_STORE.setCredentials(KOREADER_STORE.getUsername(), v);
               KOREADER_STORE.saveToFile();
             },
             "koPassword", StrId::STR_KOREADER_SYNC));
-    v.push_back(SettingInfo::DynamicString(
+    emit(SettingInfo::DynamicString(
             StrId::STR_SYNC_SERVER_URL, [] { return KOREADER_STORE.getServerUrl(); },
             [](const std::string& v) {
               KOREADER_STORE.setServerUrl(v);
               KOREADER_STORE.saveToFile();
             },
             "koServerUrl", StrId::STR_KOREADER_SYNC));
-    v.push_back(SettingInfo::DynamicEnum(
+    emit(SettingInfo::DynamicEnum(
             StrId::STR_DOCUMENT_MATCHING, {StrId::STR_FILENAME, StrId::STR_BINARY},
             [] { return static_cast<uint8_t>(KOREADER_STORE.getMatchMethod()); },
             [](uint8_t v) {
@@ -542,7 +620,7 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
               KOREADER_STORE.saveToFile();
             },
             "koMatchMethod", StrId::STR_KOREADER_SYNC));
-    v.push_back(SettingInfo::DynamicEnum(
+    emit(SettingInfo::DynamicEnum(
             StrId::STR_SEND_METADATA, {StrId::STR_STATE_OFF, StrId::STR_STATE_ON},
             [] { return static_cast<uint8_t>(KOREADER_STORE.getSendMetadata()); },
             [](uint8_t v) {
@@ -550,7 +628,7 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
               KOREADER_STORE.saveToFile();
             },
             "koSendMetadata", StrId::STR_KOREADER_SYNC));
-    v.push_back(SettingInfo::DynamicEnum(
+    emit(SettingInfo::DynamicEnum(
             StrId::STR_SYNC_BEHAVIOR, {StrId::STR_ASK_EVERY_TIME, StrId::STR_SMART_SYNC},
             [] { return static_cast<uint8_t>(KOREADER_STORE.getSyncBehavior()); },
             [](uint8_t v) {
@@ -559,41 +637,97 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
             },
             "koSyncBehavior", StrId::STR_KOREADER_SYNC));
     // --- Status Bar Settings (web-only, uses StatusBarSettingsActivity) ---
-    v.push_back(SettingInfo::Toggle(StrId::STR_CHAPTER_PAGE_COUNT, &CrossPointSettings::statusBarChapterPageCount,
+    emit(SettingInfo::DynamicEnum(StrId::STR_READER_STATUS_TOP,
+          {StrId::STR_BOOK, StrId::STR_CHAPTER, StrId::STR_STATE_OFF},
+          [] { return SETTINGS.readerStatusItem(0); }, [](uint8_t v) { SETTINGS.setReaderStatusItem(0, v); },
+          "readerStatusTop", StrId::STR_CUSTOMISE_STATUS_BAR));
+    for (int row = 1; row <= 3; ++row) {
+      const StrId names[] = {StrId::STR_READER_STATUS_LEFT, StrId::STR_READER_STATUS_CENTER,
+                             StrId::STR_READER_STATUS_RIGHT};
+      const char* keys[] = {"readerStatusLeft", "readerStatusCenter", "readerStatusRight"};
+      std::vector<StrId> values = {StrId::STR_STATE_OFF, StrId::STR_CLOCK, StrId::STR_BATTERY,
+          StrId::STR_CHAPTER_PAGE_COUNT, StrId::STR_BOOK_PROGRESS_PERCENTAGE,
+          StrId::STR_READER_STATUS_CHAPTER_ETA, StrId::STR_READER_STATUS_BOOK_ETA};
+      if (row == 2) {
+        values.push_back(StrId::STR_CHAPTER_NAME);
+        values.push_back(StrId::STR_READER_STATUS_CHAPTER_AND_BOOK_PROGRESS);
+      }
+      emit(SettingInfo::DynamicEnum(names[row - 1], std::move(values),
+            [row] { return SETTINGS.readerStatusItem(row); },
+            [row](uint8_t v) { SETTINGS.setReaderStatusItem(row, v); }, keys[row - 1], StrId::STR_CUSTOMISE_STATUS_BAR));
+    }
+    emit(SettingInfo::Toggle(StrId::STR_CHAPTER_PAGE_COUNT, &CrossPointSettings::statusBarChapterPageCount,
                             "statusBarChapterPageCount", StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Toggle(StrId::STR_BOOK_PROGRESS_PERCENTAGE, &CrossPointSettings::statusBarBookProgressPercentage,
+    emit(SettingInfo::Toggle(StrId::STR_BOOK_PROGRESS_PERCENTAGE, &CrossPointSettings::statusBarBookProgressPercentage,
                             "statusBarBookProgressPercentage", StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Enum(StrId::STR_PROGRESS_BAR, &CrossPointSettings::statusBarProgressBar,
+    emit(SettingInfo::Enum(StrId::STR_PROGRESS_BAR, &CrossPointSettings::statusBarProgressBar,
                           {StrId::STR_BOOK, StrId::STR_CHAPTER, StrId::STR_HIDE}, "statusBarProgressBar",
                           StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Enum(StrId::STR_PROGRESS_BAR_THICKNESS, &CrossPointSettings::statusBarProgressBarThickness,
+    emit(SettingInfo::Enum(StrId::STR_PROGRESS_BAR_THICKNESS, &CrossPointSettings::statusBarProgressBarThickness,
                           {StrId::STR_PROGRESS_BAR_THIN, StrId::STR_PROGRESS_BAR_MEDIUM, StrId::STR_PROGRESS_BAR_THICK},
                           "statusBarProgressBarThickness", StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Enum(StrId::STR_TITLE, &CrossPointSettings::statusBarTitle,
+    emit(SettingInfo::Enum(StrId::STR_TITLE, &CrossPointSettings::statusBarTitle,
                           {StrId::STR_BOOK, StrId::STR_CHAPTER, StrId::STR_HIDE}, "statusBarTitle",
                           StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Toggle(StrId::STR_BATTERY, &CrossPointSettings::statusBarBattery, "statusBarBattery",
+    emit(SettingInfo::Toggle(StrId::STR_BATTERY, &CrossPointSettings::statusBarBattery, "statusBarBattery",
                             StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Enum(StrId::STR_XTC_STATUS_BAR, &CrossPointSettings::xtcStatusBarMode,
+    emit(SettingInfo::Enum(StrId::STR_XTC_STATUS_BAR, &CrossPointSettings::xtcStatusBarMode,
                           {StrId::STR_HIDE, StrId::STR_BOTTOM, StrId::STR_TOP}, "xtcStatusBarMode",
                           StrId::STR_CUSTOMISE_STATUS_BAR));
-    // Clock entries (web settings only; device UI uses ClockOffsetActivity for the offset).
-    // Range 0..104 = quarter-hour steps from UTC-12:00 to UTC+14:00, biased by 48.
-    v.push_back(SettingInfo::Enum(StrId::STR_CLOCK, &CrossPointSettings::statusBarClock, std::move(statusBarClockValues),
+    // Clock entries (persistence + web settings; the device UI is
+    // ClockSettingsActivity under System settings).
+    emit(SettingInfo::Enum(StrId::STR_CLOCK, &CrossPointSettings::statusBarClock, std::move(statusBarClockValues),
                           "statusBarClock", StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Toggle(StrId::STR_CLOCK_AUTO_TIMEZONE, &CrossPointSettings::clockAutoTimezone, "clockAutoTimezone",
+    emit(SettingInfo::Enum(StrId::STR_HOME_STYLE, &CrossPointSettings::homeStyle,
+                          {StrId::STR_HOME_STYLE_STATS, StrId::STR_HOME_STYLE_LARGE, StrId::STR_HOME_STYLE_SHELF},
+                          "homeStyle", StrId::STR_CAT_DISPLAY));
+    emit(SettingInfo::Toggle(StrId::STR_CLOCK_AUTO_TIMEZONE, &CrossPointSettings::clockAutoTimezone, "clockAutoTimezone",
                             StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Value(StrId::STR_CLOCK_UTC_OFFSET, &CrossPointSettings::clockUtcOffsetQ, {0, 104, 1},
+    // LEGACY: retired quarter-hour UTC offset (biased by 48), still written so
+    // timezones::activeIndex() can migrate it into clockTimezone (#3562).
+    emit(SettingInfo::Value(StrId::STR_CLOCK_UTC_OFFSET, &CrossPointSettings::clockUtcOffsetQ, {0, 104, 1},
                            "clockUtcOffsetQ", StrId::STR_CUSTOMISE_STATUS_BAR));
-    v.push_back(SettingInfo::Enum(StrId::STR_CLOCK_FORMAT, &CrossPointSettings::clockFormat,
+    // Index into the append-only table in src/util/Timezones.cpp; 255 = unset.
+    emit(SettingInfo::Value(StrId::STR_TIMEZONE, &CrossPointSettings::clockTimezone, {0, 255, 1}, "clockTimezone",
+                           StrId::STR_CUSTOMISE_STATUS_BAR));
+    emit(SettingInfo::Enum(StrId::STR_CLOCK_DST, &CrossPointSettings::clockDst,
+                          {StrId::STR_CLOCK_DST_AUTO, StrId::STR_STATE_ON, StrId::STR_STATE_OFF}, "clockDst",
+                          StrId::STR_CUSTOMISE_STATUS_BAR));
+    emit(SettingInfo::Enum(StrId::STR_CLOCK_IN_HEADER, &CrossPointSettings::clockShowInHeader,
+                          {StrId::STR_HIDE, StrId::STR_CLOCK_HEADER_TIME, StrId::STR_CLOCK_HEADER_TIME_DATE}, "clockShowHeader",
+                          StrId::STR_CUSTOMISE_STATUS_BAR));
+    emit(SettingInfo::Enum(StrId::STR_CLOCK_FORMAT, &CrossPointSettings::clockFormat,
                           {StrId::STR_CLOCK_FORMAT_24H, StrId::STR_CLOCK_FORMAT_12H}, "clockFormat",
                           StrId::STR_CUSTOMISE_STATUS_BAR));
     // Persistence flag for NTP debounce. Resetting from the web UI forces a re-sync
     // on next WiFi connect, which is useful when crossing time zones.
-    v.push_back(SettingInfo::Toggle(StrId::STR_CLOCK_SYNCED, &CrossPointSettings::clockHasBeenSynced, "clockHasBeenSynced",
+    emit(SettingInfo::Toggle(StrId::STR_CLOCK_SYNCED, &CrossPointSettings::clockHasBeenSynced, "clockHasBeenSynced",
                             StrId::STR_CUSTOMISE_STATUS_BAR));
-    return v;
-  }();
+    emit(SettingInfo::Enum(StrId::STR_UGLY_START_SCREEN, &CrossPointSettings::uglyStartScreen,
+                          {StrId::STR_UGLY_START_BOOK, StrId::STR_UGLY_ROOT_SCREEN, StrId::STR_UGLY_START_RECENT},
+                          "uglyStartScreen", StrId::STR_CAT_DISPLAY));
+    emit(SettingInfo::Enum(StrId::STR_UGLY_ROOT_SCREEN, &CrossPointSettings::uglyRootScreen,
+                          {StrId::STR_UGLY_START_DIARY, StrId::STR_UGLY_START_DESK},
+                          "uglyRootScreen", StrId::STR_CAT_DISPLAY));
+}
+
+inline const std::vector<SettingInfo>& getBaseSettingsList() {
+  auto& baseList = settings_catalog::storage();
+  if (!baseList.empty()) return baseList;
+#if defined(TENOR_UI_ACCEPTANCE) && defined(ESP_PLATFORM)
+  static bool catalogMeasured = false;
+  if (!catalogMeasured) {
+    logSerial.printf("SETTING_CATALOG:fixed:before,info_size=%u,size=0,capacity=0,free=%u,min=%u,largest=%u,loop_stack_free=%u\n",
+                     static_cast<unsigned>(sizeof(SettingInfo)), ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+                     ESP.getMaxAllocHeap(), static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+  }
+#endif
+  // Counted, not written down: a hand count fell 2 rows short in v1.0.53 and the vector doubled to
+  // 196 rows, 25,600 B on the X3 instead of 12,800.
+  size_t rows = 0;
+  forEachBaseSetting([&rows](SettingInfo&&) { ++rows; });
+  baseList.reserve(rows);
+  forEachBaseSetting([&baseList](SettingInfo&& info) { baseList.push_back(std::move(info)); });
 
 #if defined(TENOR_UI_ACCEPTANCE) && defined(ESP_PLATFORM)
   if (!catalogMeasured) {
@@ -610,10 +744,21 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
 // Dong nao khong thuoc ve ban may nay. Tach rieng de duong luu va duong doc soi
 // duoc tung dong ma khong phai chep ca bang ra mot vector moi.
 inline bool settingHiddenOnThisBoard(const SettingInfo& s) {
-  // Menu doc dang thanh cong cu la giao dien cham: may nut giu menu danh sach cu.
+  if (!BoardConfig::hasTouch() && s.nameId == StrId::STR_HOME_STYLE) return true;
+  if (BoardConfig::hasTouch() && s.nameId == StrId::STR_TIPS) return true;
+  // Touch controls and the per-direction gestures they drive need a touch
+  // controller. The toolbar reader menu style does not (#3603 re-enabled it
+  // on button-only boards: the toolbar chrome is button-navigable).
   if (!BoardConfig::hasTouch() &&
-      (s.nameId == StrId::STR_TOUCH_READER_CONTROLS || s.nameId == StrId::STR_READER_MENU_STYLE))
+      (s.nameId == StrId::STR_TOUCH_READER_CONTROLS || s.nameId == StrId::STR_NEXT_PAGE_GESTURE ||
+       s.nameId == StrId::STR_PREV_PAGE_GESTURE || s.nameId == StrId::STR_BACK_TAP_ZONE))
     return true;
+  // X4 Pro only (#3089); the frontlight double-click shortcut needs its I2C frontlight. The tap-zone tip is
+  // the touch shell's.
+  if (!BoardConfig::isX4Pro() && (s.nameId == StrId::STR_DBL_CLICK_PWR_LIGHT || s.nameId == StrId::STR_READER_TAP_TIP))
+    return true;
+  // Home button shortcuts (#3516) need a physical Home key.
+  if (!BoardConfig::hasHomeKey() && home_button::isSetting(s.valuePtr)) return true;
   // Khong co den nen thi hai dong do ngoi khong. X3 va X4 khai NO_FRONTLIGHT,
   // X4 Pro co den nen giu lai. Phai hoi CA HAI kieu day den: mot bang day den qua
   // I2C chu khong phai PWM, chi hoi PWM la giau mat dong cua may that su co den.
@@ -623,8 +768,10 @@ inline bool settingHiddenOnThisBoard(const SettingInfo& s) {
   // Cu chi mo menu doc chi co nghia o may con phim Home cam ung, vi cho khac thi
   // vuot canh duoi la ve Home va cham giua moi la duong chinh.
   if (!BoardConfig::hasHomeKey() && s.nameId == StrId::STR_SHOW_READER_MENU) return true;
-  // Only X3 sleeps with its panel unpowered; the other boards keep their sleep refresh.
-  if (s.nameId == StrId::STR_SLEEP_BW_REFRESH && BoardConfig::ACTIVE.board != BoardConfig::Board::XteinkX3 &&
+  // Only X3 sleeps with its panel unpowered; the other boards keep their sleep refresh and wake with
+  // no kept frame to draw the notice over.
+  if ((s.nameId == StrId::STR_SLEEP_BW_REFRESH || s.nameId == StrId::STR_WAKE_NOTICE) &&
+      BoardConfig::ACTIVE.board != BoardConfig::Board::XteinkX3 &&
       BoardConfig::ACTIVE.board != BoardConfig::Board::XteinkX3Uc8279)
     return true;
   if (BoardConfig::hasTouch() &&
@@ -637,22 +784,33 @@ inline bool settingHiddenOnThisBoard(const SettingInfo& s) {
 // The device category list owns only rows visible in its categories. Font and
 // spacing descriptors stay in Text Settings; their dynamic options are built
 // there when needed. Return -1 for rows hidden in device categories.
+inline bool settingHiddenInShell(const SettingInfo& setting) {
+  const bool ugly = SETTINGS.uiShell == 1;
+  return (ugly && setting.valuePtr == &CrossPointSettings::wakeIntoBook) ||
+         (ugly && setting.valuePtr == &CrossPointSettings::tipsEnabled) ||
+         (!ugly && (setting.valuePtr == &CrossPointSettings::uglyStartScreen ||
+                    setting.valuePtr == &CrossPointSettings::uglyRootScreen));
+}
+
 inline int deviceSettingsTab(const SettingInfo& setting) {
-  if (settingHiddenOnThisBoard(setting)) return -1;
+  if (settingHiddenOnThisBoard(setting) || settingHiddenInShell(setting)) return -1;
+  // X4 Pro: four rows made for front buttons do nothing here. They leave the lists, not the saved file.
+  if (BoardConfig::isX4Pro() && (setting.nameId == StrId::STR_SIDE_ARROW_HINTS || setting.nameId == StrId::STR_BUTTON_LABELS ||
+                                 setting.nameId == StrId::STR_BUTTON_HINTS ||
+                                 setting.nameId == StrId::STR_READER_MENU_STYLE))
+    return -1;
   if (setting.valuePtr == &CrossPointSettings::sleepScreen ||
       setting.valuePtr == &CrossPointSettings::sleepScreenCoverMode ||
       setting.valuePtr == &CrossPointSettings::sleepScreenCoverFilter ||
       setting.valuePtr == &CrossPointSettings::quickResumeSleepScreen ||
       setting.valuePtr == &CrossPointSettings::wakeIntoBook ||
-      setting.valuePtr == &CrossPointSettings::sleepBwRefresh ||
+      setting.valuePtr == &CrossPointSettings::uglyStartScreen ||
+      setting.valuePtr == &CrossPointSettings::wakeNotice ||
+      setting.valuePtr == &CrossPointSettings::sleepBwFold ||
       setting.valuePtr == &CrossPointSettings::sleepTimeoutMinutes ||
       setting.valuePtr == &CrossPointSettings::frontlightRestoreOnWake)
     return static_cast<int>(settingstabs::Tab::SLEEP);
-  const bool tenor = SETTINGS.uiTheme == CrossPointSettings::TENOR_UI;
-  if (tenor && setting.valuePtr == &CrossPointSettings::hideBatteryPercentage) return -1;
-  if (!tenor && (setting.valuePtr == &CrossPointSettings::tenorButtonSymbols ||
-                 setting.valuePtr == &CrossPointSettings::tenorSideArrows)) return -1;
-  if (tenor && setting.valuePtr == &CrossPointSettings::statusBarClock)
+  if (setting.valuePtr == &CrossPointSettings::statusBarClock)
     return static_cast<int>(settingstabs::Tab::SCREEN);
   if (setting.category == StrId::STR_CAT_DISPLAY) {
     if (setting.valuePtr == &CrossPointSettings::fadingFix &&
@@ -675,7 +833,7 @@ inline int deviceSettingsTab(const SettingInfo& setting) {
 }
 
 // Settings tabs this board shows: all of them with a motion sensor, else every one but
-// Motion sensor, the last by ID.
+// Gestures, the last by ID.
 static_assert(static_cast<int>(settingstabs::Tab::MOTION) == settingstabs::TAB_COUNT - 1,
               "a board without a motion sensor drops the last tab");
 inline int deviceSettingsTabCount() {
@@ -686,6 +844,17 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                                               const std::vector<DictionaryEntry>* dictionaries = nullptr) {
   std::vector<SettingInfo> v = getBaseSettingsList();
   v.erase(std::remove_if(v.begin(), v.end(), settingHiddenOnThisBoard), v.end());
+  v.erase(std::remove_if(v.begin(), v.end(), settingHiddenInShell), v.end());
+  // The web page saves values without shell::changed(), so the shell is chosen on the device only.
+  v.erase(std::remove_if(v.begin(), v.end(),
+                         [](const SettingInfo& s) {
+                           return s.valuePtr == &CrossPointSettings::uiShell || s.valuePtr == &CrossPointSettings::uiUglyLevel ||
+                                  s.valuePtr == &CrossPointSettings::uiShellSleepMemo ||
+                                  s.valuePtr == &CrossPointSettings::uiShellClockMemo ||
+                                  s.valuePtr == &CrossPointSettings::uiShellClockOnce ||
+                                  s.valuePtr == &CrossPointSettings::uglyBatteryHidden;
+                         }),
+          v.end());
   if (registry && registry->getFamilyCount() > 0) {
     auto it = std::find_if(v.begin(), v.end(), [](const SettingInfo& s) { return s.nameId == StrId::STR_FONT_FAMILY; });
     if (it != v.end()) {

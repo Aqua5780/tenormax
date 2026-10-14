@@ -8,6 +8,7 @@
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <MemoryManager.h>
 #include <Serialization.h>
 #include <Utf8.h>
 #include <XmlParserUtils.h>
@@ -109,7 +110,7 @@ constexpr uint8_t TABLE_ROW_SEPARATOR_THICKNESS = 1;
 constexpr int16_t TABLE_MIN_CELL_WIDTH_LINE_HEIGHTS = 3;
 
 constexpr const char* HEADER_TAGS[] = {"h1", "h2", "h3", "h4", "h5", "h6"};
-constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote"};
+constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote", "ul", "ol"};
 constexpr const char* BOLD_TAGS[] = {"b", "strong"};
 constexpr const char* ITALIC_TAGS[] = {"i", "em"};
 constexpr const char* UNDERLINE_TAGS[] = {"u", "ins"};
@@ -568,6 +569,13 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
   currentTextBlock = makeUniqueNoThrow<ParsedText>(
       extraParagraphSpacing, hyphenationEnabled, false, blockStyle, paragraphIndent, letterSpacing, wordSpacing);
   if (!currentTextBlock) {
+    // Evict rebuildable caches and retry once before failing the build.
+    freeink::MemoryManager::instance().ensureFree(4 * 1024);
+    currentTextBlock = makeUniqueNoThrow<ParsedText>(
+        extraParagraphSpacing, hyphenationEnabled, false, blockStyle, paragraphIndent, letterSpacing, wordSpacing);
+  }
+  if (!currentTextBlock) {
+    LOG_ERR("EHP", "OOM: ParsedText");
     failBuild();
     return;
   }
@@ -1147,6 +1155,14 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
               bool gotDimensions = headerProbe.getDimensions(dims);
 
               if (!gotDimensions) {
+                // Retry with framebuffer scratch when the heap cannot fit the inflate window.
+                GfxRenderer::FrameBufferLoan probeLoan(self->renderer);
+                ImageDimsProbe retryProbe;
+                self->epub->readItemContentsToStream(resolvedPath, retryProbe, 1024, /*allowEarlyStop=*/true);
+                gotDimensions = retryProbe.getDimensions(dims);
+              }
+
+              if (!gotDimensions) {
                 // No header within the stream (rare) - fall back to extracting the
                 // whole image and probing the file. That can take seconds, so
                 // surface the indexing popup first (single-shot per parser).
@@ -1157,7 +1173,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 HalFile cachedImageFile;
                 bool extractSuccess = false;
                 if (Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
-                  extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
+                  {
+                    GfxRenderer::FrameBufferLoan extractLoan(self->renderer);
+                    extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
+                  }
                   cachedImageFile.flush();
                   cachedImageFile.close();
                 }
@@ -1573,8 +1592,31 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       self->updateEffectiveInlineStyle();
 
       if (strcmp(name, "li") == 0) {
-        self->currentTextBlock->addWord("\xe2\x80\xa2", EpdFontFamily::REGULAR, false, false, self->visibleTextOffset);
-        self->listItemBulletOnly = true;
+        // Innermost open <ul>/<ol> (if any) decides whether this item gets a bullet,
+        // a number, or no marker at all (list-style-type: none). A malformed <li>
+        // with no enclosing list falls back to the plain bullet.
+        if (!self->listStack.empty() && self->listStack.back().styleNone) {
+          // No marker: leave the block empty so it behaves like a normal paragraph.
+        } else if (!self->listStack.empty() && self->listStack.back().ordered) {
+          self->listStack.back().counter += 1;
+          char marker[16];
+          snprintf(marker, sizeof(marker), "%d.", self->listStack.back().counter);
+          self->currentTextBlock->addWord(marker, EpdFontFamily::REGULAR, false, false, self->visibleTextOffset);
+          self->listItemBulletOnly = true;
+        } else {
+          self->currentTextBlock->addWord("\xe2\x80\xa2", EpdFontFamily::REGULAR, false, false,
+                                          self->visibleTextOffset);
+          self->listItemBulletOnly = true;
+        }
+      } else if (strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0) {
+        // <ul>/<ol> container accumulation: pushing the block-style stack here includes
+        // the container's own margin/padding in the inset children combine with, so a
+        // hanging text-indent on <li><p> children keeps the first line on the page.
+        ChapterHtmlSlimParser::ListContext ctx;
+        ctx.ordered = strcmp(name, "ol") == 0;
+        ctx.styleNone = cssStyle.hasListStyleType() && cssStyle.listStyleType == CssListStyleType::None;
+        ctx.depth = self->depth;
+        self->listStack.push_back(ctx);
       }
     }
   } else if (matches(name, UNDERLINE_TAGS, std::size(UNDERLINE_TAGS))) {
@@ -1947,17 +1989,7 @@ void ChapterHtmlSlimParser::flushTextIfOverBudget() {
   if (blockWordCount > softFlushThreshold ||
       currentTextBlock->getRubyTextBytes() > TextBlock::MAX_RUBY_ANNOTATION_BYTES) {
     LOG_DBG("EHP", "Text block soft flush (%u words)", static_cast<unsigned>(blockWordCount));
-    const int horizontalInset = currentTextBlock->getBlockStyle().totalHorizontalInset();
-    const uint16_t effectiveWidth = (horizontalInset < viewportWidth)
-                                        ? static_cast<uint16_t>(viewportWidth - horizontalInset)
-                                        : viewportWidth;
-    if (!currentTextBlock->layoutAndExtractLines(
-        renderer, fontId, effectiveWidth,
-        [this](std::unique_ptr<TextBlock> textBlock, const uint32_t offset) {
-          addLineToPage(std::move(textBlock), offset);
-          if (buildFailed_) return;
-        },
-        false)) failBuild();
+    makePages(/*includeLastLine=*/false);
   }
 }
 
@@ -2204,6 +2236,17 @@ void XMLCALL ChapterHtmlSlimParser::processEndElement(void* userData, const XML_
       self->listItemBulletOnly = false;
     }
   }
+
+  // </ul> or </ol> closes: pop its list context so a following sibling list at the
+  // same nesting level starts its own counter/style instead of inheriting this one's.
+  // Guarded by depth (not just tag name + non-empty stack): a display:none <ul>/<ol>
+  // returns early in startElement without ever pushing a context (see the
+  // hasDisplay()/CssDisplay::None branch above), so its closing tag must not pop
+  // the *parent* list's context out from under still-unprocessed siblings.
+  if ((strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0) && !self->listStack.empty() &&
+      self->listStack.back().depth == self->depth) {
+    self->listStack.pop_back();
+  }
   if (strcmp(name, "body") == 0) {
     self->insideBody = false;
   }
@@ -2290,7 +2333,7 @@ void ChapterHtmlSlimParser::trackCheckpointEnd(const XML_Char* name) {
   // currentCssStyle. Soft-flush and inline boundaries carry more layout state.
   // A page finished in this step, or a requested checkpoint once any page is done (a restore needs one).
   const bool pageBoundary = completedPageCount > stepStartPages_ || (checkpointWanted_ && completedPageCount > 0);
-  if (replayingCheckpoint_ || buildFailed_ || !pageBoundary ||
+  if (replayingCheckpoint_ || buildFailed_ || (!pageBoundary && !resumePointFn) ||
       !isHeaderOrBlock(name) || strcmp(name, "br") == 0 || !insideBody ||
       checkpointUnsupported_ != 0 || checkpointDepth_ == 0 || skipUntilDepth != INT_MAX ||
       boldUntilDepth != INT_MAX || italicUntilDepth != INT_MAX || partWordBufferIndex != 0 ||
@@ -2308,6 +2351,11 @@ void ChapterHtmlSlimParser::trackCheckpointEnd(const XML_Char* name) {
       context[contextOffset] != '<' || context[contextOffset + 1] != '/') return;
   const int64_t offset = sourceOffsetBase_ + XML_GetCurrentByteIndex(xmlParser_) + eventBytes;
   if (offset <= 0 || offset >= static_cast<int64_t>(parseFile_.size())) return;
+  if (resumePointFn) {
+    resumePointFn(ResumePoint{static_cast<uint32_t>(offset), visibleTextOffset, imageCounter}, checkpointPrefix_,
+                  checkpointPrologBytes_);
+  }
+  if (!pageBoundary) return;
   if (XML_StopParser(xmlParser_, XML_TRUE) == XML_STATUS_ERROR) return;
   checkpointOffset_ = static_cast<uint32_t>(offset);
   checkpointReady_ = true;
@@ -2432,6 +2480,36 @@ bool ChapterHtmlSlimParser::restoreCheckpoint(HalFile& file, const uint16_t expe
   return true;
 }
 
+bool ChapterHtmlSlimParser::restoreResumePoint(const std::string& prologAndPrefix, const ResumePoint& point,
+                                               const uint32_t pageStart) {
+  if (prologAndPrefix.empty() || point.offset == 0 || point.offset >= parseFile_.size() || point.imageCounter < 0 ||
+      point.visible > pageStart) return false;
+  replayingCheckpoint_ = true;
+  const auto xmlStatus =
+      XML_Parse(xmlParser_, prologAndPrefix.data(), static_cast<int>(prologAndPrefix.size()), XML_FALSE);
+  replayingCheckpoint_ = false;
+  if (xmlStatus != XML_STATUS_OK || buildFailed_ || !insideBody || checkpointDepth_ == 0 ||
+      skipUntilDepth != INT_MAX || completedPageCount != 0 || !currentTextBlock || !currentTextBlock->isEmpty() ||
+      !parseFile_.seek(point.offset)) return false;
+  currentCssStyle.reset();
+  updateEffectiveInlineStyle();
+  currentTextBlock->resetDropCap();
+  pendingAnchorId.clear();
+  anchorData.clear();
+  visibleTextOffset = point.visible;
+  currentPageVisibleOffset = point.visible;
+  imageCounter = point.imageCounter;
+  chapterInitialPending = false;  // the chapter's first letter is behind us
+  sourceOffsetBase_ = static_cast<int64_t>(point.offset) - prologAndPrefix.size();
+  startPageAt(pageStart);
+  return true;
+}
+
+void ChapterHtmlSlimParser::startPageAt(const uint32_t pageStart) {
+  holdingLines_ = pageStart > 0;
+  holdUntil_ = pageStart;
+}
+
 ChapterHtmlSlimParser::~ChapterHtmlSlimParser() { abortParse(); }
 
 bool ChapterHtmlSlimParser::beginParse() {
@@ -2450,6 +2528,8 @@ bool ChapterHtmlSlimParser::beginParse() {
   blockStyleStack.reserve(8);
   blockStyleStack.push_back(rootBlockStyle);
 
+  listStack.clear();
+  listStack.reserve(4);
   tableDepth = 0;
   insideTableCell = false;
   tableRowStacked = false;
@@ -2740,6 +2820,10 @@ bool ChapterHtmlSlimParser::createPage() {
 
 bool ChapterHtmlSlimParser::emitCurrentPage() {
   if (buildFailed_) return false;
+  if (holdingLines_) {
+    currentPage.reset();  // laid out before the page asked for
+    return true;
+  }
   if (!currentPage) return true;
   completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
   if (buildFailed_) return false;
@@ -2767,6 +2851,14 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
 void ChapterHtmlSlimParser::addLineToPage(std::unique_ptr<TextBlock> line, const uint32_t visibleOffset) {
   if (buildFailed_) return;
   if (!line || !line->valid()) { failBuild(); return; }
+  if (holdingLines_) {
+    if (visibleOffset <= holdUntil_) {
+      // Discard everything before this candidate, then use the normal page layout for its tail.
+      if (!createPage()) return;
+    } else {
+      holdingLines_ = false;
+    }
+  }
   const int ascender = renderer.getFontAscenderSize(fontId);
   const int rubyShift = line->getRubyShift(ascender);
   const int lineHeight = renderer.getLineHeight(fontId, lineCompression) + rubyShift;
@@ -2817,7 +2909,7 @@ void ChapterHtmlSlimParser::addLineToPage(std::unique_ptr<TextBlock> line, const
   currentPageNextY += lineHeight;
 }
 
-void ChapterHtmlSlimParser::makePages() {
+void ChapterHtmlSlimParser::makePages(const bool includeLastLine) {
   if (buildFailed_) return;
   if (!currentTextBlock) {
     LOG_ERR("EHP", "!! No text block to make pages for !!");
@@ -2830,23 +2922,7 @@ void ChapterHtmlSlimParser::makePages() {
 
   const int lineHeight = renderer.getLineHeight(fontId, lineCompression);
 
-  // Khoang ngan doan thuoc ve RANH GIOI giua hai khoi: cong o day, dau khoi, chu khong cong sau khi
-  // khoi truoc da xep xong. Nho vay khoi do <br> mo (ngat dong mem trong cung doan) khong nhan khoang
-  // ngan doan, ke ca <br> DAU TIEN - truong hop ma cach "danh dau khoi bi dong" bo sot vi <br> duoc doc
-  // sau khi khoi da xep trang.
   const BlockStyle& blockStyle = currentTextBlock->getBlockStyle();
-  if (khoiTruocDaXepTrang && !blockStyle.fromBrElement) {
-    currentPageNextY += readerSpacing::paragraphGap(extraParagraphSpacing, lineHeight);
-  }
-  khoiTruocDaXepTrang = true;
-
-  // Apply top spacing before the paragraph (stored in pixels)
-  if (blockStyle.marginTop > 0) {
-    currentPageNextY += blockStyle.marginTop;
-  }
-  if (blockStyle.paddingTop > 0) {
-    currentPageNextY += blockStyle.paddingTop;
-  }
 
   // Calculate effective width accounting for horizontal margins/padding
   const int horizontalInset = blockStyle.totalHorizontalInset();
@@ -2854,13 +2930,41 @@ void ChapterHtmlSlimParser::makePages() {
       (horizontalInset < viewportWidth) ? static_cast<uint16_t>(viewportWidth - horizontalInset) : viewportWidth;
 
   if (!currentTextBlock->isEmpty() && currentTextBlock->wantsDropCap()) chapterInitialPending = false;
-  if (!currentTextBlock->layoutAndExtractLines(renderer, fontId, effectiveWidth,
-                                          [this](std::unique_ptr<TextBlock> textBlock, const uint32_t offset) {
-                                            addLineToPage(std::move(textBlock), offset);
-                                          })) {
+  // The block's top spacing goes before its first line only: a soft flush already placed the
+  // earlier lines of a long paragraph, and its later chunks continue that paragraph.
+  bool blockStart = currentTextBlock->linesExtracted() == 0;
+  if (!currentTextBlock->layoutAndExtractLines(
+          renderer, fontId, effectiveWidth,
+          [this, lineHeight, &blockStart](std::unique_ptr<TextBlock> textBlock, const uint32_t offset) {
+            if (blockStart) {
+              blockStart = false;
+              // Khoang ngan doan thuoc ve RANH GIOI giua hai khoi: cong o day, dau khoi, chu khong cong sau
+              // khi khoi truoc da xep xong. Nho vay khoi do <br> mo (ngat dong mem trong cung doan) khong
+              // nhan khoang ngan doan, ke ca <br> DAU TIEN - truong hop ma cach "danh dau khoi bi dong" bo
+              // sot vi <br> duoc doc sau khi khoi da xep trang.
+              const BlockStyle& style = currentTextBlock->getBlockStyle();
+              if (khoiTruocDaXepTrang && !style.fromBrElement) {
+                currentPageNextY += readerSpacing::paragraphGap(extraParagraphSpacing, lineHeight);
+              }
+              khoiTruocDaXepTrang = true;
+              // Apply top spacing before the paragraph (stored in pixels)
+              if (style.marginTop > 0) {
+                currentPageNextY += style.marginTop;
+              }
+              if (style.paddingTop > 0) {
+                currentPageNextY += style.paddingTop;
+              }
+            }
+            addLineToPage(std::move(textBlock), offset);
+          },
+          includeLastLine)) {
     failBuild();
     return;
   }
+  // Trailing spacing, held lines and footnotes wait for the call that finishes the block.
+  if (!includeLastLine) return;
+  // A final line has no later text callback before margins/images. Keep its page before those arrive.
+  if (holdingLines_ && visibleTextOffset > holdUntil_) holdingLines_ = false;
 
   currentPageNextY = std::max<int>(currentPageNextY, dropCapBottom);
   dropCapBottom = 0;

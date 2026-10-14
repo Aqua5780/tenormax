@@ -1,5 +1,7 @@
 #include "KOReaderSyncActivity.h"
 
+#include "activities/X3ActivityLayout.h"
+
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -21,9 +23,14 @@
 #include "SilentRestart.h"
 #include "activities/ActivityManager.h"
 #include "activities/network/WifiSelectionActivity.h"
+#include "components/TenorMenuChrome.h"
 #include "components/UITheme.h"
 #include "components/UiAppHelpers.h"  // list icons for the compare rows
 #include "fontIds.h"
+#include "shells/Shell.h"
+#include "shells/ugly/UglyChrome.h"
+#include "shells/ugly/UglyLayout.h"
+#include "shells/ugly/UglyNote.h"
 
 namespace fui = freeink::ui;
 
@@ -471,8 +478,9 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
   // Side padding is 0 here (like the other FreeInkApp screens): the action list
   // supplies its own theme side padding, and the raw comparison text is indented
   // to line up with the list rows below (see labelIndent).
-  screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
-                                                static_cast<int16_t>(metrics.buttonHintsHeight), 0});
+  screen.setContentMarginFromScreen(
+      fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
+                  static_cast<int16_t>(tenorchrome::footReserve(metrics.buttonHintsHeight)), 0});
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   if (state == SHOWING_RESULT) {
@@ -607,7 +615,91 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
   }
 }
 
+// The same screen by hand: the waits and the endings are note pages; the comparison and the prompt to upload keep
+// their layout, written in pen, with the circle on the chosen action.
+void KOReaderSyncActivity::renderUgly() {
+  const char* title = state == SHOWING_RESULT ? tr(STR_PROGRESS_FOUND) : tr(STR_KOREADER_SYNC);
+  ugly::Hints hints;
+  hints.back = true;
+  switch (state) {
+    case NO_CREDENTIALS:
+      return ugly::notePage(renderer, mappedInput, title, tr(STR_UGLY_KOSYNC_NO_LOGIN), nullptr, -1, hints);
+    case SYNCING:
+    case UPLOADING:
+      return ugly::notePage(renderer, mappedInput, title, statusMessage.c_str(), nullptr, -1, {});
+    case UPLOAD_COMPLETE:
+    case SYNC_COMPLETE:
+      hints.confirm = true;
+      return ugly::notePage(renderer, mappedInput, title,
+                            state == UPLOAD_COMPLETE ? tr(STR_UGLY_KOSYNC_UPLOADED) : tr(STR_UGLY_KOSYNC_SAME), nullptr,
+                            -1, hints);
+    case SYNC_FAILED:
+      return ugly::notePage(renderer, mappedInput, title, tr(STR_UGLY_KOSYNC_SYNC_FAILED),
+                            statusMessage.empty() ? nullptr : statusMessage.c_str(), -1, hints);
+    default:
+      break;
+  }
+  renderer.clearScreen();
+  const auto metrics = UITheme::getInstance().getMetrics();
+  const Rect screen = UITheme::getInstance().getScreenSafeArea(renderer, true, false, UITheme::StatusBarScope::Reader);
+  GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight}, title);
+  ugly::layoutByHand(renderer, uiTarget, [this] { renderUi(); });
+  const int chosen = state == SHOWING_RESULT ? selectedOption : 0;
+  const auto box = app.publishedRect(ACTION_ROW, static_cast<int16_t>(chosen));
+  if (!box.empty()) uglychrome::marks(renderer, box, {true}, mark_.get((static_cast<uint64_t>(state) << 32) | chosen));
+  const auto labels = state == SHOWING_RESULT
+                          ? mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN))
+                          : mappedInput.mapLabels(tr(STR_BACK), tr(STR_UPLOAD), "", "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  renderer.displayBuffer();
+#ifdef UGLY_FRAME_LOG
+  LOG_INF("UGLY", "KOReader sync frame state=%d chosen=%d", static_cast<int>(state), chosen);
+#endif
+}
+
 void KOReaderSyncActivity::render(RenderLock&&) {
+  if (tenorchrome::x3ScreenLayoutEnabled()) {
+    const char* status = state == NO_CREDENTIALS ? tr(STR_NO_CREDENTIALS_MSG) :
+        state == SYNC_FAILED ? tr(STR_SYNC_FAILED_MSG) : state == UPLOAD_COMPLETE ? tr(STR_UPLOAD_SUCCESS) :
+        state == SYNC_COMPLETE ? tr(STR_ALREADY_SYNCED) : state == NO_REMOTE_PROGRESS ? tr(STR_NO_REMOTE_MSG) :
+        statusMessage.c_str();
+    const char* detail = state == NO_CREDENTIALS ? tr(STR_KOREADER_SETUP_HINT) :
+        state == NO_REMOTE_PROGRESS ? tr(STR_UPLOAD_PROMPT) : state == SYNC_FAILED ? statusMessage.c_str() : nullptr;
+    std::string remoteChapter, first, second;
+    char remoteValue[64] = {}, localValue[64] = {};
+    if (state == SHOWING_RESULT) {
+      const int index = epub->getTocIndexForSpineIndex(remotePosition.spineIndex);
+      remoteChapter = index >= 0 ? epub->getTocItem(index).title :
+          std::string(tr(STR_SECTION_PREFIX)) + std::to_string(remotePosition.spineIndex + 1);
+      snprintf(remoteValue, sizeof(remoteValue), tr(STR_PAGE_OVERALL_FORMAT), remotePosition.pageNumber + 1,
+          remoteProgress.percentage * 100);
+      snprintf(localValue, sizeof(localValue), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), localPosition.pageNumber + 1,
+          localPosition.totalPages, localProgress.percentage * 100);
+      first = std::string(selectedOption == 0 ? "> " : "") + tr(STR_APPLY_REMOTE);
+      second = std::string(selectedOption == 1 ? "> " : "") + tr(STR_UPLOAD_LOCAL);
+    }
+    const char* tip = nullptr;
+    const auto layout = tenorchrome::x3ScreenLayout(renderer, tenorchrome::tipHeight(renderer, tip, 8));
+    renderer.clearScreen();
+    char localFallback[32];
+    snprintf(localFallback, sizeof(localFallback), "%s%d", tr(STR_SECTION_PREFIX), localPosition.spineIndex + 1);
+    x3Info.draw(renderer, layout.bodyRect, {status, detail,
+        state == SHOWING_RESULT ? tr(STR_REMOTE_LABEL) : nullptr, remoteChapter.c_str(), remoteValue,
+        state == SHOWING_RESULT && !remoteProgress.device.empty() ? tr(STR_DEVICE_NAME) : nullptr,
+        state == SHOWING_RESULT ? remoteProgress.device.c_str() : nullptr,
+        state == SHOWING_RESULT ? tr(STR_LOCAL_LABEL) : nullptr,
+        state == SHOWING_RESULT ? (localChapterName.empty() ? localFallback : localChapterName.c_str()) : nullptr,
+        localValue, first.c_str(), second.c_str()});
+    tenorchrome::drawTipInRect(renderer, tip, layout.tipRect, 8);
+    x3activity::drawBar(renderer, layout.barRect, state == SHOWING_RESULT ? tr(STR_PROGRESS_FOUND) : tr(STR_KOREADER_SYNC), navigationPrefix.c_str());
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+    renderer.displayBuffer();
+    return;
+  }
+
+  if (shell::uglyParts()) return renderUgly();
   renderer.clearScreen();
 
   auto metrics = UITheme::getInstance().getMetrics();
@@ -686,6 +778,13 @@ bool KOReaderSyncActivity::idleExitDue(const unsigned long now, const bool inter
 }
 
 void KOReaderSyncActivity::loop() {
+  if (tenorchrome::x3ScreenLayoutEnabled() &&
+      x3Info.turn(mappedInput.wasReleased(MappedInputManager::Button::Up) ? -1 :
+                  mappedInput.wasReleased(MappedInputManager::Button::Down) ? 1 : 0)) {
+    requestUpdate();
+    return;
+  }
+
   const bool interaction = mappedInput.wasAnyPressed() || mappedInput.wasAnyReleased() ||
                            mappedInput.wasScreenTouchReleased();
   if (idleExitDue(millis(), interaction)) {

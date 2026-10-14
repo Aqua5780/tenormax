@@ -22,11 +22,10 @@ from cai_dat_truoc_tenor import truoc_tenor
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = Path(os.environ.get('TEST_PROGRAM', REPO / '.pio/build/simulator_x3_uc8279/program'))
 
-# Home: Up opens the Settings tab. From "File transfer": Display, Sleep, Reader, Controls,
-# then Motion sensor.
+# Home: Up opens Settings on Display. Sleep, Reader, Controls and Motion follow.
 HOME_TO_SETTINGS = ['1000:UP']
-HOME_TO_CONTROLS = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '3000:RIGHT', '3500:CONFIRM']
-HOME_TO_MOTION = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '2800:RIGHT', '3100:RIGHT', '3500:CONFIRM']
+HOME_TO_CONTROLS = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '3500:CONFIRM']
+HOME_TO_MOTION = ['1000:UP', '1500:RIGHT', '2000:RIGHT', '2500:RIGHT', '2800:RIGHT', '3500:CONFIRM']
 
 # A file from v1.0.16, every sensor row away from its default.
 OLD_SENSOR_VALUES = {
@@ -126,11 +125,14 @@ class MotionSensorTabTest(unittest.TestCase):
         self.assertEqual(len(set(pictures.values())), 3, 'each language draws its own row')
 
     def test_first_motion_row_is_page_tilt(self):
-        # A three-choice row steps in place: Reversed (2) goes round to Off.
+        # U11: open the three-choice picker on Reversed, wrap to Off, then save.
         self.write_settings()
-        self.run_sim([*HOME_TO_MOTION, '4500:CONFIRM'])
+        self.run_sim([*HOME_TO_MOTION, '4500:CONFIRM', '5500:RIGHT', '6500:CONFIRM'],
+                     shots=[(5000, 'page-tilt-choices'), (7000, 'page-tilt-off')])
         saved = self.saved()
         self.assertEqual((saved['tiltPageTurn'], saved['tiltTabNavigation']), (0, 1))
+        self.run_sim([*HOME_TO_MOTION], shots=[(4500, 'page-tilt-restart')])
+        self.assertEqual(self.saved()['tiltPageTurn'], 0)
 
     def test_controls_keeps_its_own_rows(self):
         # Controls begins on remap; the next row is now "front buttons follow orientation",

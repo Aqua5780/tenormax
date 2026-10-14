@@ -90,6 +90,15 @@ bool HalStorage::disconnectUsbDriveHost() {
 #endif
 }
 
+bool HalStorage::usbDriveHostSuspended() const {
+#if FREEINK_CAP_USB_MSC
+  StorageLock lock;
+  return usbMassStorage.hostSuspended();
+#else
+  return false;
+#endif
+}
+
 void HalStorage::endUsbDrive() {
 #if FREEINK_CAP_USB_MSC
   StorageLock lock;
@@ -125,6 +134,10 @@ UsbDriveState HalStorage::usbDriveState() const {
 
 std::vector<String> HalStorage::listFiles(const char* path, int maxFiles) {
   HAL_STORAGE_WRAPPED_CALL(listFiles, path, maxFiles);
+}
+
+bool HalStorage::freeSpace(uint64_t& bytes, uint32_t& clusterBytes) {
+  HAL_STORAGE_WRAPPED_CALL(freeSpace, bytes, clusterBytes);
 }
 
 String HalStorage::readFile(const char* path) { HAL_STORAGE_WRAPPED_CALL(readFile, path); }
@@ -254,7 +267,20 @@ bool HalStorage::rename(const char* oldPath, const char* newPath) {
   HAL_STORAGE_WRAPPED_CALL(rename, oldPath, newPath);
 }
 
-bool HalStorage::rmdir(const char* path) { HAL_STORAGE_WRAPPED_CALL(rmdir, path); }
+namespace {
+// "", "/", "//": the card root. No caller may remove it or empty it.
+bool isCardRoot(const char* path) {
+  if (!path) return true;
+  for (; *path; ++path)
+    if (*path != '/') return false;
+  return true;
+}
+}  // namespace
+
+bool HalStorage::rmdir(const char* path) {
+  if (isCardRoot(path)) return false;
+  HAL_STORAGE_WRAPPED_CALL(rmdir, path);
+}
 
 bool HalStorage::openFileForRead(const char* moduleName, const char* path, HalFile& file) {
   StorageLock lock;  // ensure thread safety for the duration of this function
@@ -296,7 +322,10 @@ bool HalStorage::openFileForWrite(const char* moduleName, const String& path, Ha
   return openFileForWrite(moduleName, path.c_str(), file);
 }
 
-bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDir, path); }
+bool HalStorage::removeDir(const char* path) {
+  if (isCardRoot(path)) return false;
+  HAL_STORAGE_WRAPPED_CALL(removeDir, path);
+}
 
 // HalFile implementation
 // Allow doing file operations while ensuring thread safety via HalStorage's mutex.
@@ -335,6 +364,13 @@ size_t HalFile::getName(char* name, size_t len) { HAL_FILE_WRAPPED_CALL(getName,
 size_t HalFile::size() { HAL_FILE_FORWARD_CALL(size, ); }              // already thread-safe, no need to wrap
 size_t HalFile::fileSize() { HAL_FILE_FORWARD_CALL(fileSize, ); }      // already thread-safe, no need to wrap
 uint64_t HalFile::fileSize64() { HAL_FILE_FORWARD_CALL(fileSize, ); }  // already thread-safe, no need to wrap
+uint32_t HalFile::modificationTime() {
+  HalStorage::StorageLock lock;
+  uint16_t date = 0;
+  uint16_t time = 0;
+  if (!impl || !impl->file.getModifyDateTime(&date, &time) || date == 0) return 0;
+  return (static_cast<uint32_t>(date) << 16) | time;
+}
 #ifdef TENOR_UI_ACCEPTANCE
 #define HAL_FILE_TRACED_SEEK(method, position)  \
   HalStorage::StorageLock lock;               \
