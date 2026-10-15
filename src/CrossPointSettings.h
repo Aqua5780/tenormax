@@ -211,7 +211,6 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     CHAPTER_SKIP = 1,
     ORIENTATION_CHANGE = 2,
     FONT_SIZE_STEP = 3,  // giu nut tien = co chu to mot nac, giu nut lui = nho mot nac (14/09/2026)
-    SAVE_QUOTE_LONG_PRESS = 4,
     LONG_PRESS_BUTTON_BEHAVIOR_COUNT
   };
 

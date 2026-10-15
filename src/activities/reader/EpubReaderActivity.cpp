@@ -1002,11 +1002,6 @@ void EpubReaderActivity::settleBuildPopup() {
   buildPopupRefreshing = false;
 }
 
-bool EpubReaderActivity::saveQuoteFromLongPress() {
-  openDictionaryWordSelect(true);
-  return true;
-}
-
 void EpubReaderActivity::openDictionaryWordSelect(const bool quotation, const std::string& editName) {
   if (!quotation && SETTINGS.dictionaryName[0] == '\0') {
     showDictionaryMessage = true;

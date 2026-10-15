@@ -482,7 +482,7 @@ inline void forEachBaseSetting(const std::function<void(SettingInfo&&)>& emit) {
     emit(SettingInfo::String(StrId::STR_DEVICE_NAME, &SETTINGS.deviceName[0], sizeof(SETTINGS.deviceName), "deviceName"));
     emit(SettingInfo::Enum(StrId::STR_LONG_PRESS_BEHAVIOR, &CrossPointSettings::longPressButtonBehavior,
                           {StrId::STR_LONG_PRESS_BEHAVIOR_OFF, StrId::STR_LONG_PRESS_BEHAVIOR_SKIP,
-                           StrId::STR_LONG_PRESS_BEHAVIOR_ORIENTATION, StrId::STR_QUOTES_SAVE_ACTION},
+                           StrId::STR_LONG_PRESS_BEHAVIOR_ORIENTATION},
                           "longPressButtonBehavior", StrId::STR_CAT_CONTROLS));
     emit(buildLongPressMenuSetting(hasTilt));
     // X4 Pro only; hidden elsewhere by settingHiddenOnThisBoard (#3089).

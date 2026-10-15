@@ -467,7 +467,6 @@ class EpubReaderActivity final : public ReaderActivity {
   void openFootnoteSelect(bool reopenMenuOnCancel);
   // `editName` non-empty reopens that saved quote for reselection on the current page.
   void openDictionaryWordSelect(bool quotation = false, const std::string& editName = {});
-  bool saveQuoteFromLongPress() override;
   // Tools > Quotations in this book: the Quotes screen for this book only. A quote it hands
   // back for reselection is jumped to, and the selector opens once its page is drawn.
   void openBookQuotes();

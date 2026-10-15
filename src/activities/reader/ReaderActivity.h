@@ -115,7 +115,6 @@ class ReaderActivity : public Activity {
   // (+1 to, -1 nho), KEP o hai bien. Tra ve true neu co doi. Mac dinh (XTC, bitmap) khong doi gi,
   // nhung nhip giu van bi TIEU: 0 doi co, 0 lat trang du.
   virtual bool docCoChuMotNac(int /*huong*/) { return false; }
-  virtual bool saveQuoteFromLongPress() { return false; }
   virtual bool isAtEndOfBook() const = 0;
   virtual void onReturnFromEndOfBook() {}
 
