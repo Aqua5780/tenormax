@@ -651,6 +651,10 @@ void ReaderActivity::loop() {
     if (docCoChuMotNac(nextTriggered ? 1 : -1)) requestUpdate();
     return;
   }
+  if (longPress && SETTINGS.longPressButtonBehavior == SETTINGS.SAVE_QUOTE_LONG_PRESS) {
+    saveQuoteFromLongPress();
+    return;
+  }
   const bool skip = longPress && SETTINGS.longPressButtonBehavior == SETTINGS.CHAPTER_SKIP;
 
   const bool changed = skip ? skipPages(prevTriggered ? -10 : 10) : pageTurn(!prevTriggered);

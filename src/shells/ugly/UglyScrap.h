@@ -194,7 +194,7 @@ inline int place(const Rect& area, const Rect* avoid, const int nAvoid, const ui
     // Keep a star, heart, and thunder along the bottom of the page. The normal collision checks still
     // apply, so each one stays clear of the words and of the other placed scribbles.
     static constexpr uint8_t BOTTOM_PICTURES[] = {0, 12, 8};  // star, heart, thunder
-    static constexpr uint8_t BOTTOM_SIZES[] = {64, 52, 56};
+    static constexpr uint8_t BOTTOM_SIZES[] = {64, 52, 82};
     for (int i = 0; i < 3; ++i) {
       Item item;
       item.kind = Kind::Doodle;
