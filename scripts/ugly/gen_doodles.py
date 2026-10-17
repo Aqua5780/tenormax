@@ -121,6 +121,12 @@ def build():
              (120, 188), (140, 182), (150, 170), (154, 148), (156, 130), (164, 148),
              (170, 166), (184, 180), (204, 184), (224, 184), (240, 178), (252, 166),
              (258, 148), (258, 130), (250, 112)], 3))
+    # 18 recreated ku: a long rising outline, a small head mark, and two round feet
+    doodle('ku-recreated',
+           ([(42, 104), (34, 88), (28, 68), (28, 48), (34, 30), (46, 18), (62, 12),
+             (76, 16), (84, 28), (82, 42), (74, 50), (62, 54), (54, 48)], 3),
+           ([(54, 34), (68, 28), (80, 30)], 3),
+           (gs.ring(38, 92, 8, 5), 3), (gs.ring(56, 104, 11, 7), 3))
 
 
 build()
@@ -223,7 +229,7 @@ def main():
     out += o
     out += ['inline constexpr int COUNT = %d;' % len(DOODLES)]
     out += ['// 0 star, 1 sparkle, 2 spiral, 3 arrow, 4 curly arrow, 5 face, 6 cloud, 7 the ku, 8 bolt, 9 coil, 10 rubbed out,',
-            '// 11 cross, 12 heart, 13 lines, 14 moon, 15 flame, 16 pylon, 17 custom face.']
+            '// 11 cross, 12 heart, 13 lines, 14 moon, 15 flame, 16 pylon, 17 custom face, 18 recreated ku.']
     out += ['inline constexpr int KU = %d;' % NAMES.index('ku')]
     out += ['inline constexpr Box BOX[COUNT] = {']
     for p, strokes in enumerate(DOODLES):

@@ -193,9 +193,9 @@ inline int place(const Rect& area, const Rect* avoid, const int nAvoid, const ui
   if (band >= MIN_BOTTOM_BAND) {
     // Keep a star, heart, and thunder along the bottom of the page. The normal collision checks still
     // apply, so each one stays clear of the words and of the other placed scribbles.
-    static constexpr uint8_t BOTTOM_PICTURES[] = {0, 12, 8, 14, 15, 16, 17};  // star, heart, thunder, moon, flame, pylon, custom face
-    static constexpr uint8_t BOTTOM_SIZES[] = {64, 52, 82, 72, 58, 68, 43};
-    for (int i = 0; i < 7; ++i) {
+    static constexpr uint8_t BOTTOM_PICTURES[] = {0, 12, 8, 17, 10};  // star, heart, thunder, custom face, rubbed zigzag
+    static constexpr uint8_t BOTTOM_SIZES[] = {64, 52, 82, 43, 97};
+    for (int i = 0; i < 5; ++i) {
       Item item;
       item.kind = Kind::Doodle;
       item.pic = BOTTOM_PICTURES[i];
@@ -207,7 +207,7 @@ inline int place(const Rect& area, const Rect* avoid, const int nAvoid, const ui
     }
   }
   // The worms.
-  const int wanted = 1 + static_cast<int>(next(state) % 2);
+  const int wanted = 2 + static_cast<int>(next(state) % 2);
   for (int worm = 0; worm < wanted && count < cap; ++worm) {
     Item w;
     w.kind = Kind::Worm;
